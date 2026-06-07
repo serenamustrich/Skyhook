@@ -1,0 +1,110 @@
+core:
+  mixed_listen: 127.0.0.1:7897
+  control_listen: 127.0.0.1:9197
+  default_outbound: direct
+  connect_timeout_ms: 5000
+  probe_url: http://cp.cloudflare.com/generate_204
+  probe_timeout_ms: 500
+  probe_interval_secs: 300
+  probe_concurrency: 256
+
+tun:
+  enabled: false
+  name:
+  setup: false
+  mtu: 1500
+  dns_strategy: virtual
+  dns_addr: 8.8.8.8
+  ipv6: false
+  tcp_timeout_secs: 600
+  udp_timeout_secs: 10
+  max_sessions: 200
+  bypass: []
+  udpgw_server:
+
+dns:
+  enabled: true
+  server: 8.8.8.8:53
+  hijack_udp_53: true
+  timeout_ms: 2000
+  block_non_dns_udp: false
+
+smart_rules:
+  enabled: true
+  auto_probe: true
+  auto_apply_recommendations: false
+  direct_outbound: direct
+  proxy_outbound:
+  direct_probe_timeout_ms: 500
+  probe_cooldown_secs: 300
+  min_samples: 2
+  state_path: skyhook-smart-rules.json
+  persist_interval_secs: 30
+  max_observations: 10000
+  rules:
+    - target: domain-suffix
+      value: apple.com
+      outbound: direct
+      enabled: true
+      note: example smart override
+
+subscriptions:
+  use_active: true
+  store_path: skyhook-subscriptions
+  use_first_node_as_default: true
+  update_on_start: true
+  auto_update: true
+  update_interval_secs: 21600
+  update_timeout_secs: 10
+  update_retries: 1
+  update_concurrency: 4
+
+geo:
+  auto_update: true
+  update_on_start: true
+  cache_dir: skyhook-geo
+  geoip_url:
+  geosite_url:
+  update_timeout_secs: 20
+
+outbounds:
+  - type: direct
+    name: direct
+  - type: reject
+    name: reject
+
+rule_sets:
+  - name: apple
+    behavior: domain
+    rules:
+      - "+.apple.com"
+
+geoip_database: null
+
+geoip:
+  - country: CN
+    cidrs:
+      - 1.2.0.0/16
+
+rules:
+  - target: app-bundle
+    value: com.apple.Safari
+    outbound: direct
+  - target: rule-set
+    value: apple
+    outbound: direct
+  - target: geo-ip
+    value: CN
+    outbound: direct
+  - target: ip
+    value: 1.1.1.1
+    outbound: direct
+  - target: domain-suffix
+    value: local
+    outbound: direct
+  - target: domain-suffix
+    value: blocked.example
+    outbound: reject
+  - target: match
+    value: "*"
+    outbound: direct

@@ -1,0 +1,35 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+
+# Runtime state
+skyhook.yaml
+active.yaml
+*.local.yaml
+*.local.yml
+skyhook-smart-rules.json
+skyhook-subscriptions/
+skyhook-geo/
+logs/
+*.log
+
+# Secrets and private subscription material
+.env
+.env.*
+*.sub
+*.subscription
+private/
+secrets/
+
+# macOS packaging/build artifacts
+*.app
+*.dmg
+*.pkg
+dist/
+build/
+
+# Coverage/profiling
+*.profraw
+*.profdata
+coverage/
