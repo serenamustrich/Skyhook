@@ -1,14 +1,35 @@
-use std::sync::Arc;
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::Semaphore,
+    time,
 };
 use url::Url;
 
 use crate::{core::Runtime, routing::Destination};
+
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const UDP_WORKER_LIMIT: usize = 1024;
+
+#[derive(Debug, Default)]
+pub struct UdpMetrics {
+    pub packets_rx: AtomicU64,
+    pub packets_tx: AtomicU64,
+    pub bytes_rx: AtomicU64,
+    pub bytes_tx: AtomicU64,
+    pub errors: AtomicU64,
+    pub fragments_rejected: AtomicU64,
+}
 
 pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(runtime.config().core.mixed_listen)
@@ -31,7 +52,7 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         let (stream, peer) = listener.accept().await?;
         let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_client(runtime.clone(), stream).await {
+            if let Err(error) = handle_client(runtime.clone(), stream, peer).await {
                 runtime
                     .telemetry()
                     .log("warn", format!("mixed client {peer} failed: {error:#}"))
@@ -41,19 +62,27 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_client(runtime: Arc<Runtime>, stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_client(
+    runtime: Arc<Runtime>,
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
     let mut first = [0u8; 1];
     let n = stream.peek(&mut first).await?;
     if n == 0 {
         return Ok(());
     }
     match first[0] {
-        0x05 => handle_socks5(runtime, stream).await,
+        0x05 => handle_socks5(runtime, stream, peer).await,
         _ => handle_http(runtime, stream).await,
     }
 }
 
-async fn handle_socks5(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_socks5(
+    runtime: Arc<Runtime>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
     if header[0] != 0x05 {
@@ -74,7 +103,7 @@ async fn handle_socks5(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::
     }
     if request[1] == 0x03 {
         let _destination = read_socks5_destination(&mut stream, request[3]).await?;
-        return handle_socks5_udp_associate(runtime, stream).await;
+        return handle_socks5_udp_associate(runtime, stream, peer).await;
     }
     if request[1] != 0x01 {
         return Err(anyhow!(
@@ -91,71 +120,160 @@ async fn handle_socks5(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::
 async fn handle_socks5_udp_associate(
     runtime: Arc<Runtime>,
     mut stream: TcpStream,
+    peer: SocketAddr,
 ) -> anyhow::Result<()> {
-    let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
-    let local = udp.local_addr()?;
-    let ip = match local.ip() {
-        std::net::IpAddr::V4(ip) => ip.octets(),
-        std::net::IpAddr::V6(_) => [127, 0, 0, 1],
+    let bind_addr = if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
     };
-    let port = local.port().to_be_bytes();
-    stream
-        .write_all(&[
-            0x05, 0x00, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], port[0], port[1],
-        ])
-        .await?;
+    let udp = Arc::new(UdpSocket::bind(bind_addr).await?);
+    let local = udp.local_addr()?;
+
+    let reply = build_udp_associate_reply(local);
+    stream.write_all(&reply).await?;
 
     runtime
         .telemetry()
-        .log("info", format!("socks5 udp associate on {local}"))
+        .log(
+            "info",
+            format!("socks5 udp associate on {local} (client {peer})"),
+        )
         .await;
 
-    let mut client_addr = None;
+    let metrics = Arc::new(UdpMetrics::default());
+    let mut client_addr: Option<SocketAddr> = None;
     let mut udp_buf = vec![0u8; 65_535];
     let mut tcp_probe = [0u8; 1];
-    let udp_workers = Arc::new(Semaphore::new(1024));
+    let udp_workers = Arc::new(Semaphore::new(UDP_WORKER_LIMIT));
+
+    let result = run_udp_associate_loop(
+        &runtime,
+        &mut stream,
+        &udp,
+        &mut client_addr,
+        &mut udp_buf,
+        &mut tcp_probe,
+        &udp_workers,
+        &metrics,
+    )
+    .await;
+
+    let m = &metrics;
+    runtime
+        .telemetry()
+        .log(
+            "info",
+            format!(
+                "socks5 udp associate closed: rx={} tx={} bytes_rx={} bytes_tx={} errors={}",
+                m.packets_rx.load(Ordering::Relaxed),
+                m.packets_tx.load(Ordering::Relaxed),
+                m.bytes_rx.load(Ordering::Relaxed),
+                m.bytes_tx.load(Ordering::Relaxed),
+                m.errors.load(Ordering::Relaxed),
+            ),
+        )
+        .await;
+
+    result
+}
+
+fn build_udp_associate_reply(local: std::net::SocketAddr) -> Vec<u8> {
+    let mut reply = vec![0x05u8, 0x00, 0x00];
+    match local {
+        std::net::SocketAddr::V4(addr) => {
+            reply.push(0x01);
+            reply.extend_from_slice(&addr.ip().octets());
+            reply.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        std::net::SocketAddr::V6(addr) => {
+            reply.push(0x04);
+            reply.extend_from_slice(&addr.ip().octets());
+            reply.extend_from_slice(&addr.port().to_be_bytes());
+        }
+    }
+    reply
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_associate_loop(
+    runtime: &Arc<Runtime>,
+    stream: &mut TcpStream,
+    udp: &Arc<UdpSocket>,
+    client_addr: &mut Option<SocketAddr>,
+    udp_buf: &mut [u8],
+    tcp_probe: &mut [u8; 1],
+    udp_workers: &Arc<Semaphore>,
+    metrics: &Arc<UdpMetrics>,
+) -> anyhow::Result<()> {
     loop {
-        tokio::select! {
-            tcp = stream.read(&mut tcp_probe) => {
+        let idle = tokio::select! {
+            tcp = stream.read(tcp_probe) => {
                 if tcp.unwrap_or(0) == 0 {
                     return Ok(());
                 }
+                continue;
             }
-            received = udp.recv_from(&mut udp_buf) => {
-                let (len, peer) = received?;
-                if client_addr.is_none() {
-                    client_addr = Some(peer);
+            received = time::timeout(UDP_IDLE_TIMEOUT, udp.recv_from(udp_buf)) => {
+                match received {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        runtime
+                            .telemetry()
+                            .log("info", "socks5 udp associate idle timeout".to_string())
+                            .await;
+                        return Ok(());
+                    }
                 }
-                if Some(peer) != client_addr {
-                    continue;
+            }
+        };
+        let (len, peer_addr) = idle;
+        metrics.packets_rx.fetch_add(1, Ordering::Relaxed);
+        metrics.bytes_rx.fetch_add(len as u64, Ordering::Relaxed);
+
+        if client_addr.is_none() {
+            *client_addr = Some(peer_addr);
+        }
+        if Some(peer_addr) != *client_addr {
+            continue;
+        }
+
+        let Ok(permit) = udp_workers.clone().try_acquire_owned() else {
+            runtime
+                .telemetry()
+                .log(
+                    "warn",
+                    "socks5 udp worker limit reached; dropping datagram".to_string(),
+                )
+                .await;
+            metrics.errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let packet = udp_buf[..len].to_vec();
+        let runtime = runtime.clone();
+        let udp = udp.clone();
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match handle_socks5_udp_datagram(runtime.clone(), &packet).await {
+                Ok(Some(response)) => {
+                    if udp.send_to(&response, peer_addr).await.is_ok() {
+                        metrics.packets_tx.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .bytes_tx
+                            .fetch_add(response.len() as u64, Ordering::Relaxed);
+                    }
                 }
-                let Ok(permit) = udp_workers.clone().try_acquire_owned() else {
+                Ok(None) => {}
+                Err(error) => {
+                    metrics.errors.fetch_add(1, Ordering::Relaxed);
                     runtime
                         .telemetry()
-                        .log("warn", "socks5 udp worker limit reached; dropping datagram".to_string())
+                        .log("warn", format!("socks5 udp datagram failed: {error:#}"))
                         .await;
-                    continue;
-                };
-                let packet = udp_buf[..len].to_vec();
-                let runtime = runtime.clone();
-                let udp = udp.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    match handle_socks5_udp_datagram(runtime.clone(), &packet).await {
-                        Ok(Some(response)) => {
-                            let _ = udp.send_to(&response, peer).await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            runtime
-                                .telemetry()
-                                .log("warn", format!("socks5 udp datagram failed: {error:#}"))
-                                .await;
-                        }
-                    }
-                });
+                }
             }
-        }
+        });
     }
 }
 
@@ -335,15 +453,36 @@ async fn handle_http(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Re
     let (mut remote_stream, decision, outbound_name) =
         runtime.connect_outbound(&destination).await?;
     let id = runtime
-        .open_connection_record("http", destination, outbound_name, decision.matched_rule)
+        .open_connection_record(
+            "http",
+            destination,
+            outbound_name.clone(),
+            decision.matched_rule,
+            crate::telemetry::Protocol::Tcp,
+        )
         .await;
     remote_stream.write_all(&rewritten).await?;
     runtime
         .telemetry()
-        .add_transfer(id, rewritten.len() as u64, 0)
+        .add_transfer(
+            id,
+            rewritten.len() as u64,
+            0,
+            crate::telemetry::Protocol::Tcp,
+            &outbound_name,
+        )
         .await;
     let copied = tokio::io::copy(&mut remote_stream, &mut client_write).await?;
-    runtime.telemetry().add_transfer(id, 0, copied).await;
+    runtime
+        .telemetry()
+        .add_transfer(
+            id,
+            0,
+            copied,
+            crate::telemetry::Protocol::Tcp,
+            &outbound_name,
+        )
+        .await;
     runtime.close_connection_record(id).await;
     Ok(())
 }
@@ -414,6 +553,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_and_builds_socks5_udp_ipv4_packet() {
+        let payload = b"hello";
+        let mut packet = vec![0x00, 0x00, 0x00, 0x01, 192, 168, 1, 1, 0x00, 0x50];
+        packet.extend_from_slice(payload);
+
+        let (destination, offset) = parse_socks5_udp_packet(&packet).expect("parse");
+        assert_eq!(destination.host, "192.168.1.1");
+        assert_eq!(destination.port, 80);
+        assert_eq!(&packet[offset..], payload);
+
+        let response = build_socks5_udp_packet(&destination, b"world").expect("build");
+        assert_eq!(&response[..offset], &packet[..offset]);
+        assert_eq!(&response[offset..], b"world");
+    }
+
+    #[test]
+    fn parses_and_builds_socks5_udp_ipv6_packet() {
+        let payload = b"test";
+        let mut packet = vec![0x00, 0x00, 0x00, 0x04];
+        packet.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        packet.extend_from_slice(&0x01BBu16.to_be_bytes());
+        packet.extend_from_slice(payload);
+
+        let (destination, offset) = parse_socks5_udp_packet(&packet).expect("parse");
+        assert_eq!(destination.host, "::1");
+        assert_eq!(destination.port, 443);
+        assert_eq!(&packet[offset..], payload);
+
+        let response = build_socks5_udp_packet(&destination, b"reply").expect("build");
+        assert_eq!(&response[..offset], &packet[..offset]);
+        assert_eq!(&response[offset..], b"reply");
+    }
+
+    #[test]
     fn parses_and_builds_socks5_udp_domain_packet() {
         let packet = [
             0x00, 0x00, 0x00, 0x03, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o',
@@ -428,5 +601,104 @@ mod tests {
         assert_eq!(&packet[offset..], b"q");
         assert_eq!(&response[..offset], &packet[..offset]);
         assert_eq!(&response[offset..], b"r");
+    }
+
+    #[test]
+    fn rejects_short_socks5_udp_packet() {
+        assert!(parse_socks5_udp_packet(&[0x00, 0x00]).is_err());
+        assert!(parse_socks5_udp_packet(&[]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_reserved_bytes() {
+        assert!(parse_socks5_udp_packet(&[0x01, 0x00, 0x00, 0x01, 1, 2, 3, 4, 0, 80]).is_err());
+        assert!(parse_socks5_udp_packet(&[0x00, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0, 80]).is_err());
+    }
+
+    #[test]
+    fn rejects_fragmented_packet() {
+        let packet = [0x00, 0x00, 0x01, 0x01, 1, 2, 3, 4, 0, 80];
+        assert!(parse_socks5_udp_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_address_type() {
+        let packet = [0x00, 0x00, 0x00, 0x02, 1, 2, 3, 4, 0, 80];
+        assert!(parse_socks5_udp_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_short_ipv4_packet() {
+        let packet = [0x00, 0x00, 0x00, 0x01, 192, 168];
+        assert!(parse_socks5_udp_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_short_ipv6_packet() {
+        let packet = [
+            0x00, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(parse_socks5_udp_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_short_domain_packet() {
+        let packet = [0x00, 0x00, 0x00, 0x03, 5, b'h', b'e'];
+        assert!(parse_socks5_udp_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_domain_utf8() {
+        let packet = [0x00, 0x00, 0x00, 0x03, 3, 0xFF, 0xFE, 0xFD, 0x00, 0x50];
+        assert!(parse_socks5_udp_packet(&packet).is_err());
+    }
+
+    #[test]
+    fn rejects_domain_name_too_long() {
+        let long_domain = "a".repeat(256);
+        let dest = Destination::new(long_domain, 80);
+        assert!(build_socks5_udp_packet(&dest, b"x").is_err());
+    }
+
+    #[test]
+    fn build_udp_associate_reply_ipv4() {
+        let addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let reply = build_udp_associate_reply(addr);
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00);
+        assert_eq!(reply[2], 0x00);
+        assert_eq!(reply[3], 0x01);
+        assert_eq!(&reply[4..8], &[127, 0, 0, 1]);
+        assert_eq!(u16::from_be_bytes([reply[8], reply[9]]), 12345);
+    }
+
+    #[test]
+    fn build_udp_associate_reply_ipv6() {
+        let addr: std::net::SocketAddr = "[::1]:54321".parse().unwrap();
+        let reply = build_udp_associate_reply(addr);
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00);
+        assert_eq!(reply[2], 0x00);
+        assert_eq!(reply[3], 0x04);
+        assert_eq!(&reply[4..20], &std::net::Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(u16::from_be_bytes([reply[20], reply[21]]), 54321);
+    }
+
+    #[test]
+    fn roundtrip_all_address_types() {
+        let ipv4 = Destination::new("10.0.0.1", 443);
+        let built = build_socks5_udp_packet(&ipv4, b"data").unwrap();
+        let (parsed, _) = parse_socks5_udp_packet(&built).unwrap();
+        assert_eq!(parsed, ipv4);
+
+        let ipv6 = Destination::new("fe80::1", 8080);
+        let built = build_socks5_udp_packet(&ipv6, b"data").unwrap();
+        let (parsed, _) = parse_socks5_udp_packet(&built).unwrap();
+        assert_eq!(parsed, ipv6);
+
+        let domain = Destination::new("test.example.org", 53);
+        let built = build_socks5_udp_packet(&domain, b"data").unwrap();
+        let (parsed, _) = parse_socks5_udp_packet(&built).unwrap();
+        assert_eq!(parsed, domain);
     }
 }

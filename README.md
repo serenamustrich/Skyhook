@@ -1,5 +1,7 @@
 # Skyhook
 
+[中文说明](README.zh-CN.md)
+
 **Skyhook** is a Rust-native intelligent proxy core.  
 Chinese name: **玥球核心**.
 
@@ -39,12 +41,16 @@ not a quiet finished binary.
 
 The current focus areas are:
 
+- finishing the NativeL3 L4 TCP data plane and UDP relay,
 - real protocol dialing coverage,
 - stronger TUN behavior,
 - smart routing and learning,
 - background subscription refresh,
 - traffic accounting,
 - clean APIs for desktop clients.
+
+For implementation handoff and remaining work, see
+[docs/MIMO_FINAL_COMPLETION_AND_OPTIMIZATION_PLAN.md](docs/MIMO_FINAL_COMPLETION_AND_OPTIMIZATION_PLAN.md).
 
 ## Highlights
 
@@ -92,16 +98,78 @@ Skyhook has native outbound implementations for:
 | TUIC | yes | yes | QUIC TCP, native datagram UDP, stream UDP modes. |
 | Naive | yes | no | TLS HTTP CONNECT. |
 | SSH | yes | no | Real direct-tcpip dialing, password/private-key auth. |
-| SSR | partial | no | Real origin/plain AES-CFB TCP path. |
-| Snell | yes | no | Real AEAD TCP path with Argon2id session keys. |
+| SSR | partial | no | Real origin AES-CFB TCP path with plain/http obfs first-packet handling. |
+| Snell | yes | no | Real AEAD TCP path with Argon2id session keys and HTTP obfs first-packet handling. |
 | AnyTLS | yes | no | TLS auth, settings, stream open, SOCKS address handoff. |
 | ShadowTLS v3 | yes | no | v3 ClientHello HMAC and application-data framing. |
-| WireGuard | planned | planned | Requires L3 tunnel manager, not a TCP stream adapter. |
-| OpenVPN | planned | planned | Requires L3 process/tunnel integration. |
+| WireGuard | L3 | L3 | Native L3 manager with WireGuard Noise packet engine, handshake timers, keepalive, encapsulation, and decapsulation. |
+| OpenVPN | manager | manager | L3 profile registration with .ovpn parser and inline-block support. Native TLS/control/data channels are **not yet implemented**; status returns `Unsupported`. |
 | Hysteria v1 | planned | planned | Separate QUIC v1 protocol implementation. |
 
 Capability reporting is first-class. Each outbound reports whether TCP/UDP is
 supported, how UDP is implemented, and which limitations are known.
+
+## L3 Tunnel Engine
+
+Skyhook treats L3 tunnel protocols as their own runtime surface, not as fake TCP
+stream adapters.
+
+The current L3 manager supports:
+
+- automatic discovery of WireGuard and OpenVPN profiles from outbounds,
+- startup auto-start through `l3.enabled` and `l3.auto_start`,
+- `GET /skyhook/l3` status snapshots,
+- `POST /skyhook/l3/start` for one profile or all profiles,
+- `POST /skyhook/l3/stop` for one profile or all profiles,
+- WireGuard key, endpoint, interface-IP, allowed-IP, MTU, and PSK validation,
+- native WireGuard Noise state machine using BoringTun's protocol engine,
+- WireGuard handshake initiation, response handling, keepalive, timers,
+  encrypted packet encapsulation, and encrypted packet decapsulation,
+- OpenVPN profile registration with honest status until native OpenVPN
+  TLS/control/data channels are completed.
+
+WireGuard L3 status exposes network packet counts, byte counts, handshake age,
+RTT when available, estimated loss, and decapsulated IP packet forwarding
+through the L3 packet channel.
+
+The L3 packet channel (`send_ip_packet` / `subscribe_ip_packets`) bridges raw
+IP packets between the native TUN backend and the WireGuard Noise engine.
+On macOS, utun address-family headers are automatically stripped on read and
+prepended on write. On Linux (IFF_NO_PI), packets are passed through directly.
+
+## NativeL3 TUN Backend
+
+The `native-l3` TUN backend bypasses the SOCKS5/HTTP proxy layer and bridges
+TUN packets directly into the L3 tunnel engine and L4 session engine.
+
+Current experimental status:
+
+- macOS utun creation via `PF_SYSTEM` / `SYSPROTO_CONTROL` socket
+- Linux TUN creation via `/dev/net/tun` with `IFF_TUN | IFF_NO_PI`
+- macOS 4-byte address-family header encode/decode
+- Automatic L3 profile startup when `tun.backend=native-l3`
+- Read loop: TUN → routing decision → L3Profile/Direct/Outbound/Group/Country/Reject
+- Write loop: WireGuard decapsulate → `subscribe_l3_ip_packets()` → TUN
+- Route and address auto-configuration via setup plan
+- Bypass route installation via original gateway (macOS/Linux)
+- Endpoint bypass for IP literal L3 endpoints
+- Fatal setup failure rollback with symmetric cleanup
+- DNS hijack integration with UDP/53 interception
+- DNS cache for IP→domain reverse lookups
+- Process metadata resolution (macOS/Linux)
+- smoltcp-based L4 TCP session engine scaffolding
+- Direct/Outbound/Group/Country/Reject routing targets wired at the decision layer
+- SNI/HTTP Host sniffing for routing decisions
+- Smart rules integration with app/domain/IP matching
+- Runtime state persistence for last selected outbound
+- Real-time metrics (packets, bytes, errors, L4 targets) via `/skyhook/tun/metrics`
+- TUN status API with real running state from metrics
+
+**Not yet complete:**
+
+- NativeL3 L4 TCP end-to-end writeback and production hardening
+- UDP relay through L4 session engine
+- Endpoint bypass for domain-based L3 endpoints (IP literals work)
 
 ## Smart Routing
 
@@ -124,12 +192,30 @@ The current smart-rule engine supports:
 - one-click single recommendation enable,
 - high-priority smart overrides,
 - persistent state with throttled writes,
-- route decisions with optional app identity.
+- route decisions with optional app identity,
+- configurable direct-probe timeout and concurrency,
+- configurable success/failure confidence thresholds before auto-apply.
 
 ## TUN And DNS
 
 Skyhook includes a TUN integration layer designed for desktop clients and
 privileged helpers.
+
+Two TUN backends are available via `tun.backend`:
+
+- **`tun2-proxy`** (default): routes TUN traffic through the local SOCKS5/HTTP
+  proxy inbound. Mature, supports DNS hijack, virtual DNS, route setup, and
+  session management.
+- **`native-l3`**: reads raw IP packets from a native TUN device and bridges
+  them into the L3 tunnel engine (WireGuard) or L4 session engine (smoltcp).
+  This backend is experimental. L3 WireGuard packet bridging, route setup,
+  bypass routes, DNS cache, and process metadata are present; L4 TCP/UDP
+  forwarding is still being completed and should not yet be treated as a
+  production replacement for the default backend.
+
+To use `native-l3`, set `tun.backend: native-l3` and `tun.l3_profile` to the
+name of a WireGuard outbound. The runtime will auto-start the L3 profile if
+`l3.auto_start` is false.
 
 Supported configuration areas include:
 
@@ -141,6 +227,9 @@ Supported configuration areas include:
 - IPv4/IPv6 route lists,
 - DNS hijack,
 - virtual DNS address,
+- automatic private-network bypass,
+- automatic IP-literal proxy-server bypass to avoid routing loops,
+- `/skyhook/tun/profile` diagnostics for the exact startup profile,
 - TCP/UDP session timeouts,
 - session limits,
 - UID/process/package include and exclude lists,
@@ -176,6 +265,10 @@ Important endpoints:
 - `GET /skyhook/groups`
 - `GET /skyhook/countries`
 - `POST /skyhook/countries/use`
+- `GET /skyhook/tun/profile`
+- `GET /skyhook/l3`
+- `POST /skyhook/l3/start`
+- `POST /skyhook/l3/stop`
 - `POST /skyhook/probe/outbounds`
 - `POST /skyhook/route/decision`
 - `GET /skyhook/subscriptions`
@@ -304,6 +397,62 @@ For root-owned TUN setup:
 ./scripts/install_macos_launch_daemon.sh
 ```
 
+## Protocol Support Matrix
+
+| Protocol | Status | TCP | UDP | Notes |
+| --- | --- | --- | --- | --- |
+| Direct | production | yes | yes | Native direct egress. |
+| HTTP proxy | production | yes | no | HTTP CONNECT and absolute-form. |
+| SOCKS5 | production | yes | yes | TCP connect and pooled UDP ASSOCIATE. |
+| Shadowsocks AEAD | production | yes | yes | AES-GCM and ChaCha20-Poly1305. |
+| Shadowsocks simple-obfs | production | yes | partial | HTTP/TLS obfs for TCP; UDP with plugin disabled. |
+| Trojan | production | yes | yes | TLS TCP and pooled UDP relay. |
+| VMess AEAD | production | yes | yes | TCP, WS, gRPC, H2, command UDP. |
+| VLESS | production | yes | yes | TCP, TLS, Reality, WS, gRPC, H2, command UDP. |
+| Hysteria2 | production | yes | yes | QUIC TCP streams, datagram UDP, Salamander/Gecko. |
+| TUIC | production | yes | yes | QUIC TCP, native datagram UDP, stream UDP. |
+| Naive | production | yes | no | TLS HTTP CONNECT. |
+| SSH | production | yes | no | Real direct-tcpip, password/key auth. |
+| SSR | partial | partial | no | Real origin AES-CFB TCP; limited variant coverage. |
+| Snell | partial | yes | no | Real AEAD TCP; no UDP or TLS obfs yet. |
+| AnyTLS | partial | yes | no | TLS auth and stream open; early. |
+| ShadowTLS v3 | partial | yes | no | v3 ClientHello HMAC and app-data framing. |
+| WireGuard | experimental | L3 | L3 | Native L3 Noise engine, handshake, keepalive, encap/decap. |
+| OpenVPN | parser only | — | — | .ovpn parser and profile registration. **No real dialing.** Status: `Unsupported`. |
+| Hysteria v1 | planned | — | — | Not yet implemented. |
+
+**Status tiers:**
+- **production**: full TCP/UDP dialing, actively tested.
+- **partial**: real dialing path exists but coverage is incomplete.
+- **experimental**: functional but not yet hardened; expect breaking changes.
+- **parser only**: config/profile parsing works, but no real network dialing.
+- **planned**: not yet implemented.
+
+## Smart Rules Workflow
+
+Skyhook's smart-rule engine observes traffic and recommends route changes:
+
+1. Each new domain/IP/app is probed for direct reachability.
+2. When direct is healthy, Skyhook recommends `direct`.
+3. When direct fails or is slow, Skyhook recommends a proxy outbound.
+4. Users review recommendations via `GET /skyhook/smart-rules`.
+5. Promote individual or all recommendations into durable high-priority rules.
+6. Smart rules sit **above** subscription rules in the evaluation chain.
+
+Smart rules are persisted to disk with throttled writes and survive restarts.
+
+## Route-Rule Priority
+
+Rules are evaluated top-to-bottom. The first match wins. The full priority
+order, highest to lowest:
+
+1. **Smart rules** — user-promoted overrides from the recommendation engine.
+2. **Subscription rules** — rules imported from Clash-style subscription configs.
+3. **Inline rules** — rules defined in the `rules:` section of the config file.
+4. **Default outbound** — `core.default_outbound` (typically `direct`).
+
+Within each tier, rules are evaluated in the order they appear.
+
 ## Design Principles
 
 - **Native over wrapper.** Implement the core behavior directly in Rust.
@@ -320,13 +469,16 @@ For root-owned TUN setup:
 
 ## Roadmap
 
+- Finish NativeL3 L4 TCP end-to-end data flow.
+- Add NativeL3 UDP relay.
 - Complete Hysteria v1 dialing.
-- Add WireGuard/OpenVPN L3 tunnel manager.
-- Expand SSR obfs/protocol variants.
-- Add Snell UDP and obfs support.
+- WireGuard L3 packet engine to native TUN bridge: **done** (packet channel + macOS utun headers).
+- Complete native OpenVPN TLS/control/data channels (profile parser done, data plane pending).
+- Harden NativeL3 TUN route/address auto-configuration and hot reload.
+- Expand SSR protocol variants beyond origin.
+- Add Snell UDP and TLS obfs support.
 - Add chain outbounds and nested transport composition.
 - Add richer DNS rule awareness.
-- Harden TUN route setup across macOS/Linux.
 - Add benchmark suite for dialing latency, DNS latency, and TUN throughput.
 - Add fuzz targets for subscription parsing and rule conversion.
 - Publish stable schema docs for config and API.

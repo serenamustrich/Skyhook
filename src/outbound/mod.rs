@@ -373,9 +373,27 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             obfs: obfs.clone(),
             obfs_host: obfs_host.clone(),
         }),
-        OutboundConfig::Hysteria { name, .. } => Arc::new(UnsupportedProtocolOutbound {
+        OutboundConfig::Hysteria {
+            name,
+            server,
+            port,
+            auth,
+            auth_str,
+            protocol: _,
+            up: _,
+            down: _,
+            sni,
+            skip_cert_verify,
+            obfs,
+        } => Arc::new(HysteriaOutbound {
             name: name.clone(),
-            protocol: "hysteria".to_string(),
+            server: server.clone(),
+            port: *port,
+            auth: auth.clone(),
+            auth_str: auth_str.clone(),
+            sni: sni.clone(),
+            skip_cert_verify: *skip_cert_verify,
+            obfs: obfs.clone(),
         }),
         OutboundConfig::AnyTls {
             name,
@@ -411,7 +429,7 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             sni: sni.clone(),
             skip_cert_verify: *skip_cert_verify,
         }),
-        OutboundConfig::WireGuard { name, .. } => Arc::new(UnsupportedProtocolOutbound {
+        OutboundConfig::WireGuard { name, .. } => Arc::new(L3TunnelOutbound {
             name: name.clone(),
             protocol: "wireguard".to_string(),
         }),
@@ -444,7 +462,7 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             name: name.clone(),
             protocol: "masque".to_string(),
         }),
-        OutboundConfig::OpenVpn { name, .. } => Arc::new(UnsupportedProtocolOutbound {
+        OutboundConfig::OpenVpn { name, .. } => Arc::new(L3TunnelOutbound {
             name: name.clone(),
             protocol: "openvpn".to_string(),
         }),
@@ -468,6 +486,11 @@ struct RejectOutbound {
 }
 
 struct UnsupportedProtocolOutbound {
+    name: String,
+    protocol: String,
+}
+
+struct L3TunnelOutbound {
     name: String,
     protocol: String,
 }
@@ -560,19 +583,36 @@ impl GroupOutbound {
                     .unwrap_or(false);
                 let latency = item.and_then(|health| health.last_latency_ms);
                 let score = item.map(|health| health.score);
-                (index, healthy, latency, score, member.clone())
+                let failures = item.map(|health| health.failures).unwrap_or(0);
+                (index, healthy, latency, score, failures, member.clone())
             })
             .collect::<Vec<_>>();
-        indexed.sort_by(|lhs, rhs| {
-            rhs.1
-                .cmp(&lhs.1)
-                .then_with(|| lhs.2.unwrap_or(u64::MAX).cmp(&rhs.2.unwrap_or(u64::MAX)))
-                .then_with(|| rhs.3.unwrap_or(0).cmp(&lhs.3.unwrap_or(0)))
-                .then_with(|| lhs.0.cmp(&rhs.0))
-        });
+        match self.kind.to_ascii_lowercase().as_str() {
+            "fallback" => indexed.sort_by(|lhs, rhs| {
+                rhs.1
+                    .cmp(&lhs.1)
+                    .then_with(|| lhs.0.cmp(&rhs.0))
+                    .then_with(|| lhs.4.cmp(&rhs.4))
+            }),
+            "load-balance" => indexed.sort_by(|lhs, rhs| {
+                rhs.1
+                    .cmp(&lhs.1)
+                    .then_with(|| rhs.3.unwrap_or(0).cmp(&lhs.3.unwrap_or(0)))
+                    .then_with(|| lhs.4.cmp(&rhs.4))
+                    .then_with(|| lhs.2.unwrap_or(u64::MAX).cmp(&rhs.2.unwrap_or(u64::MAX)))
+                    .then_with(|| lhs.0.cmp(&rhs.0))
+            }),
+            _ => indexed.sort_by(|lhs, rhs| {
+                rhs.1
+                    .cmp(&lhs.1)
+                    .then_with(|| lhs.2.unwrap_or(u64::MAX).cmp(&rhs.2.unwrap_or(u64::MAX)))
+                    .then_with(|| rhs.3.unwrap_or(0).cmp(&lhs.3.unwrap_or(0)))
+                    .then_with(|| lhs.0.cmp(&rhs.0))
+            }),
+        }
         indexed
             .into_iter()
-            .map(|(_, _, _, _, member)| member)
+            .map(|(_, _, _, _, _, member)| member)
             .collect()
     }
 }
@@ -580,7 +620,7 @@ impl GroupOutbound {
 fn group_uses_health_order(kind: &str) -> bool {
     matches!(
         kind.to_ascii_lowercase().as_str(),
-        "select" | "url-test" | "fallback" | "load-balance" | "auto" | "latency"
+        "url-test" | "fallback" | "load-balance" | "auto" | "latency"
     )
 }
 
@@ -683,6 +723,28 @@ impl Outbound for UnsupportedProtocolOutbound {
     ) -> anyhow::Result<BoxedStream> {
         Err(anyhow!(
             "protocol {} is recognized but native dialing is not implemented yet",
+            self.protocol
+        ))
+    }
+}
+
+#[async_trait]
+impl Outbound for L3TunnelOutbound {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> &'static str {
+        "l3-tunnel"
+    }
+
+    async fn connect(
+        &self,
+        _destination: &Destination,
+        _timeout_ms: u64,
+    ) -> anyhow::Result<BoxedStream> {
+        Err(anyhow!(
+            "protocol {} is an L3 tunnel and cannot be dialed as a per-connection stream",
             self.protocol
         ))
     }
@@ -1017,9 +1079,10 @@ impl Outbound for SsrOutbound {
                 self.protocol
             ));
         }
-        if !ssr_obfs_is_plain(&self.obfs) {
+        let obfs = SsrObfsMode::from_name(&self.obfs)?;
+        if obfs == SsrObfsMode::Unsupported {
             return Err(anyhow!(
-                "ssr obfs {} is not implemented yet; supported: plain",
+                "ssr obfs {} is not implemented yet; supported: plain, http_simple, http_post",
                 self.obfs
             ));
         }
@@ -1046,23 +1109,56 @@ impl Outbound for SsrOutbound {
         let mut destination_payload = Vec::new();
         encode_socks5_destination(destination, &mut destination_payload)?;
         upload.apply(&mut destination_payload);
+        let mut first_payload = iv.clone();
+        first_payload.extend_from_slice(&destination_payload);
+        let initial_payload = obfs.wrap_first_client_payload(
+            &self.server,
+            self.port,
+            self.obfs_param.as_deref(),
+            first_payload,
+        )?;
 
         let mut stream = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        stream.write_all(&iv).await?;
-        stream.write_all(&destination_payload).await?;
-        Ok(Box::new(spawn_ssr_stream(cipher, key, upload, stream)))
+        stream.write_all(&initial_payload).await?;
+        Ok(Box::new(spawn_ssr_stream(
+            cipher, key, upload, stream, obfs,
+        )))
     }
 }
 
 fn ssr_protocol_is_origin(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "origin" | "verify_sha1"
-    )
+    matches!(value.to_ascii_lowercase().as_str(), "origin")
 }
 
-fn ssr_obfs_is_plain(value: &str) -> bool {
-    matches!(value.to_ascii_lowercase().as_str(), "plain" | "")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SsrObfsMode {
+    Plain,
+    Http,
+    Unsupported,
+}
+
+impl SsrObfsMode {
+    fn from_name(value: &str) -> anyhow::Result<Self> {
+        Ok(match value.to_ascii_lowercase().as_str() {
+            "" | "plain" => Self::Plain,
+            "http_simple" | "http-post" | "http_post" | "http" => Self::Http,
+            _ => Self::Unsupported,
+        })
+    }
+
+    fn wrap_first_client_payload(
+        self,
+        server: &str,
+        port: u16,
+        host: Option<&str>,
+        payload: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Plain => Ok(payload),
+            Self::Http => build_http_obfs_request(host.unwrap_or(server), port, payload),
+            Self::Unsupported => Err(anyhow!("unsupported ssr obfs mode")),
+        }
+    }
 }
 
 struct SnellOutbound {
@@ -1096,18 +1192,7 @@ impl Outbound for SnellOutbound {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        if let Some(obfs) = obfs {
-            return Err(anyhow!(
-                "snell obfs {obfs} is not implemented yet; supported: plain tcp"
-            ));
-        }
-        if self
-            .obfs_host
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            tracing::debug!(name = %self.name, "snell plain tcp ignores obfs_host");
-        }
+        let plugin = snell_obfs_plugin(obfs, self.obfs_host.as_deref())?;
 
         let method = self.method.as_deref().unwrap_or("aes-128-gcm");
         let cipher = SsCipher::from_method(method)
@@ -1126,20 +1211,43 @@ impl Outbound for SnellOutbound {
             &mut upload_nonce,
             &handshake,
         )?);
+        if let Some(plugin) = &plugin {
+            initial = apply_shadowsocks_plugin_request(plugin, &self.server, self.port, initial)?;
+        }
 
         let mut stream = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
         stream.write_all(&initial).await?;
         stream.flush().await?;
 
         let mut download_nonce = [0u8; SS_NONCE_LEN];
-        let response = timeout(
-            Duration::from_millis(timeout_ms),
-            read_ss_chunk(cipher, &subkey, &mut download_nonce, &mut stream),
-        )
-        .await
-        .context("snell tunnel response timed out")?
-        .context("failed to read snell tunnel response")?
-        .ok_or_else(|| anyhow!("snell server closed before tunnel response"))?;
+        let response = if plugin_is_http_obfs(plugin.as_ref()) {
+            let leftover = timeout(
+                Duration::from_millis(timeout_ms),
+                read_http_obfs_response(&mut stream),
+            )
+            .await
+            .context("snell http obfs response timed out")?
+            .context("failed to read snell http obfs response")?;
+            let cursor = Cursor::new(leftover);
+            let mut chained = cursor.chain(&mut stream);
+            timeout(
+                Duration::from_millis(timeout_ms),
+                read_ss_chunk(cipher, &subkey, &mut download_nonce, &mut chained),
+            )
+            .await
+            .context("snell tunnel response timed out")?
+            .context("failed to read snell tunnel response")?
+            .ok_or_else(|| anyhow!("snell server closed before tunnel response"))?
+        } else {
+            timeout(
+                Duration::from_millis(timeout_ms),
+                read_ss_chunk(cipher, &subkey, &mut download_nonce, &mut stream),
+            )
+            .await
+            .context("snell tunnel response timed out")?
+            .context("failed to read snell tunnel response")?
+            .ok_or_else(|| anyhow!("snell server closed before tunnel response"))?
+        };
         if response.first().copied() != Some(0) {
             return Err(anyhow!(
                 "snell server rejected tunnel with response {:?}",
@@ -1194,6 +1302,30 @@ fn derive_snell_subkey(cipher: SsCipher, password: &[u8], salt: &[u8]) -> anyhow
         .map_err(|error| anyhow!("failed to derive snell session key: {error}"))?;
     output.truncate(cipher.key_len());
     Ok(output)
+}
+
+fn snell_obfs_plugin(
+    obfs: Option<&str>,
+    host: Option<&str>,
+) -> anyhow::Result<Option<ShadowsocksPluginConfig>> {
+    let Some(obfs) = obfs.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match obfs.to_ascii_lowercase().as_str() {
+        "http" | "http_simple" | "obfs-http" | "simple-obfs-http" => {
+            Ok(Some(ShadowsocksPluginConfig {
+                mode: "http".to_string(),
+                host: host
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+            }))
+        }
+        "tls" | "tls1.2_ticket_auth" | "obfs-tls" | "simple-obfs-tls" => Err(anyhow!(
+            "snell tls obfs is not implemented yet; supported obfs: http"
+        )),
+        other => Err(anyhow!("unsupported snell obfs mode {other}")),
+    }
 }
 
 struct SshOutbound {
@@ -1642,6 +1774,165 @@ struct VmessUdpSession {
 struct VlessUdpSession {
     stream: BoxedStream,
     response_header_read: bool,
+}
+
+struct HysteriaOutbound {
+    name: String,
+    server: String,
+    port: u16,
+    auth: Option<String>,
+    auth_str: Option<String>,
+    sni: Option<String>,
+    skip_cert_verify: bool,
+    obfs: Option<String>,
+}
+
+#[async_trait]
+impl Outbound for HysteriaOutbound {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn kind(&self) -> &'static str {
+        "hysteria"
+    }
+
+    async fn connect(
+        &self,
+        destination: &Destination,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BoxedStream> {
+        let auth_bytes = self.hysteria_auth_bytes()?;
+        let connection = open_hysteria_connection(
+            &self.server,
+            self.port,
+            self.sni.as_deref(),
+            self.skip_cert_verify,
+            self.obfs.as_deref(),
+            &auth_bytes,
+            timeout_ms,
+        )
+        .await?;
+        let (mut send, mut recv) = timeout(Duration::from_millis(timeout_ms), connection.open_bi())
+            .await
+            .context("hysteria open stream timed out")?
+            .context("hysteria failed to open bidirectional stream")?;
+        let request = build_hysteria_tcp_request(destination, &auth_bytes)?;
+        send.write_all(&request).await?;
+        send.flush().await?;
+        let status = timeout(Duration::from_millis(timeout_ms), recv.read_u8())
+            .await
+            .context("hysteria tcp response timed out")?
+            .context("hysteria tcp response read failed")?;
+        if status != 0x00 {
+            return Err(anyhow!(
+                "hysteria tcp request failed with status {status:#04x}"
+            ));
+        }
+        Ok(Box::new(HysteriaTcpStream { recv, send }))
+    }
+}
+
+impl HysteriaOutbound {
+    fn hysteria_auth_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        if let Some(auth_str) = &self.auth_str {
+            return Ok(auth_str.as_bytes().to_vec());
+        }
+        if let Some(auth) = &self.auth {
+            return Ok(auth.as_bytes().to_vec());
+        }
+        Err(anyhow!(
+            "hysteria outbound {} requires auth or auth_str",
+            self.name
+        ))
+    }
+}
+
+struct HysteriaTcpStream {
+    recv: quinn::RecvStream,
+    send: quinn::SendStream,
+}
+
+impl AsyncRead for HysteriaTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), Error>> {
+        Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for HysteriaTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, Error>> {
+        AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
+        AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Result<(), Error>> {
+        AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
+    }
+}
+
+async fn open_hysteria_connection(
+    server: &str,
+    port: u16,
+    sni: Option<&str>,
+    skip_cert_verify: bool,
+    obfs: Option<&str>,
+    auth_bytes: &[u8],
+    timeout_ms: u64,
+) -> anyhow::Result<quinn::Connection> {
+    if auth_bytes.is_empty() {
+        return Err(anyhow!("hysteria auth is empty"));
+    }
+    if obfs.map(str::trim).filter(|v| !v.is_empty()).is_some() {
+        return Err(anyhow!("hysteria obfs is not implemented yet"));
+    }
+    let remote = lookup_host((server, port))
+        .await
+        .with_context(|| format!("failed to resolve hysteria server {server}:{port}"))?
+        .next()
+        .ok_or_else(|| anyhow!("hysteria server {server}:{port} did not resolve"))?;
+    let bind = if remote.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    }
+    .parse::<SocketAddr>()
+    .expect("valid quic bind address");
+    let mut endpoint = quinn::Endpoint::client(bind).context("failed to create quic endpoint")?;
+    endpoint.set_default_client_config(quic_client_config(skip_cert_verify, None)?);
+    let server_name = sni.unwrap_or(server).to_string();
+    let connection = timeout(
+        Duration::from_millis(timeout_ms),
+        endpoint.connect(remote, &server_name)?,
+    )
+    .await
+    .context("hysteria quic connect timed out")?
+    .context("hysteria quic connect failed")?;
+
+    Ok(connection)
+}
+
+fn build_hysteria_tcp_request(
+    destination: &Destination,
+    auth_bytes: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(auth_bytes.len() + 32 + destination.host.len());
+    output.extend_from_slice(auth_bytes);
+    encode_socks5_destination(destination, &mut output)?;
+    Ok(output)
 }
 
 struct Hysteria2Outbound {
@@ -6724,6 +7015,7 @@ fn spawn_ssr_stream(
     key: Vec<u8>,
     mut upload: SsrStreamCipher,
     stream: TcpStream,
+    obfs: SsrObfsMode,
 ) -> DuplexStream {
     let (app_side, relay_side) = tokio::io::duplex(64 * 1024);
     let (mut local_read, mut local_write) = tokio::io::split(relay_side);
@@ -6750,8 +7042,19 @@ fn spawn_ssr_stream(
     });
 
     tokio::spawn(async move {
+        let mut reader: Box<dyn AsyncRead + Unpin + Send> = if obfs == SsrObfsMode::Http {
+            match read_http_obfs_response(&mut remote_read).await {
+                Ok(leftover) => Box::new(Cursor::new(leftover).chain(remote_read)),
+                Err(_) => {
+                    let _ = local_write.shutdown().await;
+                    return;
+                }
+            }
+        } else {
+            Box::new(remote_read)
+        };
         let mut iv = vec![0u8; cipher.iv_len()];
-        if remote_read.read_exact(&mut iv).await.is_err() {
+        if reader.read_exact(&mut iv).await.is_err() {
             let _ = local_write.shutdown().await;
             return;
         }
@@ -6761,7 +7064,7 @@ fn spawn_ssr_stream(
         };
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            match remote_read.read(&mut buf).await {
+            match reader.read(&mut buf).await {
                 Ok(0) => {
                     let _ = local_write.shutdown().await;
                     break;
@@ -7316,6 +7619,10 @@ fn apply_shadowsocks_plugin_request(
         ));
     }
     let host = plugin.host.as_deref().unwrap_or(server);
+    build_http_obfs_request(host, port, payload)
+}
+
+fn build_http_obfs_request(host: &str, port: u16, payload: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     let host_header = if host.contains(':') || port == 80 || port == 443 {
         host.to_string()
     } else {

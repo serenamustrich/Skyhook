@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, RwLock},
     time::Instant,
 };
@@ -11,6 +12,7 @@ use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    sync::Semaphore,
     task::JoinSet,
     time::{sleep, timeout, Duration},
 };
@@ -19,8 +21,11 @@ use url::Url;
 
 use crate::{
     config::{OutboundConfig, SmartRouteRule, SuperConfig},
+    inbound::native_tun_metrics::NativeTunMetrics,
+    l3::{L3Manager, L3Snapshot, L3TunnelStatus},
     outbound::{build_outbounds, BoxedStream, Outbound, OutboundMap},
     routing::{Destination, RouteDecision, Router},
+    runtime_state::RuntimeStateStore,
     smart::{self, DirectProbeRequest, SmartRecommendationAction, SmartRuleEngine, SmartSnapshot},
     subscription_store::SubscriptionStore,
     telemetry::{ConnectionSubscription, OutboundHealth, Telemetry},
@@ -30,7 +35,11 @@ pub struct Runtime {
     base_config: RwLock<SuperConfig>,
     state: RwLock<RuntimeState>,
     smart_rules: Arc<SmartRuleEngine>,
+    direct_probe_limit: Arc<Semaphore>,
+    l3_manager: L3Manager,
     telemetry: Arc<Telemetry>,
+    tun_metrics: NativeTunMetrics,
+    runtime_state: Arc<RuntimeStateStore>,
 }
 
 struct RuntimeState {
@@ -94,6 +103,9 @@ pub struct OutboundCapabilitySnapshot {
 pub struct ProbeOptions {
     pub url: Option<String>,
     pub timeout_ms: Option<u64>,
+    pub concurrency: Option<usize>,
+    pub include_unsupported: bool,
+    pub include_failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,12 +124,34 @@ impl Runtime {
         let telemetry = Arc::new(Telemetry::default());
         let state = build_runtime_state(config, telemetry.clone())?;
         let smart_config = effective_smart_config(&state.config);
+        let direct_probe_limit = Arc::new(Semaphore::new(sanitize_probe_concurrency(
+            smart_config.direct_probe_concurrency,
+        )));
         let smart_rules = Arc::new(SmartRuleEngine::new(smart_config));
+        let l3_manager = L3Manager::new(&state.config);
+        let tun_config = &state.config.tun;
+        let tun_metrics = NativeTunMetrics::new(
+            tun_config.enabled,
+            format!("{:?}", tun_config.backend),
+            tun_config.setup,
+            tun_config.auto_route,
+        );
+
+        let state_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".skyhook")
+            .join("runtime-state.json");
+        let runtime_state = Arc::new(RuntimeStateStore::new(&state_path));
+
         Ok(Self {
             base_config: RwLock::new(base_config),
             state: RwLock::new(state),
             smart_rules,
+            direct_probe_limit,
+            l3_manager,
             telemetry,
+            tun_metrics,
+            runtime_state,
         })
     }
 
@@ -126,6 +160,7 @@ impl Runtime {
         let config = state.config.clone();
         self.smart_rules
             .update_config(effective_smart_config(&state.config));
+        self.l3_manager.reconcile_config(&state.config);
         *self
             .state
             .write()
@@ -159,12 +194,27 @@ impl Runtime {
         self.telemetry.clone()
     }
 
+    pub fn runtime_state_store(&self) -> &Arc<RuntimeStateStore> {
+        &self.runtime_state
+    }
+
+    pub fn tun_metrics(&self) -> &NativeTunMetrics {
+        &self.tun_metrics
+    }
+
+    pub fn native_tun_metrics(
+        &self,
+    ) -> crate::inbound::native_tun_metrics::NativeTunMetricsSnapshot {
+        self.tun_metrics.snapshot()
+    }
+
     pub async fn open_connection_record(
         &self,
         inbound: &'static str,
         destination: Destination,
         outbound: String,
         matched_rule: Option<String>,
+        protocol: crate::telemetry::Protocol,
     ) -> uuid::Uuid {
         self.telemetry
             .open_connection(
@@ -173,6 +223,7 @@ impl Runtime {
                 outbound,
                 self.active_subscription_context(),
                 matched_rule,
+                protocol,
             )
             .await
     }
@@ -270,6 +321,67 @@ impl Runtime {
         value: &str,
     ) -> anyhow::Result<Vec<SmartRouteRule>> {
         self.smart_rules.apply_recommendation(target, value)
+    }
+
+    pub fn add_rule(
+        &self,
+        target: crate::config::RuleTarget,
+        value: &str,
+        outbound: &str,
+    ) -> anyhow::Result<Vec<crate::config::RouteRule>> {
+        let has_outbound = self
+            .state
+            .read()
+            .map_err(|_| anyhow!("runtime state lock poisoned"))?
+            .outbounds
+            .contains_key(outbound);
+        if !has_outbound {
+            return Err(anyhow!("rule references undefined outbound '{}'", outbound));
+        }
+        let mut config = self.config();
+        config.rules.push(crate::config::RouteRule {
+            target,
+            value: value.to_string(),
+            outbound: outbound.to_string(),
+        });
+        self.reload_config(config.clone())?;
+        Ok(config.rules)
+    }
+
+    pub fn delete_rule(&self, index: usize) -> anyhow::Result<Vec<crate::config::RouteRule>> {
+        let mut config = self.config();
+        if index >= config.rules.len() {
+            return Err(anyhow!(
+                "rule index {} out of range (total {})",
+                index,
+                config.rules.len()
+            ));
+        }
+        config.rules.remove(index);
+        self.reload_config(config.clone())?;
+        Ok(config.rules)
+    }
+
+    pub fn reorder_rules(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> anyhow::Result<Vec<crate::config::RouteRule>> {
+        let mut config = self.config();
+        let len = config.rules.len();
+        if from >= len {
+            return Err(anyhow!("from index {} out of range (total {})", from, len));
+        }
+        if to >= len {
+            return Err(anyhow!("to index {} out of range (total {})", to, len));
+        }
+        if from == to {
+            return Ok(config.rules);
+        }
+        let rule = config.rules.remove(from);
+        config.rules.insert(to, rule);
+        self.reload_config(config.clone())?;
+        Ok(config.rules)
     }
 
     pub fn decide(&self, destination: &Destination) -> RouteDecision {
@@ -381,6 +493,127 @@ impl Runtime {
         }
     }
 
+    pub async fn connect_named_outbound(
+        &self,
+        outbound_name: &str,
+        destination: &Destination,
+    ) -> anyhow::Result<BoxedStream> {
+        let (outbound, connect_timeout_ms) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("runtime state lock poisoned"))?;
+            let outbound = state
+                .outbounds
+                .get(outbound_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("outbound '{}' not found", outbound_name))?;
+            (outbound, state.config.core.connect_timeout_ms)
+        };
+
+        let kind = outbound.kind().to_string();
+        let started = Instant::now();
+        match outbound.connect(destination, connect_timeout_ms).await {
+            Ok(stream) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                self.telemetry
+                    .record_outbound_result(
+                        outbound_name.to_string(),
+                        kind.clone(),
+                        true,
+                        Some(latency_ms),
+                        None,
+                    )
+                    .await;
+                Ok(stream)
+            }
+            Err(error) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                self.telemetry
+                    .record_outbound_result(
+                        outbound_name.to_string(),
+                        kind,
+                        false,
+                        Some(latency_ms),
+                        Some(error.to_string()),
+                    )
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn resolve_group_member(&self, group_name: &str) -> anyhow::Result<String> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| anyhow!("runtime state lock poisoned"))?;
+
+        let group_config = state
+            .config
+            .outbounds
+            .iter()
+            .find(|o| o.name() == group_name)
+            .ok_or_else(|| anyhow!("group '{}' not found", group_name))?;
+
+        let members = match group_config {
+            crate::config::OutboundConfig::Group { members, .. } => members.clone(),
+            _ => return Err(anyhow!("'{}' is not a group", group_name)),
+        };
+
+        let health = self.telemetry.outbound_health_sync();
+
+        let mut candidates: Vec<(&String, Option<u64>)> = members
+            .iter()
+            .map(|m| {
+                let latency = health
+                    .iter()
+                    .find(|h| h.name == *m)
+                    .and_then(|h| h.last_latency_ms);
+                (m, latency)
+            })
+            .collect();
+
+        candidates.sort_by_key(|(_, latency)| latency.unwrap_or(u64::MAX));
+
+        candidates
+            .first()
+            .map(|(name, _)| (*name).clone())
+            .ok_or_else(|| anyhow!("group '{}' has no members", group_name))
+    }
+
+    pub async fn resolve_country_best(&self, code: &str) -> anyhow::Result<String> {
+        let config = self.config();
+        let probe_timeout_ms = config.core.probe_timeout_ms;
+        let health_vec = self.telemetry.outbound_health().await;
+        let health: std::collections::HashMap<String, crate::telemetry::OutboundHealth> =
+            health_vec
+                .into_iter()
+                .map(|h| (h.name.clone(), h))
+                .collect();
+        let groups = country_groups_from_config(&config, &health);
+
+        let group = groups
+            .iter()
+            .find(|g| g.code.eq_ignore_ascii_case(code))
+            .ok_or_else(|| anyhow!("country group '{}' not found", code))?;
+
+        let best = group
+            .members
+            .iter()
+            .filter(|m| m.healthy)
+            .filter(|m| m.last_latency_ms.unwrap_or(u64::MAX) <= probe_timeout_ms)
+            .min_by_key(|m| m.last_latency_ms.unwrap_or(u64::MAX))
+            .or_else(|| group.members.first())
+            .ok_or_else(|| anyhow!("country group '{}' has no members", code))?;
+
+        Ok(best.name.clone())
+    }
+
+    pub fn outbound_health_sync(&self) -> Vec<crate::telemetry::OutboundHealth> {
+        self.telemetry.outbound_health_sync()
+    }
+
     pub async fn exchange_udp(
         &self,
         inbound: &'static str,
@@ -412,6 +645,7 @@ impl Runtime {
                 destination.clone(),
                 outbound_name.clone(),
                 decision.matched_rule.clone(),
+                crate::telemetry::Protocol::Udp,
             )
             .await;
         let started = Instant::now();
@@ -431,7 +665,13 @@ impl Runtime {
                     )
                     .await;
                 self.telemetry
-                    .add_transfer(id, payload.len() as u64, response.len() as u64)
+                    .add_transfer(
+                        id,
+                        payload.len() as u64,
+                        response.len() as u64,
+                        crate::telemetry::Protocol::Udp,
+                        &outbound_name,
+                    )
                     .await;
                 self.telemetry
                     .log(
@@ -488,6 +728,73 @@ impl Runtime {
 
     pub async fn probe_all_outbounds(&self) -> Vec<ProbeResult> {
         self.probe_all_outbounds_with(ProbeOptions::default()).await
+    }
+
+    pub fn l3_snapshot(&self) -> L3Snapshot {
+        self.l3_manager.snapshot()
+    }
+
+    pub fn collect_l3_endpoints(&self) -> Vec<String> {
+        let snapshot = self.l3_manager.snapshot();
+        snapshot
+            .profiles
+            .iter()
+            .filter_map(|p| p.endpoint.clone())
+            .collect()
+    }
+
+    pub fn is_l3_profile(&self, name: &str) -> bool {
+        let snapshot = self.l3_manager.snapshot();
+        snapshot.profiles.iter().any(|p| p.name == name)
+    }
+
+    pub fn is_proxy_group(&self, name: &str) -> bool {
+        let config = self.config();
+        config.outbounds.iter().any(|o| {
+            matches!(o, crate::config::OutboundConfig::Group { name: group_name, .. } if group_name == name)
+        })
+    }
+
+    pub async fn is_country_group(&self, name: &str) -> bool {
+        let config = self.config();
+        let health_vec = self.telemetry.outbound_health().await;
+        let health: HashMap<String, OutboundHealth> = health_vec
+            .into_iter()
+            .map(|h| (h.name.clone(), h))
+            .collect();
+        let country_groups = country_groups_from_config(&config, &health);
+        country_groups.iter().any(|g| g.code == name)
+    }
+
+    pub async fn send_l3_ip_packet(
+        &self,
+        profile: &str,
+        packet: Vec<u8>,
+    ) -> crate::l3::L3PacketSubmitResult {
+        self.l3_manager.send_ip_packet(profile, packet).await
+    }
+
+    pub fn subscribe_l3_ip_packets(
+        &self,
+        profile: &str,
+    ) -> anyhow::Result<tokio::sync::broadcast::Receiver<crate::l3::L3Packet>> {
+        self.l3_manager.subscribe_ip_packets(profile)
+    }
+
+    pub async fn start_l3_all(&self) -> Vec<L3TunnelStatus> {
+        self.l3_manager.start_all().await
+    }
+
+    pub async fn stop_l3_all(&self) -> Vec<L3TunnelStatus> {
+        self.l3_manager.stop_all().await
+    }
+
+    pub async fn start_l3(&self, name: &str) -> L3TunnelStatus {
+        self.l3_manager.start(name).await
+    }
+
+    pub fn stop_l3(&self, name: &str) -> L3TunnelStatus {
+        self.l3_manager.stop(name)
     }
 
     pub async fn proxy_groups(&self) -> Vec<ProxyGroupSnapshot> {
@@ -614,11 +921,21 @@ impl Runtime {
     }
 
     pub async fn probe_all_outbounds_with(&self, options: ProbeOptions) -> Vec<ProbeResult> {
+        let health = self
+            .telemetry
+            .outbound_health()
+            .await
+            .into_iter()
+            .map(|item| (item.name.clone(), item))
+            .collect::<HashMap<_, _>>();
         let (probe_url, probe_timeout_ms, probe_concurrency, outbounds) = {
             let state = match self.state.read() {
                 Ok(state) => state,
                 Err(_) => return Vec::new(),
             };
+            let failure_threshold = state.config.core.probe_failure_threshold.max(1);
+            let include_unsupported =
+                options.include_unsupported || !state.config.core.probe_only_supported;
             (
                 options
                     .url
@@ -628,11 +945,32 @@ impl Runtime {
                         .timeout_ms
                         .unwrap_or(state.config.core.probe_timeout_ms),
                 ),
-                sanitize_probe_concurrency(state.config.core.probe_concurrency),
+                sanitize_probe_concurrency(
+                    options
+                        .concurrency
+                        .unwrap_or(state.config.core.probe_concurrency),
+                ),
                 state
                     .outbounds
                     .values()
                     .filter(|outbound| outbound.kind() != "reject")
+                    .filter(|outbound| {
+                        include_unsupported
+                            || !matches!(outbound.kind(), "unsupported-protocol" | "l3-tunnel")
+                    })
+                    .filter(|outbound| {
+                        if options.include_failed {
+                            return true;
+                        }
+                        health
+                            .get(outbound.name())
+                            .map(|item| {
+                                !(item.last_error.is_some()
+                                    && item.failures >= failure_threshold
+                                    && item.successes == 0)
+                            })
+                            .unwrap_or(true)
+                    })
                     .cloned()
                     .collect::<Vec<_>>(),
             )
@@ -698,6 +1036,9 @@ impl Runtime {
     }
 
     fn spawn_direct_probe(&self, destination: Destination) {
+        let Ok(permit) = self.direct_probe_limit.clone().try_acquire_owned() else {
+            return;
+        };
         let engine = self.smart_rules.clone();
         let timeout_ms = self
             .state
@@ -707,6 +1048,7 @@ impl Runtime {
             })
             .unwrap_or(500);
         tokio::spawn(async move {
+            let _permit = permit;
             let outcome = smart::probe_direct_tcp(destination.clone(), timeout_ms).await;
             engine.record_direct_probe_result(&destination, outcome);
         });
@@ -724,7 +1066,13 @@ impl Runtime {
 
         sleep(Duration::from_secs(1)).await;
         loop {
-            let results = self.probe_all_outbounds().await;
+            let results = self
+                .probe_all_outbounds_with(ProbeOptions {
+                    include_failed: false,
+                    include_unsupported: false,
+                    ..ProbeOptions::default()
+                })
+                .await;
             let ok_count = results.iter().filter(|item| item.success).count();
             self.telemetry
                 .log(
@@ -752,6 +1100,7 @@ impl Runtime {
                 destination.clone(),
                 outbound_name.clone(),
                 decision.matched_rule.clone(),
+                crate::telemetry::Protocol::Tcp,
             )
             .await;
         self.telemetry
@@ -769,7 +1118,15 @@ impl Runtime {
             )
             .await;
 
-        let result = relay_bidirectional(self.telemetry.clone(), id, client, remote).await;
+        let result = relay_bidirectional(
+            self.telemetry.clone(),
+            id,
+            client,
+            remote,
+            &outbound_name,
+            crate::telemetry::Protocol::Tcp,
+        )
+        .await;
         self.close_connection_record(id).await;
         result
     }
@@ -1180,11 +1537,11 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                 method.to_ascii_lowercase().as_str(),
                 "aes-128-cfb" | "aes-192-cfb" | "aes-256-cfb"
             );
-            let protocol_supported = matches!(
-                protocol.to_ascii_lowercase().as_str(),
-                "origin" | "verify_sha1"
+            let protocol_supported = matches!(protocol.to_ascii_lowercase().as_str(), "origin");
+            let obfs_supported = matches!(
+                obfs.to_ascii_lowercase().as_str(),
+                "plain" | "" | "http" | "http_simple" | "http_post" | "http-post"
             );
-            let obfs_supported = matches!(obfs.to_ascii_lowercase().as_str(), "plain" | "");
             if !method_supported {
                 limitations.push(format!("unsupported ssr method {method}"));
             }
@@ -1198,7 +1555,7 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
             (
                 method_supported && protocol_supported && obfs_supported,
                 false,
-                Some("ssr-origin-cfb-tcp".to_string()),
+                Some("ssr-origin-cfb-tcp-http-obfs".to_string()),
             )
         }
         OutboundConfig::Snell { method, obfs, .. } => {
@@ -1211,22 +1568,57 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .is_none();
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "http" | "http_simple" | "obfs-http" | "simple-obfs-http"
+                    )
+                })
+                .unwrap_or(true);
             if !method_supported {
                 limitations.push(format!("unsupported snell method {method}"));
             }
             if !obfs_supported {
-                limitations.push("snell obfs is not supported".to_string());
+                limitations.push("snell tls/unknown obfs is not supported".to_string());
             }
             limitations.push("snell udp is not supported".to_string());
             (
                 method_supported && obfs_supported,
                 false,
-                Some("snell-aead-tcp".to_string()),
+                Some("snell-aead-tcp-http-obfs".to_string()),
             )
         }
-        OutboundConfig::Hysteria { .. } => {
-            unsupported_protocol_capability("hysteria", &mut limitations)
+        OutboundConfig::Hysteria {
+            auth,
+            auth_str,
+            obfs,
+            ..
+        } => {
+            let auth_present = auth
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|v| !v.is_empty())
+                || auth_str
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|v| !v.is_empty());
+            if !auth_present {
+                limitations.push("hysteria auth or auth_str is required".to_string());
+            }
+            let obfs_present = obfs
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            if obfs_present {
+                limitations.push("hysteria obfs is not implemented yet".to_string());
+            }
+            limitations.push("hysteria udp is not supported".to_string());
+            (
+                auth_present && !obfs_present,
+                false,
+                Some("quic-hysteria-tcp".to_string()),
+            )
         }
         OutboundConfig::AnyTls { .. } => {
             limitations.push("anytls udp is not supported".to_string());
@@ -1245,9 +1637,7 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                 Some("shadowtls-v3-tcp-transport".to_string()),
             )
         }
-        OutboundConfig::WireGuard { .. } => {
-            unsupported_protocol_capability("wireguard", &mut limitations)
-        }
+        OutboundConfig::WireGuard { .. } => l3_tunnel_capability("wireguard", &mut limitations),
         OutboundConfig::Ssh { .. } => {
             limitations.push("ssh udp is not supported".to_string());
             (true, false, Some("ssh-direct-tcpip".to_string()))
@@ -1259,9 +1649,7 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
         OutboundConfig::Masque { .. } => {
             unsupported_protocol_capability("masque", &mut limitations)
         }
-        OutboundConfig::OpenVpn { .. } => {
-            unsupported_protocol_capability("openvpn", &mut limitations)
-        }
+        OutboundConfig::OpenVpn { .. } => l3_tunnel_capability("openvpn", &mut limitations),
         OutboundConfig::Unknown { protocol, .. } => {
             unsupported_protocol_capability(protocol, &mut limitations)
         }
@@ -1285,6 +1673,25 @@ fn unsupported_protocol_capability(
         "{protocol} is recognized in config/subscriptions but native dialing is not implemented yet"
     ));
     (false, false, None)
+}
+
+fn l3_tunnel_capability(
+    protocol: &str,
+    limitations: &mut Vec<String>,
+) -> (bool, bool, Option<String>) {
+    let detail = match protocol {
+        "wireguard" => {
+            "wireguard runs through the native L3 manager with a WireGuard Noise packet engine; it is not a per-connection stream adapter"
+        }
+        "openvpn" => {
+            "openvpn is registered in the L3 manager while native OpenVPN TLS/control/data channels are being built; it is not a per-connection stream adapter"
+        }
+        _ => {
+            "this protocol is controlled by the L3 manager and is not a per-connection stream adapter"
+        }
+    };
+    limitations.push(detail.to_string());
+    (false, false, Some("l3-tunnel-manager".to_string()))
 }
 
 fn group_member_snapshot(
@@ -1318,27 +1725,59 @@ fn select_group_member(
     if members.is_empty() {
         return (None, "empty group".to_string());
     }
-    if !group_kind_is_auto_select(kind) {
+    let kind = kind.to_ascii_lowercase();
+    if !group_kind_is_auto_select(&kind) {
         return (
             members.first().map(|item| item.name.clone()),
-            "ordered group uses first configured member".to_string(),
+            "manual group uses first configured member until the client selects a member"
+                .to_string(),
         );
     }
 
-    if let Some(best) = members
-        .iter()
-        .filter(|item| item.healthy)
-        .min_by_key(|item| {
-            (
-                item.last_latency_ms.unwrap_or(u64::MAX),
-                100u8 - item.score.unwrap_or(0),
-            )
-        })
-    {
-        return (
-            Some(best.name.clone()),
-            "lowest healthy latency from telemetry".to_string(),
-        );
+    match kind.as_str() {
+        "fallback" => {
+            if let Some(best) = members.iter().find(|item| item.healthy) {
+                return (
+                    Some(best.name.clone()),
+                    "first healthy member in configured fallback order".to_string(),
+                );
+            }
+        }
+        "load-balance" => {
+            if let Some(best) = members
+                .iter()
+                .filter(|item| item.healthy)
+                .max_by_key(|item| {
+                    (
+                        item.score.unwrap_or(0),
+                        std::cmp::Reverse(item.failures),
+                        std::cmp::Reverse(item.last_latency_ms.unwrap_or(u64::MAX)),
+                    )
+                })
+            {
+                return (
+                    Some(best.name.clone()),
+                    "highest health score from telemetry".to_string(),
+                );
+            }
+        }
+        _ => {
+            if let Some(best) = members
+                .iter()
+                .filter(|item| item.healthy)
+                .min_by_key(|item| {
+                    (
+                        item.last_latency_ms.unwrap_or(u64::MAX),
+                        100u8 - item.score.unwrap_or(0),
+                    )
+                })
+            {
+                return (
+                    Some(best.name.clone()),
+                    "lowest healthy latency from telemetry".to_string(),
+                );
+            }
+        }
     }
 
     (
@@ -1350,7 +1789,7 @@ fn select_group_member(
 fn group_kind_is_auto_select(kind: &str) -> bool {
     matches!(
         kind.to_ascii_lowercase().as_str(),
-        "select" | "url-test" | "load-balance" | "auto" | "latency"
+        "select" | "url-test" | "fallback" | "load-balance" | "auto" | "latency"
     )
 }
 
@@ -1728,18 +2167,31 @@ async fn relay_bidirectional(
     id: uuid::Uuid,
     client: TcpStream,
     remote: BoxedStream,
+    outbound: &str,
+    protocol: crate::telemetry::Protocol,
 ) -> anyhow::Result<()> {
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut remote_read, mut remote_write) = tokio::io::split(remote);
 
+    let ob = outbound.to_string();
     let upload = copy_counted(
         &mut client_read,
         &mut remote_write,
         telemetry.clone(),
         id,
         true,
+        &ob,
+        protocol,
     );
-    let download = copy_counted(&mut remote_read, &mut client_write, telemetry, id, false);
+    let download = copy_counted(
+        &mut remote_read,
+        &mut client_write,
+        telemetry,
+        id,
+        false,
+        &ob,
+        protocol,
+    );
     tokio::select! {
         result = upload => result?,
         result = download => result?,
@@ -1753,6 +2205,8 @@ async fn copy_counted<R, W>(
     telemetry: Arc<Telemetry>,
     id: uuid::Uuid,
     upload: bool,
+    outbound: &str,
+    protocol: crate::telemetry::Protocol,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1767,9 +2221,13 @@ where
         }
         writer.write_all(&buf[..n]).await?;
         if upload {
-            telemetry.add_transfer(id, n as u64, 0).await;
+            telemetry
+                .add_transfer(id, n as u64, 0, protocol, outbound)
+                .await;
         } else {
-            telemetry.add_transfer(id, 0, n as u64).await;
+            telemetry
+                .add_transfer(id, 0, n as u64, protocol, outbound)
+                .await;
         }
     }
 }

@@ -497,9 +497,13 @@ proxies:
             Destination::new("example.com", 443),
             "direct".to_string(),
             None,
+            skyhook::telemetry::Protocol::Tcp,
         )
         .await;
-    runtime.telemetry().add_transfer(id, 64, 128).await;
+    runtime
+        .telemetry()
+        .add_transfer(id, 64, 128, skyhook::telemetry::Protocol::Tcp, "direct")
+        .await;
     runtime.close_connection_record(id).await;
 
     let index = store.index().expect("index");
@@ -564,6 +568,8 @@ async fn dns_exchange_uses_tcp_framing_through_runtime() {
     let mut config = SuperConfig::default();
     isolate_smart_state(&mut config, "dns-over-tcp");
     config.dns.server = addr;
+    config.dns.nameserver.clear();
+    config.dns.default_nameserver.clear();
 
     let runtime = Runtime::new(config).expect("runtime");
     let response = runtime
@@ -598,6 +604,9 @@ async fn probe_timeout_can_be_overridden_per_request() {
         .probe_all_outbounds_with(ProbeOptions {
             url: None,
             timeout_ms: Some(10),
+            concurrency: None,
+            include_unsupported: false,
+            include_failed: true,
         })
         .await;
 

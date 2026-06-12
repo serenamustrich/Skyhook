@@ -161,7 +161,7 @@ impl SubscriptionNode {
                 name: self.name.clone(),
                 server: self.server.clone(),
                 port: self.port,
-                psk: required_param(&self.params, &["psk", "password"], "snell psk")?,
+                psk: required_param(&self.params, &["psk", "password", "username"], "snell psk")?,
                 method: first_param(&self.params, &["method", "cipher"]),
                 version: first_param(&self.params, &["version", "v"])
                     .and_then(|value| value.parse().ok()),
@@ -330,7 +330,11 @@ impl SubscriptionNode {
                 name: self.name.clone(),
                 server: self.server.clone(),
                 port: self.port,
-                password: required_param(&self.params, &["password"], "shadowtls password")?,
+                password: required_param(
+                    &self.params,
+                    &["password", "username"],
+                    "shadowtls password",
+                )?,
                 version: first_param(&self.params, &["version", "v"])
                     .and_then(|value| value.parse().ok()),
                 sni: first_param(&self.params, &["sni", "servername", "host"]),
@@ -2006,6 +2010,387 @@ proxies:
                 assert_eq!(sni.as_deref(), Some("cdn.example.com"));
                 assert_eq!(congestion_control.as_deref(), Some("bbr"));
                 assert_eq!(udp_relay_mode.as_deref(), Some("native"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mieru_uri_to_outbound_config() {
+        let uri = "mieru://user1:pass1@mi.example.com:1080?transport=tcp#MI";
+
+        let doc = parse_subscription(uri).unwrap();
+        assert_eq!(doc.nodes.len(), 1);
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Mieru {
+                name,
+                server,
+                port,
+                username,
+                password,
+                transport,
+            } => {
+                assert_eq!(name, "MI");
+                assert_eq!(server, "mi.example.com");
+                assert_eq!(port, 1080);
+                assert_eq!(username, "user1");
+                assert_eq!(password, "pass1");
+                assert_eq!(transport.as_deref(), Some("tcp"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_juicity_uri_to_outbound_config() {
+        let uri = "juicity://11111111-1111-1111-1111-111111111111:secret@ju.example.com:443?sni=cdn.example.com&allowInsecure=1#JU";
+
+        let doc = parse_subscription(uri).unwrap();
+        assert_eq!(doc.nodes.len(), 1);
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Juicity {
+                name,
+                server,
+                port,
+                uuid,
+                password,
+                sni,
+                skip_cert_verify,
+            } => {
+                assert_eq!(name, "JU");
+                assert_eq!(server, "ju.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(uuid, "11111111-1111-1111-1111-111111111111");
+                assert_eq!(password, "secret");
+                assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+                assert!(skip_cert_verify);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_masque_uri_to_outbound_config() {
+        let uri = "masque://user:pass@mq.example.com:443?sni=cdn.example.com&allowInsecure=1#MQ";
+
+        let doc = parse_subscription(uri).unwrap();
+        assert_eq!(doc.nodes.len(), 1);
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Masque {
+                name,
+                server,
+                port,
+                username,
+                password,
+                sni,
+                skip_cert_verify,
+            } => {
+                assert_eq!(name, "MQ");
+                assert_eq!(server, "mq.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("pass"));
+                assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+                assert!(skip_cert_verify);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria_v1_uri_to_outbound_config() {
+        let uri = "hysteria://hy.example.com:443?auth=secret&sni=cdn.example.com&insecure=1&up=100&down=200#HY1";
+
+        let doc = parse_subscription(uri).unwrap();
+        assert_eq!(doc.nodes.len(), 1);
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Hysteria {
+                name,
+                server,
+                port,
+                auth,
+                auth_str,
+                sni,
+                skip_cert_verify,
+                up,
+                down,
+                ..
+            } => {
+                assert_eq!(name, "HY1");
+                assert_eq!(server, "hy.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(auth.as_deref(), Some("secret"));
+                assert!(auth_str.is_none());
+                assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+                assert!(skip_cert_verify);
+                assert_eq!(up.as_deref(), Some("100"));
+                assert_eq!(down.as_deref(), Some("200"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_openvpn_uri_to_outbound_config() {
+        let uri = "openvpn://ov.example.com:1194?profile=/etc/openvpn/client.ovpn#OVPN";
+
+        let doc = parse_subscription(uri).unwrap();
+        assert_eq!(doc.nodes.len(), 1);
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::OpenVpn {
+                name,
+                profile,
+                inline_profile,
+            } => {
+                assert_eq!(name, "OVPN");
+                assert_eq!(
+                    profile.map(|p| p.display().to_string()),
+                    Some("/etc/openvpn/client.ovpn".to_string())
+                );
+                assert!(inline_profile.is_none());
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_protocol_uri_parsed_as_unknown() {
+        let uri = "foo://bar.example.com:443#FOO";
+        let doc = parse_subscription(uri).unwrap();
+        assert_eq!(doc.nodes.len(), 1);
+        assert_eq!(
+            doc.nodes[0].protocol,
+            NodeProtocol::Unknown("foo".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_mieru_node_round_trips_to_unsupported_outbound() {
+        let text = r#"
+proxies:
+  - name: MI-01
+    type: mieru
+    server: mi.example.com
+    port: 1080
+    username: user1
+    password: pass1
+"#;
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Mieru { name, .. } => assert_eq!(name, "MI-01"),
+            other => panic!("expected Mieru, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_juicity_node_round_trips_to_unsupported_outbound() {
+        let text = r#"
+proxies:
+  - name: JU-01
+    type: juicity
+    server: ju.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    password: secret
+"#;
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Juicity { name, .. } => assert_eq!(name, "JU-01"),
+            other => panic!("expected Juicity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_masque_node_round_trips_to_unsupported_outbound() {
+        let text = r#"
+proxies:
+  - name: MQ-01
+    type: masque
+    server: mq.example.com
+    port: 443
+    username: user
+    password: pass
+"#;
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Masque { name, .. } => assert_eq!(name, "MQ-01"),
+            other => panic!("expected Masque, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_hysteria_v1_node_round_trips_to_unsupported_outbound() {
+        let text = r#"
+proxies:
+  - name: HY1-01
+    type: hysteria
+    server: hy.example.com
+    port: 443
+    auth: secret
+"#;
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Hysteria { name, .. } => assert_eq!(name, "HY1-01"),
+            other => panic!("expected Hysteria, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ssh_uri_to_outbound_config() {
+        let uri = "ssh://admin:secret@ssh.example.com:22#SSH-01";
+
+        let doc = parse_subscription(uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Ssh {
+                name,
+                server,
+                port,
+                username,
+                password,
+                ..
+            } => {
+                assert_eq!(name, "SSH-01");
+                assert_eq!(server, "ssh.example.com");
+                assert_eq!(port, 22);
+                assert_eq!(username, "admin");
+                assert_eq!(password.as_deref(), Some("secret"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ssr_uri_to_outbound_config() {
+        let payload = "host.example.com:443:origin:aes-256-cfb:plain:cGFzcw/?obfsparam=b2Jmcw&protoparam=cHJvdG8&remarks=U1NSLTAx";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let uri = format!("ssr://{encoded}");
+
+        let doc = parse_subscription(&uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Ssr {
+                name,
+                server,
+                port,
+                method,
+                password,
+                protocol,
+                obfs,
+                protocol_param,
+                obfs_param,
+            } => {
+                assert_eq!(name, "SSR-01");
+                assert_eq!(server, "host.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(method, "aes-256-cfb");
+                assert_eq!(password, "pass");
+                assert_eq!(protocol, "origin");
+                assert_eq!(obfs, "plain");
+                assert_eq!(obfs_param.as_deref(), Some("obfs"));
+                assert_eq!(protocol_param.as_deref(), Some("proto"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_snell_uri_to_outbound_config() {
+        let uri = "snell://mykey@sn.example.com:8388?obfs=http&obfs-host=edge.example.com&version=3#SN-01";
+
+        let doc = parse_subscription(uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Snell {
+                name,
+                server,
+                port,
+                psk,
+                version,
+                obfs,
+                obfs_host,
+                ..
+            } => {
+                assert_eq!(name, "SN-01");
+                assert_eq!(server, "sn.example.com");
+                assert_eq!(port, 8388);
+                assert_eq!(psk, "mykey");
+                assert_eq!(version, Some(3));
+                assert_eq!(obfs.as_deref(), Some("http"));
+                assert_eq!(obfs_host.as_deref(), Some("edge.example.com"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_shadowtls_uri_to_outbound_config() {
+        let uri = "shadowtls://secretpw@st.example.com:443?sni=cdn.example.com&version=3#ST-01";
+
+        let doc = parse_subscription(uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::ShadowTls {
+                name,
+                server,
+                port,
+                password,
+                version,
+                sni,
+                ..
+            } => {
+                assert_eq!(name, "ST-01");
+                assert_eq!(server, "st.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(password, "secretpw");
+                assert_eq!(version, Some(3));
+                assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_anytls_uri_to_outbound_config() {
+        let uri = "anytls://secret@at.example.com:443?sni=cdn.example.com&alpn=h2#AT";
+
+        let doc = parse_subscription(uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::AnyTls {
+                name,
+                server,
+                port,
+                password,
+                sni,
+                alpn,
+                ..
+            } => {
+                assert_eq!(name, "AT");
+                assert_eq!(server, "at.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(password, "secret");
+                assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+                assert_eq!(alpn, vec!["h2".to_string()]);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

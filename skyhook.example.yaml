@@ -22,6 +22,30 @@ tun:
   bypass: []
   udpgw_server:
 
+# NativeL3 TUN example (experimental)
+# tun:
+#   enabled: true
+#   backend: native-l3
+#   l3_profile: wg-main
+#   name: utun
+#   setup: true
+#   auto_route: true
+#   mtu: 1420
+#   inet4_address:
+#     - 198.18.0.1/30
+#   inet4_route_address:
+#     - 0.0.0.0/1
+#     - 128.0.0.0/1
+#   bypass:
+#     - 127.0.0.0/8
+#     - 10.0.0.0/8
+
+l3:
+  enabled: true
+  auto_start: true
+  handshake_interval_secs: 25
+  start_timeout_ms: 1000
+
 dns:
   enabled: true
   server: 8.8.8.8:53

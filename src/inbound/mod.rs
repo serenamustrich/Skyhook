@@ -1,3 +1,13 @@
 pub mod dns;
 pub mod mixed;
+pub mod native_tun;
+pub mod native_tun_dns;
+pub mod native_tun_flow;
+pub mod native_tun_metrics;
+pub mod native_tun_packet;
+pub mod native_tun_process;
+pub mod native_tun_router;
+pub mod native_tun_session;
+pub mod native_tun_stack;
+pub mod native_tun_system;
 pub mod tun;

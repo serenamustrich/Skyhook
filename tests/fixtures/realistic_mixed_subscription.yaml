@@ -42,6 +42,18 @@ proxies:
       path: /ws
       headers:
         Host: vmess-edge.example.com
+  - name: MI-Unsupported-01
+    type: mieru
+    server: mi.example.com
+    port: 1080
+    username: user1
+    password: pass1
+  - name: JU-Unsupported-01
+    type: juicity
+    server: ju.example.com
+    port: 443
+    uuid: 33333333-3333-3333-3333-333333333333
+    password: secret
 proxy-groups:
   - name: Auto
     type: url-test

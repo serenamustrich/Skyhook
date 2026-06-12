@@ -858,10 +858,7 @@ async fn fetch_subscription_url_once(
 ) -> anyhow::Result<String> {
     let response = client
         .get(url)
-        .header(
-            "User-Agent",
-            concat!("Skyhook/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
         .send()
         .await?
         .error_for_status()?;

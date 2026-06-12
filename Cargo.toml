@@ -16,12 +16,14 @@ aes-gcm = "0.10"
 axum = "0.7"
 base64 = "0.22"
 blake2 = "0.10"
+boringtun = "0.7.1"
 bytes = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 crc32c = "0.6"
 digest = "0.10"
+dirs = "5"
 getrandom = "0.3"
 h2 = "0.4"
 h3 = "0.0.8"
@@ -29,6 +31,7 @@ h3-quinn = "0.0.10"
 hkdf = "0.12"
 http = "1"
 ipnet = { version = "2", features = ["serde"] }
+libc = "0.2"
 maxminddb = "0.28.1"
 md-5 = "0.10"
 quinn = "0.11.9"
@@ -56,9 +59,18 @@ x25519-dalek = { version = "3.0.0-rc.0", features = ["getrandom", "static_secret
 russh = "0.61.2"
 cfb-mode = "0.8.2"
 argon2 = "0.5.3"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "socket-tcp",
+    "socket-udp",
+    "proto-ipv4",
+    "proto-ipv6",
+] }
 
 [dev-dependencies]
 rcgen = "0.13"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

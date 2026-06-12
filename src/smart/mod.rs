@@ -33,8 +33,13 @@ pub struct SmartSnapshot {
     pub direct_outbound: String,
     pub proxy_outbound: Option<String>,
     pub direct_probe_timeout_ms: u64,
+    pub direct_probe_concurrency: usize,
     pub probe_cooldown_secs: u64,
     pub min_samples: u32,
+    pub direct_success_min_ratio: f64,
+    pub proxy_failure_min_ratio: f64,
+    pub auto_apply_min_confidence: f64,
+    pub direct_max_latency_ms: u64,
     pub state_path: String,
     pub persist_interval_secs: u64,
     pub max_observations: usize,
@@ -176,6 +181,9 @@ impl SmartRuleEngine {
                 continue;
             };
             if let Some(recommendation) = self.recommendation_for(observation, true) {
+                if recommendation.confidence < clamp_ratio(config.auto_apply_min_confidence) {
+                    continue;
+                }
                 return Some(RouteDecision {
                     outbound: recommendation.recommended_outbound,
                     matched_rule: Some(format!("SmartAuto:{target:?}:{value}")),
@@ -392,7 +400,7 @@ impl SmartRuleEngine {
         }
 
         let mut observations = self.observations.write().expect("smart observations lock");
-        for (target, value) in host_observation_targets(destination) {
+        for (target, value) in observation_targets(destination) {
             let key = observation_key(target, &value);
             let item = observations
                 .entry(key.clone())
@@ -441,8 +449,13 @@ impl SmartRuleEngine {
             direct_outbound: config.direct_outbound.clone(),
             proxy_outbound: config.proxy_outbound.clone(),
             direct_probe_timeout_ms: config.direct_probe_timeout_ms,
+            direct_probe_concurrency: config.direct_probe_concurrency,
             probe_cooldown_secs: config.probe_cooldown_secs,
             min_samples: config.min_samples,
+            direct_success_min_ratio: config.direct_success_min_ratio,
+            proxy_failure_min_ratio: config.proxy_failure_min_ratio,
+            auto_apply_min_confidence: config.auto_apply_min_confidence,
+            direct_max_latency_ms: config.direct_max_latency_ms,
             state_path: config.state_path.display().to_string(),
             persist_interval_secs: config.persist_interval_secs,
             max_observations: config.max_observations,
@@ -552,37 +565,48 @@ impl SmartRuleEngine {
         if require_min_samples && attempts < config.min_samples as u64 {
             return None;
         }
+        let success_ratio = ratio(observation.direct_probe_successes, attempts);
+        let failure_ratio = ratio(observation.direct_probe_failures, attempts);
+        let latency_ok = observation
+            .last_direct_latency_ms
+            .map(|latency| latency <= config.direct_max_latency_ms)
+            .unwrap_or(false);
 
-        if observation.direct_probe_successes > 0 {
+        if observation.direct_probe_successes > 0
+            && success_ratio >= clamp_ratio(config.direct_success_min_ratio)
+            && latency_ok
+        {
             return Some(SmartRecommendation {
                 target: observation.target,
                 value: observation.value.clone(),
                 recommended_outbound: config.direct_outbound.clone(),
                 action: SmartRecommendationAction::Direct,
-                confidence: confidence(
-                    observation.direct_probe_successes,
-                    observation.direct_probe_attempts,
+                confidence: confidence(observation.direct_probe_successes, attempts),
+                reason: format!(
+                    "direct tcp probe success ratio {:.0}% and latency <= {}ms",
+                    success_ratio * 100.0,
+                    config.direct_max_latency_ms
                 ),
-                reason: "direct tcp probe can reach this target".to_string(),
                 latency_ms: observation.last_direct_latency_ms,
             });
         }
 
-        if observation.direct_probe_failures > 0 {
+        if observation.direct_probe_failures > 0
+            && failure_ratio >= clamp_ratio(config.proxy_failure_min_ratio)
+        {
             let proxy_outbound = config.proxy_outbound.clone()?;
             return Some(SmartRecommendation {
                 target: observation.target,
                 value: observation.value.clone(),
                 recommended_outbound: proxy_outbound,
                 action: SmartRecommendationAction::Proxy,
-                confidence: confidence(
-                    observation.direct_probe_failures,
-                    observation.direct_probe_attempts,
-                ),
-                reason: observation
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "direct tcp probe failed".to_string()),
+                confidence: confidence(observation.direct_probe_failures, attempts),
+                reason: observation.last_error.clone().unwrap_or_else(|| {
+                    format!(
+                        "direct tcp probe failure ratio {:.0}%",
+                        failure_ratio * 100.0
+                    )
+                }),
                 latency_ms: observation.last_direct_latency_ms,
             });
         }
@@ -912,5 +936,21 @@ fn confidence(matches: u64, attempts: u64) -> f64 {
         0.0
     } else {
         matches as f64 / attempts as f64
+    }
+}
+
+fn ratio(count: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64
+    }
+}
+
+fn clamp_ratio(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        1.0
     }
 }

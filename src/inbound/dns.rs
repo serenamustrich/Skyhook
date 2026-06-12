@@ -51,6 +51,16 @@ async fn serve_udp(runtime: Arc<Runtime>, udp: Arc<UdpSocket>) -> anyhow::Result
         tokio::spawn(async move {
             match runtime.exchange_dns_over_tcp(&query).await {
                 Ok(response) => {
+                    runtime
+                        .telemetry()
+                        .add_transfer(
+                            uuid::Uuid::nil(),
+                            query.len() as u64,
+                            response.len() as u64,
+                            crate::telemetry::Protocol::Dns,
+                            "",
+                        )
+                        .await;
                     let _ = udp.send_to(&response, peer).await;
                 }
                 Err(error) => {
@@ -97,6 +107,16 @@ async fn handle_tcp_client(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyh
         if response.len() > u16::MAX as usize {
             anyhow::bail!("dns response is too large");
         }
+        runtime
+            .telemetry()
+            .add_transfer(
+                uuid::Uuid::nil(),
+                query.len() as u64,
+                response.len() as u64,
+                crate::telemetry::Protocol::Dns,
+                "",
+            )
+            .await;
         stream
             .write_all(&(response.len() as u16).to_be_bytes())
             .await?;

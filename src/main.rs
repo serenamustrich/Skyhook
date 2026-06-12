@@ -8,7 +8,7 @@ use std::{
 use clap::{Parser, Subcommand};
 use skyhook::{
     api,
-    config::{SubscriptionConfig, SuperConfig},
+    config::{SubscriptionConfig, SuperConfig, TunBackend},
     core::{ProbeOptions, Runtime},
     geo, inbound, subscription,
     subscription_store::{SubscriptionStore, SubscriptionUpdateOptions, DEFAULT_STORE_DIR},
@@ -126,11 +126,45 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%mixed_addr, %control_addr, "starting skyhook");
             tokio::spawn(runtime.clone().background_probe_loop());
             tokio::spawn(background_subscription_update_loop(subscription_config));
+            if runtime.config().l3.enabled && runtime.config().l3.auto_start {
+                let statuses = runtime.start_l3_all().await;
+                let started = statuses
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.state,
+                            skyhook::l3::L3TunnelState::Starting
+                                | skyhook::l3::L3TunnelState::Handshaking
+                                | skyhook::l3::L3TunnelState::Running
+                        )
+                    })
+                    .count();
+                tracing::info!(started, total = statuses.len(), "l3 auto-start requested");
+            }
 
             let mut tasks = JoinSet::new();
             tasks.spawn(api::serve(runtime.clone()));
             if runtime.config().tun.enabled {
-                tasks.spawn(inbound::tun::serve(runtime.clone()));
+                match runtime.config().tun.backend {
+                    TunBackend::Tun2Proxy => {
+                        tasks.spawn(inbound::tun::serve(runtime.clone()));
+                    }
+                    TunBackend::NativeL3 => {
+                        if let Some(l3_name) = runtime.config().tun.l3_profile.clone() {
+                            let status = runtime.start_l3(&l3_name).await;
+                            tracing::info!(
+                                l3_profile = l3_name,
+                                state = ?status.state,
+                                "native_l3: l3 profile start requested"
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "native_l3 tun backend requires tun.l3_profile to be set"
+                            );
+                        }
+                        tasks.spawn(inbound::native_tun::serve(runtime.clone()));
+                    }
+                }
             }
             if runtime.config().dns.enabled && runtime.config().dns.listen.is_some() {
                 tasks.spawn(inbound::dns::serve(runtime.clone()));
@@ -153,7 +187,12 @@ async fn main() -> anyhow::Result<()> {
             let config = load_runtime_config(&config).await?;
             let runtime = Runtime::new(config)?;
             let results = runtime
-                .probe_all_outbounds_with(ProbeOptions { url, timeout_ms })
+                .probe_all_outbounds_with(ProbeOptions {
+                    url,
+                    timeout_ms,
+                    include_failed: true,
+                    ..ProbeOptions::default()
+                })
                 .await;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
@@ -327,10 +366,7 @@ async fn read_subscription_source(
                 ))
                 .build()?
                 .get(url)
-                .header(
-                    "User-Agent",
-                    concat!("Skyhook/", env!("CARGO_PKG_VERSION")),
-                )
+                .header("User-Agent", concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
                 .send()
                 .await?
                 .error_for_status()?;

@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SuperConfig {
     #[serde(default)]
     pub core: CoreConfig,
@@ -15,6 +15,8 @@ pub struct SuperConfig {
     pub tun: TunConfig,
     #[serde(default)]
     pub dns: DnsConfig,
+    #[serde(default)]
+    pub l3: L3Config,
     #[serde(default)]
     pub smart_rules: SmartRulesConfig,
     #[serde(default)]
@@ -51,6 +53,10 @@ pub struct CoreConfig {
     pub probe_interval_secs: u64,
     #[serde(default = "default_probe_concurrency")]
     pub probe_concurrency: usize,
+    #[serde(default = "default_probe_only_supported")]
+    pub probe_only_supported: bool,
+    #[serde(default = "default_probe_failure_threshold")]
+    pub probe_failure_threshold: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +65,10 @@ pub struct TunConfig {
     pub enabled: bool,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default = "default_tun_backend")]
+    pub backend: TunBackend,
+    #[serde(default)]
+    pub l3_profile: Option<String>,
     #[serde(default = "default_tun_stack")]
     pub stack: TunStack,
     #[serde(default = "default_tun_setup")]
@@ -103,6 +113,10 @@ pub struct TunConfig {
     pub max_sessions: usize,
     #[serde(default)]
     pub bypass: Vec<String>,
+    #[serde(default = "default_tun_auto_bypass_private")]
+    pub auto_bypass_private: bool,
+    #[serde(default = "default_tun_auto_bypass_proxy_servers")]
+    pub auto_bypass_proxy_servers: bool,
     #[serde(default)]
     pub route_exclude_address: Vec<String>,
     #[serde(default)]
@@ -181,6 +195,25 @@ pub struct DnsConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_dns_block_non_dns_udp")]
     pub block_non_dns_udp: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct L3Config {
+    #[serde(default = "default_l3_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_l3_auto_start")]
+    pub auto_start: bool,
+    #[serde(default = "default_l3_handshake_interval_secs")]
+    pub handshake_interval_secs: u64,
+    #[serde(default = "default_l3_start_timeout_ms")]
+    pub start_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunBackend {
+    Tun2Proxy,
+    NativeL3,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -581,7 +614,7 @@ pub enum RuleSetBehavior {
     Classical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SmartRulesConfig {
     #[serde(default = "default_smart_rules_enabled")]
     pub enabled: bool,
@@ -595,10 +628,20 @@ pub struct SmartRulesConfig {
     pub proxy_outbound: Option<String>,
     #[serde(default = "default_smart_direct_probe_timeout_ms")]
     pub direct_probe_timeout_ms: u64,
+    #[serde(default = "default_smart_direct_probe_concurrency")]
+    pub direct_probe_concurrency: usize,
     #[serde(default = "default_smart_probe_cooldown_secs")]
     pub probe_cooldown_secs: u64,
     #[serde(default = "default_smart_min_samples")]
     pub min_samples: u32,
+    #[serde(default = "default_smart_direct_success_min_ratio")]
+    pub direct_success_min_ratio: f64,
+    #[serde(default = "default_smart_proxy_failure_min_ratio")]
+    pub proxy_failure_min_ratio: f64,
+    #[serde(default = "default_smart_auto_apply_min_confidence")]
+    pub auto_apply_min_confidence: f64,
+    #[serde(default = "default_smart_direct_max_latency_ms")]
+    pub direct_max_latency_ms: u64,
     #[serde(default = "default_smart_state_path")]
     pub state_path: PathBuf,
     #[serde(default = "default_smart_persist_interval_secs")]
@@ -680,6 +723,7 @@ impl Default for SuperConfig {
             core: CoreConfig::default(),
             tun: TunConfig::default(),
             dns: DnsConfig::default(),
+            l3: L3Config::default(),
             smart_rules: SmartRulesConfig::default(),
             subscriptions: SubscriptionConfig::default(),
             geo: GeoConfig::default(),
@@ -730,11 +774,24 @@ impl Default for DnsConfig {
     }
 }
 
+impl Default for L3Config {
+    fn default() -> Self {
+        Self {
+            enabled: default_l3_enabled(),
+            auto_start: default_l3_auto_start(),
+            handshake_interval_secs: default_l3_handshake_interval_secs(),
+            start_timeout_ms: default_l3_start_timeout_ms(),
+        }
+    }
+}
+
 impl Default for TunConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             name: None,
+            backend: default_tun_backend(),
+            l3_profile: None,
             stack: default_tun_stack(),
             setup: default_tun_setup(),
             auto_route: false,
@@ -757,6 +814,8 @@ impl Default for TunConfig {
             udp_timeout_secs: default_tun_udp_timeout_secs(),
             max_sessions: default_tun_max_sessions(),
             bypass: Vec::new(),
+            auto_bypass_private: default_tun_auto_bypass_private(),
+            auto_bypass_proxy_servers: default_tun_auto_bypass_proxy_servers(),
             route_exclude_address: Vec::new(),
             include_uid: Vec::new(),
             include_uid_range: Vec::new(),
@@ -792,8 +851,13 @@ impl Default for SmartRulesConfig {
             direct_outbound: default_smart_direct_outbound(),
             proxy_outbound: None,
             direct_probe_timeout_ms: default_smart_direct_probe_timeout_ms(),
+            direct_probe_concurrency: default_smart_direct_probe_concurrency(),
             probe_cooldown_secs: default_smart_probe_cooldown_secs(),
             min_samples: default_smart_min_samples(),
+            direct_success_min_ratio: default_smart_direct_success_min_ratio(),
+            proxy_failure_min_ratio: default_smart_proxy_failure_min_ratio(),
+            auto_apply_min_confidence: default_smart_auto_apply_min_confidence(),
+            direct_max_latency_ms: default_smart_direct_max_latency_ms(),
             state_path: default_smart_state_path(),
             persist_interval_secs: default_smart_persist_interval_secs(),
             max_observations: default_smart_max_observations(),
@@ -842,6 +906,8 @@ impl Default for CoreConfig {
             probe_timeout_ms: default_probe_timeout_ms(),
             probe_interval_secs: default_probe_interval_secs(),
             probe_concurrency: default_probe_concurrency(),
+            probe_only_supported: default_probe_only_supported(),
+            probe_failure_threshold: default_probe_failure_threshold(),
         }
     }
 }
@@ -910,6 +976,10 @@ fn default_outbounds() -> Vec<OutboundConfig> {
     ]
 }
 
+fn default_tun_backend() -> TunBackend {
+    TunBackend::Tun2Proxy
+}
+
 fn default_tun_setup() -> bool {
     false
 }
@@ -956,6 +1026,14 @@ fn default_tun_udp_timeout_secs() -> u64 {
 
 fn default_tun_max_sessions() -> usize {
     200
+}
+
+fn default_tun_auto_bypass_private() -> bool {
+    true
+}
+
+fn default_tun_auto_bypass_proxy_servers() -> bool {
+    true
 }
 
 fn default_dns_enabled() -> bool {
@@ -1024,6 +1102,22 @@ fn default_dns_timeout_ms() -> u64 {
 
 fn default_dns_block_non_dns_udp() -> bool {
     false
+}
+
+fn default_l3_enabled() -> bool {
+    true
+}
+
+fn default_l3_auto_start() -> bool {
+    true
+}
+
+fn default_l3_handshake_interval_secs() -> u64 {
+    25
+}
+
+fn default_l3_start_timeout_ms() -> u64 {
+    1_000
 }
 
 fn default_subscriptions_use_active() -> bool {
@@ -1118,6 +1212,14 @@ fn default_probe_concurrency() -> usize {
     256
 }
 
+fn default_probe_only_supported() -> bool {
+    true
+}
+
+fn default_probe_failure_threshold() -> u64 {
+    2
+}
+
 fn default_smart_rules_enabled() -> bool {
     true
 }
@@ -1138,12 +1240,32 @@ fn default_smart_direct_probe_timeout_ms() -> u64 {
     500
 }
 
+fn default_smart_direct_probe_concurrency() -> usize {
+    64
+}
+
 fn default_smart_probe_cooldown_secs() -> u64 {
     300
 }
 
 fn default_smart_min_samples() -> u32 {
     2
+}
+
+fn default_smart_direct_success_min_ratio() -> f64 {
+    0.75
+}
+
+fn default_smart_proxy_failure_min_ratio() -> f64 {
+    0.75
+}
+
+fn default_smart_auto_apply_min_confidence() -> f64 {
+    0.80
+}
+
+fn default_smart_direct_max_latency_ms() -> u64 {
+    500
 }
 
 fn default_smart_state_path() -> PathBuf {

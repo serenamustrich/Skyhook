@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::{OutboundConfig, RuleTarget, SmartRouteRule, SuperConfig},
     core::{ProbeOptions, Runtime},
+    inbound::{native_tun, tun},
     routing::Destination,
     smart::SmartRecommendationAction,
     subscription_store::SubscriptionStore,
@@ -37,6 +38,11 @@ struct StatusResponse {
 struct ProbeRequest {
     url: Option<String>,
     timeout_ms: Option<u64>,
+    concurrency: Option<usize>,
+    #[serde(default)]
+    include_unsupported: bool,
+    #[serde(default = "default_true")]
+    include_failed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +81,24 @@ struct SmartRuleDeleteRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct RuleAddRequest {
+    target: RuleTarget,
+    value: String,
+    outbound: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleDeleteRequest {
+    index: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleReorderRequest {
+    from: usize,
+    to: usize,
+}
+
+#[derive(Debug, Deserialize)]
 struct SubscriptionImportRequest {
     #[serde(default)]
     id: Option<String>,
@@ -101,6 +125,12 @@ struct CountryUseRequest {
 #[derive(Debug, Deserialize)]
 struct OutboundUseRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct L3StartStopRequest {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,15 +162,24 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         .route("/skyhook/version", get(version))
         .route("/skyhook/status", get(status))
         .route("/skyhook/connections", get(connections))
-        .route(
-            "/skyhook/traffic/subscriptions",
-            get(subscription_traffic),
-        )
+        .route("/skyhook/traffic/subscriptions", get(subscription_traffic))
+        .route("/skyhook/traffic/detailed", get(detailed_traffic))
+        .route("/skyhook/traffic/realtime", get(traffic_realtime))
+        .route("/skyhook/traffic/by-outbound", get(traffic_by_outbound))
+        .route("/skyhook/traffic/by-protocol", get(traffic_by_protocol))
+        .route("/skyhook/connections/active", get(active_connections))
         .route("/skyhook/outbounds", get(outbounds))
         .route("/skyhook/outbounds/use", post(use_outbound))
         .route("/skyhook/groups", get(groups))
         .route("/skyhook/countries", get(countries))
         .route("/skyhook/countries/use", post(use_country))
+        .route("/skyhook/tun/profile", get(tun_profile))
+        .route("/skyhook/tun/status", get(tun_status))
+        .route("/skyhook/tun/metrics", get(tun_metrics))
+        .route("/skyhook/tun/reload", post(tun_reload))
+        .route("/skyhook/l3", get(l3_snapshot))
+        .route("/skyhook/l3/start", post(start_l3))
+        .route("/skyhook/l3/stop", post(stop_l3))
         .route("/skyhook/probe/outbounds", post(probe_outbounds))
         .route("/skyhook/route/decision", post(route_decision))
         .route("/skyhook/subscriptions", get(subscriptions))
@@ -162,10 +201,24 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
             "/skyhook/smart-rules",
             get(smart_rules).post(upsert_smart_rule),
         )
+        .route("/skyhook/smart-rules/stats", get(smart_rules_stats))
         .route(
-            "/skyhook/smart-rules/enabled",
-            post(set_smart_rule_enabled),
+            "/skyhook/smart-rules/recommendations",
+            get(smart_rules_recommendations),
         )
+        .route(
+            "/skyhook/smart-rules/recommendations/apply-all",
+            post(apply_smart_recommendations),
+        )
+        .route(
+            "/skyhook/smart-rules/recommendations/apply-one",
+            post(apply_smart_recommendation),
+        )
+        .route(
+            "/skyhook/smart-rules/recommendations/ignore",
+            post(ignore_smart_recommendation),
+        )
+        .route("/skyhook/smart-rules/enabled", post(set_smart_rule_enabled))
         .route("/skyhook/smart-rules/delete", post(delete_smart_rule))
         .route(
             "/skyhook/smart-rules/apply-recommendations",
@@ -175,6 +228,9 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
             "/skyhook/smart-rules/apply-recommendation",
             post(apply_smart_recommendation),
         )
+        .route("/skyhook/rules", get(list_rules).post(add_rule))
+        .route("/skyhook/rules/delete", post(delete_rule))
+        .route("/skyhook/rules/reorder", post(reorder_rules))
         .route("/skyhook/logs", get(logs))
         .route("/skyhook/config", get(config))
         .route("/skyhook/config/reload", post(reload_config))
@@ -217,6 +273,37 @@ async fn connections(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Va
 
 async fn traffic(State(runtime): State<Arc<Runtime>>) -> Json<crate::telemetry::TrafficSnapshot> {
     Json(runtime.telemetry().traffic())
+}
+
+async fn detailed_traffic(
+    State(runtime): State<Arc<Runtime>>,
+) -> Json<crate::telemetry::DetailedTrafficSnapshot> {
+    Json(runtime.telemetry().detailed_traffic().await)
+}
+
+async fn traffic_realtime(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!(runtime.telemetry().realtime_traffic()))
+}
+
+async fn active_connections(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "connections": runtime.telemetry().active_connections().await,
+    }))
+}
+
+async fn traffic_by_outbound(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "outbounds": runtime.telemetry().traffic_by_outbound().await,
+    }))
+}
+
+async fn traffic_by_protocol(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "protocols": runtime.telemetry().traffic_by_protocol().await,
+    }))
 }
 
 async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
@@ -358,6 +445,115 @@ async fn countries(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Valu
     }))
 }
 
+async fn tun_profile(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    if config.tun.backend == crate::config::TunBackend::NativeL3 {
+        Json(serde_json::json!({
+            "profile": native_tun::profile(&config),
+        }))
+    } else {
+        Json(serde_json::json!({
+            "profile": tun::profile(&config),
+        }))
+    }
+}
+
+async fn tun_status(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    if config.tun.backend != crate::config::TunBackend::NativeL3 {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "TUN backend is not native-l3",
+        }));
+    }
+
+    let profile = native_tun::profile(&config);
+    let metrics = runtime.native_tun_metrics();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "status": {
+            "backend": "native-l3",
+            "running": metrics.running,
+            "interface_name": metrics.interface_name,
+            "l3_profile": metrics.l3_profile,
+            "mtu": metrics.mtu,
+            "setup": {
+                "enabled": profile.setup_enabled,
+                "auto_route": profile.auto_route,
+                "routes": metrics.routes_installed,
+                "bypass": metrics.bypass_routes_installed,
+            },
+            "metrics": metrics,
+        }
+    }))
+}
+
+async fn tun_metrics(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    if config.tun.backend != crate::config::TunBackend::NativeL3 {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "TUN backend is not native-l3",
+        }));
+    }
+
+    let metrics = runtime.native_tun_metrics();
+    Json(serde_json::json!({
+        "ok": true,
+        "metrics": metrics,
+    }))
+}
+
+async fn tun_reload(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    if config.tun.backend != crate::config::TunBackend::NativeL3 {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "TUN backend is not native-l3",
+        }));
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": "hot reload not yet implemented for native-l3",
+    }))
+}
+
+async fn l3_snapshot(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!(runtime.l3_snapshot()))
+}
+
+async fn start_l3(
+    State(runtime): State<Arc<Runtime>>,
+    request: Option<Json<L3StartStopRequest>>,
+) -> Json<serde_json::Value> {
+    let name = request.and_then(|Json(request)| request.name);
+    let statuses = match name {
+        Some(name) => vec![runtime.start_l3(&name).await],
+        None => runtime.start_l3_all().await,
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "statuses": statuses,
+    }))
+}
+
+async fn stop_l3(
+    State(runtime): State<Arc<Runtime>>,
+    request: Option<Json<L3StartStopRequest>>,
+) -> Json<serde_json::Value> {
+    let name = request.and_then(|Json(request)| request.name);
+    let statuses = match name {
+        Some(name) => vec![runtime.stop_l3(&name)],
+        None => runtime.stop_l3_all().await,
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "statuses": statuses,
+    }))
+}
+
 async fn use_country(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<CountryUseRequest>,
@@ -386,8 +582,14 @@ async fn probe_outbounds(
         .map(|Json(request)| ProbeOptions {
             url: request.url,
             timeout_ms: request.timeout_ms,
+            concurrency: request.concurrency,
+            include_unsupported: request.include_unsupported,
+            include_failed: request.include_failed,
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|| ProbeOptions {
+            include_failed: true,
+            ..ProbeOptions::default()
+        });
     Json(serde_json::json!({
         "results": runtime.probe_all_outbounds_with(options).await,
     }))
@@ -405,6 +607,42 @@ async fn route_decision(
 
 async fn smart_rules(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     Json(serde_json::json!(runtime.smart_snapshot()))
+}
+
+async fn smart_rules_stats(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let snapshot = runtime.smart_snapshot();
+    Json(serde_json::json!({
+        "ok": true,
+        "stats": snapshot.stats,
+        "recommendation_buckets": snapshot.recommendation_buckets,
+    }))
+}
+
+async fn smart_rules_recommendations(
+    State(runtime): State<Arc<Runtime>>,
+) -> Json<serde_json::Value> {
+    let snapshot = runtime.smart_snapshot();
+    Json(serde_json::json!({
+        "ok": true,
+        "recommendations": snapshot.recommendations,
+        "recommendation_buckets": snapshot.recommendation_buckets,
+    }))
+}
+
+async fn ignore_smart_recommendation(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<ApplySmartRecommendationRequest>,
+) -> Json<serde_json::Value> {
+    match runtime.set_smart_rule_enabled(request.target, &request.value, false) {
+        Ok(rules) => Json(serde_json::json!({
+            "ok": true,
+            "rules": rules,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
 }
 
 async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
@@ -675,6 +913,62 @@ async fn apply_smart_recommendation(
     }
 }
 
+async fn list_rules(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    Json(serde_json::json!({
+        "ok": true,
+        "rules": config.rules,
+    }))
+}
+
+async fn add_rule(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<RuleAddRequest>,
+) -> Json<serde_json::Value> {
+    match runtime.add_rule(request.target, &request.value, &request.outbound) {
+        Ok(rules) => Json(serde_json::json!({
+            "ok": true,
+            "rules": rules,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
+}
+
+async fn delete_rule(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<RuleDeleteRequest>,
+) -> Json<serde_json::Value> {
+    match runtime.delete_rule(request.index) {
+        Ok(rules) => Json(serde_json::json!({
+            "ok": true,
+            "rules": rules,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
+}
+
+async fn reorder_rules(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<RuleReorderRequest>,
+) -> Json<serde_json::Value> {
+    match runtime.reorder_rules(request.from, request.to) {
+        Ok(rules) => Json(serde_json::json!({
+            "ok": true,
+            "rules": rules,
+        })),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "error": error.to_string(),
+        })),
+    }
+}
+
 async fn logs(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "logs": runtime.telemetry().logs().await,
@@ -736,6 +1030,10 @@ async fn reload_config(
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -807,10 +1105,7 @@ async fn fetch_subscription_url(url: String, timeout_secs: u64) -> anyhow::Resul
         .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
         .build()?
         .get(url)
-        .header(
-            "User-Agent",
-            concat!("Skyhook/", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
         .send()
         .await?
         .error_for_status()?;

@@ -11,13 +11,16 @@ fn realistic_mixed_subscription_fixture_builds_runtime_config() {
     let text = include_str!("fixtures/realistic_mixed_subscription.yaml");
     let document = parse_subscription(text).expect("fixture parses");
 
-    assert_eq!(document.nodes.len(), 4);
-    assert_eq!(document.supported_outbounds().len(), 4);
+    assert_eq!(document.nodes.len(), 6);
+    assert_eq!(document.supported_outbounds().len(), 6);
     assert!(
         document.unsupported.is_empty(),
         "{:?}",
         document.unsupported
     );
+
+    assert!(document.nodes.iter().any(|n| n.name == "MI-Unsupported-01"));
+    assert!(document.nodes.iter().any(|n| n.name == "JU-Unsupported-01"));
 
     let config = runtime_config_from_document(SuperConfig::default(), &document, true);
     assert!(config.outbounds.iter().any(|item| item.name() == "Auto"));
