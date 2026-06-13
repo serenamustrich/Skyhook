@@ -18,6 +18,7 @@ base64 = "0.22"
 blake2 = "0.10"
 boringtun = "0.7.1"
 bytes = "1"
+chacha20 = "0.9"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -69,8 +70,33 @@ smoltcp = { version = "0.12", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 rcgen = "0.13"
 tempfile = "3"
+
+[[bench]]
+name = "routing_decision"
+harness = false
+
+[[bench]]
+name = "tcp_forwarder"
+harness = false
+
+[[bench]]
+name = "udp_relay"
+harness = false
+
+[[bench]]
+name = "dns"
+harness = false
+
+[[bench]]
+name = "subscription_parse"
+harness = false
+
+[[bench]]
+name = "probe_outbounds"
+harness = false
 
 [profile.release]
 opt-level = 3

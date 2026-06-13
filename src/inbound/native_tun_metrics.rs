@@ -32,6 +32,18 @@ pub struct NativeTunMetricsInner {
     pub lagged_events: AtomicU64,
     pub last_error: RwLock<Option<String>>,
     pub last_drop_reason: RwLock<Option<String>>,
+    // Session tracking
+    pub tcp_active_sessions: AtomicU64,
+    pub udp_active_sessions: AtomicU64,
+    pub direct_sessions: AtomicU64,
+    pub proxy_sessions: AtomicU64,
+    pub group_resolved_sessions: AtomicU64,
+    pub country_resolved_sessions: AtomicU64,
+    // DNS hijack
+    pub dns_queries: AtomicU64,
+    pub dns_successes: AtomicU64,
+    pub dns_failures: AtomicU64,
+    pub dns_unsupported_ipv6: AtomicU64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +75,18 @@ pub struct NativeTunMetricsSnapshot {
     pub lagged_events: u64,
     pub last_error: Option<String>,
     pub last_drop_reason: Option<String>,
+    // Session tracking
+    pub tcp_active_sessions: u64,
+    pub udp_active_sessions: u64,
+    pub direct_sessions: u64,
+    pub proxy_sessions: u64,
+    pub group_resolved_sessions: u64,
+    pub country_resolved_sessions: u64,
+    // DNS hijack
+    pub dns_queries: u64,
+    pub dns_successes: u64,
+    pub dns_failures: u64,
+    pub dns_unsupported_ipv6: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +125,16 @@ impl NativeTunMetrics {
                 lagged_events: AtomicU64::new(0),
                 last_error: RwLock::new(None),
                 last_drop_reason: RwLock::new(None),
+                tcp_active_sessions: AtomicU64::new(0),
+                udp_active_sessions: AtomicU64::new(0),
+                direct_sessions: AtomicU64::new(0),
+                proxy_sessions: AtomicU64::new(0),
+                group_resolved_sessions: AtomicU64::new(0),
+                country_resolved_sessions: AtomicU64::new(0),
+                dns_queries: AtomicU64::new(0),
+                dns_successes: AtomicU64::new(0),
+                dns_failures: AtomicU64::new(0),
+                dns_unsupported_ipv6: AtomicU64::new(0),
             }),
         }
     }
@@ -209,6 +243,70 @@ impl NativeTunMetrics {
         }
     }
 
+    // Session tracking
+    pub fn record_tcp_session_opened(&self) {
+        self.inner
+            .tcp_active_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tcp_session_closed(&self) {
+        self.inner
+            .tcp_active_sessions
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_udp_session_opened(&self) {
+        self.inner
+            .udp_active_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_udp_session_closed(&self) {
+        self.inner
+            .udp_active_sessions
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_session(&self) {
+        self.inner.direct_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_proxy_session(&self) {
+        self.inner.proxy_sessions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_group_resolved_session(&self) {
+        self.inner
+            .group_resolved_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_country_resolved_session(&self) {
+        self.inner
+            .country_resolved_sessions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // DNS hijack
+    pub fn record_dns_query(&self) {
+        self.inner.dns_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_success(&self) {
+        self.inner.dns_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_failure(&self) {
+        self.inner.dns_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_unsupported_ipv6(&self) {
+        self.inner
+            .dns_unsupported_ipv6
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> NativeTunMetricsSnapshot {
         NativeTunMetricsSnapshot {
             enabled: self.inner.enabled,
@@ -289,6 +387,18 @@ impl NativeTunMetrics {
                 .read()
                 .ok()
                 .and_then(|v| v.clone()),
+            // Session tracking
+            tcp_active_sessions: self.inner.tcp_active_sessions.load(Ordering::Relaxed),
+            udp_active_sessions: self.inner.udp_active_sessions.load(Ordering::Relaxed),
+            direct_sessions: self.inner.direct_sessions.load(Ordering::Relaxed),
+            proxy_sessions: self.inner.proxy_sessions.load(Ordering::Relaxed),
+            group_resolved_sessions: self.inner.group_resolved_sessions.load(Ordering::Relaxed),
+            country_resolved_sessions: self.inner.country_resolved_sessions.load(Ordering::Relaxed),
+            // DNS hijack
+            dns_queries: self.inner.dns_queries.load(Ordering::Relaxed),
+            dns_successes: self.inner.dns_successes.load(Ordering::Relaxed),
+            dns_failures: self.inner.dns_failures.load(Ordering::Relaxed),
+            dns_unsupported_ipv6: self.inner.dns_unsupported_ipv6.load(Ordering::Relaxed),
         }
     }
 }

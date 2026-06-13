@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -20,14 +20,14 @@ const UDP_METADATA_COUNT: usize = 64;
 pub struct NativeTunStack {
     iface: Interface,
     sockets: SocketSet<'static>,
-    rx_packets: Vec<Vec<u8>>,
+    rx_packets: VecDeque<Vec<u8>>,
     tx_packets: Vec<Vec<u8>>,
     tcp_handles: HashMap<FlowKey, SocketHandle>,
     udp_handles: HashMap<FlowKey, SocketHandle>,
 }
 
 struct TunDevice<'a> {
-    rx: &'a mut Vec<Vec<u8>>,
+    rx: &'a mut VecDeque<Vec<u8>>,
     tx: &'a mut Vec<Vec<u8>>,
 }
 
@@ -67,7 +67,7 @@ impl<'a> Device for TunDevice<'a> {
 }
 
 struct TunRxToken<'a> {
-    packets: &'a mut Vec<Vec<u8>>,
+    packets: &'a mut VecDeque<Vec<u8>>,
 }
 
 impl<'a> RxToken for TunRxToken<'a> {
@@ -75,7 +75,7 @@ impl<'a> RxToken for TunRxToken<'a> {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let packet = self.packets.remove(0);
+        let packet = self.packets.pop_front().unwrap();
         f(&packet)
     }
 }
@@ -118,9 +118,15 @@ pub enum StackEvent {
     },
 }
 
+impl Default for NativeTunStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NativeTunStack {
     pub fn new() -> Self {
-        let mut rx_packets = Vec::new();
+        let mut rx_packets = VecDeque::new();
         let mut tx_packets = Vec::new();
 
         let mut device = TunDevice {
@@ -129,7 +135,8 @@ impl NativeTunStack {
         };
 
         let config = smoltcp::iface::Config::new(HardwareAddress::Ip);
-        let iface = Interface::new(config, &mut device, SmolInstant::from_micros(0));
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_micros(0));
+        iface.set_any_ip(true);
         let sockets = SocketSet::new(vec![]);
 
         Self {
@@ -151,7 +158,11 @@ impl NativeTunStack {
     }
 
     pub fn inject_packet(&mut self, packet: Vec<u8>) {
-        self.rx_packets.push(packet);
+        self.rx_packets.push_back(packet);
+    }
+
+    pub fn peek_rx_packets(&self) -> Vec<Vec<u8>> {
+        self.rx_packets.iter().cloned().collect()
     }
 
     pub fn poll(&mut self, now: Instant) -> Vec<StackEvent> {
@@ -178,7 +189,16 @@ impl NativeTunStack {
     pub fn create_tcp_socket(&mut self, flow_key: FlowKey, _local_port: u16) -> SocketHandle {
         let rx_buf = TcpSocketBuffer::new(vec![0; TCP_RX_BUFFER_SIZE]);
         let tx_buf = TcpSocketBuffer::new(vec![0; TCP_TX_BUFFER_SIZE]);
-        let socket = TcpSocket::new(rx_buf, tx_buf);
+        let mut socket = TcpSocket::new(rx_buf, tx_buf);
+
+        // Listen on the destination endpoint for transparent proxying
+        let dst_ip: IpAddress = match flow_key.dst.ip() {
+            std::net::IpAddr::V4(v4) => IpAddress::Ipv4(v4),
+            std::net::IpAddr::V6(v6) => IpAddress::Ipv6(v6),
+        };
+        let local_endpoint = IpEndpoint::new(dst_ip, flow_key.dst.port());
+        socket.listen(local_endpoint).ok();
+
         let handle = self.sockets.add(socket);
         self.tcp_handles.insert(flow_key, handle);
         handle

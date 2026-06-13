@@ -20,6 +20,7 @@ use tokio_rustls::TlsConnector;
 use url::Url;
 
 use crate::{
+    background_tasks::BackgroundScheduler,
     config::{OutboundConfig, SmartRouteRule, SuperConfig},
     inbound::native_tun_metrics::NativeTunMetrics,
     l3::{L3Manager, L3Snapshot, L3TunnelStatus},
@@ -29,6 +30,7 @@ use crate::{
     smart::{self, DirectProbeRequest, SmartRecommendationAction, SmartRuleEngine, SmartSnapshot},
     subscription_store::SubscriptionStore,
     telemetry::{ConnectionSubscription, OutboundHealth, Telemetry},
+    traffic_store::TrafficStore,
 };
 
 pub struct Runtime {
@@ -40,12 +42,23 @@ pub struct Runtime {
     telemetry: Arc<Telemetry>,
     tun_metrics: NativeTunMetrics,
     runtime_state: Arc<RuntimeStateStore>,
+    background_scheduler: Arc<BackgroundScheduler>,
+    traffic_store: Arc<TrafficStore>,
 }
 
 struct RuntimeState {
     config: SuperConfig,
     router: Router,
     outbounds: OutboundMap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TunReloadResult {
+    pub ok: bool,
+    pub changed: bool,
+    pub requires_restart: bool,
+    pub warnings: Vec<String>,
+    pub details: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +156,14 @@ impl Runtime {
             .join("runtime-state.json");
         let runtime_state = Arc::new(RuntimeStateStore::new(&state_path));
 
+        let background_scheduler = Arc::new(BackgroundScheduler::new_with_defaults());
+
+        let traffic_path = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".skyhook")
+            .join("traffic.json");
+        let traffic_store = Arc::new(TrafficStore::new(&traffic_path));
+
         Ok(Self {
             base_config: RwLock::new(base_config),
             state: RwLock::new(state),
@@ -152,6 +173,8 @@ impl Runtime {
             telemetry,
             tun_metrics,
             runtime_state,
+            background_scheduler,
+            traffic_store,
         })
     }
 
@@ -194,6 +217,14 @@ impl Runtime {
         self.telemetry.clone()
     }
 
+    pub fn background_scheduler(&self) -> &Arc<BackgroundScheduler> {
+        &self.background_scheduler
+    }
+
+    pub fn traffic_store(&self) -> &Arc<TrafficStore> {
+        &self.traffic_store
+    }
+
     pub fn runtime_state_store(&self) -> &Arc<RuntimeStateStore> {
         &self.runtime_state
     }
@@ -206,6 +237,108 @@ impl Runtime {
         &self,
     ) -> crate::inbound::native_tun_metrics::NativeTunMetricsSnapshot {
         self.tun_metrics.snapshot()
+    }
+
+    pub fn tun_reload(&self, new_config: SuperConfig) -> TunReloadResult {
+        let old_config = self.config();
+        let mut changed = Vec::new();
+        let mut warnings = Vec::new();
+        let mut requires_restart = false;
+
+        // Check route_exclude changes
+        if old_config.tun.route_exclude_address != new_config.tun.route_exclude_address {
+            changed.push("route_exclude_address".to_string());
+        }
+
+        // Check bypass changes
+        if old_config.tun.bypass != new_config.tun.bypass {
+            changed.push("bypass".to_string());
+        }
+
+        // Check MTU changes - requires restart
+        if old_config.tun.mtu != new_config.tun.mtu {
+            changed.push("mtu".to_string());
+            requires_restart = true;
+            warnings.push("MTU change requires TUN restart".to_string());
+        }
+
+        // Check interface name changes - requires restart
+        if old_config.tun.name != new_config.tun.name {
+            changed.push("name".to_string());
+            requires_restart = true;
+            warnings.push("Interface name change requires TUN restart".to_string());
+        }
+
+        // Check setup changes
+        if old_config.tun.setup != new_config.tun.setup {
+            changed.push("setup".to_string());
+        }
+
+        // Check auto_route changes
+        if old_config.tun.auto_route != new_config.tun.auto_route {
+            changed.push("auto_route".to_string());
+            requires_restart = true;
+            warnings.push("auto_route change requires TUN restart".to_string());
+        }
+
+        // Check inet4_route_address changes
+        if old_config.tun.inet4_route_address != new_config.tun.inet4_route_address {
+            changed.push("inet4_route_address".to_string());
+        }
+
+        // Check inet6_route_address changes
+        if old_config.tun.inet6_route_address != new_config.tun.inet6_route_address {
+            changed.push("inet6_route_address".to_string());
+        }
+
+        // Check l3_profile changes - requires restart
+        if old_config.tun.l3_profile != new_config.tun.l3_profile {
+            changed.push("l3_profile".to_string());
+            requires_restart = true;
+            warnings.push("l3_profile change requires TUN restart".to_string());
+        }
+
+        if changed.is_empty() {
+            return TunReloadResult {
+                ok: true,
+                changed: false,
+                requires_restart: false,
+                warnings: Vec::new(),
+                details: "No changes detected".to_string(),
+            };
+        }
+
+        // If requires restart, don't apply changes
+        if requires_restart {
+            return TunReloadResult {
+                ok: true,
+                changed: true,
+                requires_restart: true,
+                warnings,
+                details: format!(
+                    "Changes detected in: {}. Restart required.",
+                    changed.join(", ")
+                ),
+            };
+        }
+
+        // Apply hot-reloadable changes
+        match self.reload_config(new_config) {
+            Ok(_) => TunReloadResult {
+                ok: true,
+                changed: true,
+                requires_restart: false,
+                warnings,
+                details: format!("Reloaded: {}", changed.join(", ")),
+            },
+            Err(e) => TunReloadResult {
+                ok: false,
+                changed: true,
+                requires_restart: false,
+                warnings: vec![format!("Reload failed: {}", e)],
+                details: format!("Failed to reload: {}", e),
+            },
+        }
     }
 
     pub async fn open_connection_record(
@@ -253,9 +386,21 @@ impl Runtime {
                 ),
             )
             .await;
+        self.traffic_store
+            .add_global_traffic(record.uploaded, record.downloaded);
+        self.traffic_store.add_outbound_traffic(
+            &record.outbound,
+            record.uploaded,
+            record.downloaded,
+        );
         let Some(subscription) = record.subscription else {
             return;
         };
+        self.traffic_store.add_subscription_traffic(
+            &subscription.id,
+            record.uploaded,
+            record.downloaded,
+        );
         let store = SubscriptionStore::new(self.base_config().subscriptions.store_path);
         if let Err(error) = store.add_traffic(&subscription.id, record.uploaded, record.downloaded)
         {
@@ -273,6 +418,17 @@ impl Runtime {
 
     pub fn smart_snapshot(&self) -> SmartSnapshot {
         self.smart_rules.snapshot()
+    }
+
+    pub fn smart_record_direct_probe(
+        &self,
+        value: &str,
+        target: crate::config::RuleTarget,
+        success: bool,
+        latency_ms: u64,
+    ) {
+        self.smart_rules
+            .record_direct_probe(value, target, success, latency_ms);
     }
 
     pub fn upsert_smart_rule(&self, rule: SmartRouteRule) -> anyhow::Result<Vec<SmartRouteRule>> {
@@ -541,6 +697,30 @@ impl Runtime {
                 Err(error)
             }
         }
+    }
+
+    pub async fn udp_exchange_named_outbound(
+        &self,
+        outbound_name: &str,
+        destination: &Destination,
+        payload: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let (outbound, timeout_ms) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| anyhow!("runtime state lock poisoned"))?;
+            let outbound = state
+                .outbounds
+                .get(outbound_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("outbound '{}' not found", outbound_name))?;
+            (outbound, state.config.core.connect_timeout_ms)
+        };
+
+        outbound
+            .udp_exchange(destination, payload, timeout_ms)
+            .await
     }
 
     pub async fn resolve_group_member(&self, group_name: &str) -> anyhow::Result<String> {
@@ -1571,7 +1751,14 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                 .map(|value| {
                     matches!(
                         value.to_ascii_lowercase().as_str(),
-                        "http" | "http_simple" | "obfs-http" | "simple-obfs-http"
+                        "http"
+                            | "http_simple"
+                            | "obfs-http"
+                            | "simple-obfs-http"
+                            | "tls"
+                            | "tls1.2_ticket_auth"
+                            | "obfs-tls"
+                            | "simple-obfs-tls"
                     )
                 })
                 .unwrap_or(true);
@@ -1579,13 +1766,13 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                 limitations.push(format!("unsupported snell method {method}"));
             }
             if !obfs_supported {
-                limitations.push("snell tls/unknown obfs is not supported".to_string());
+                limitations.push("snell unknown obfs is not supported".to_string());
             }
-            limitations.push("snell udp is not supported".to_string());
+            limitations.push("snell udp is tunneled over tcp".to_string());
             (
                 method_supported && obfs_supported,
-                false,
-                Some("snell-aead-tcp-http-obfs".to_string()),
+                method_supported && obfs_supported,
+                Some("snell-aead-tcp-udp-http-tls-obfs".to_string()),
             )
         }
         OutboundConfig::Hysteria {
@@ -1613,11 +1800,10 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
             if obfs_present {
                 limitations.push("hysteria obfs is not implemented yet".to_string());
             }
-            limitations.push("hysteria udp is not supported".to_string());
             (
                 auth_present && !obfs_present,
-                false,
-                Some("quic-hysteria-tcp".to_string()),
+                auth_present && !obfs_present,
+                Some("quic-hysteria-tcp-udp".to_string()),
             )
         }
         OutboundConfig::AnyTls { .. } => {

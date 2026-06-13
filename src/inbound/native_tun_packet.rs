@@ -499,6 +499,32 @@ pub fn extract_tls_sni(ip_packet: &TunIpPacket) -> Option<String> {
     None
 }
 
+pub fn is_quic_packet(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+
+    let first = data[0];
+
+    // Long header: first bit is 1
+    if first & 0x80 != 0 {
+        // Check for QUIC version in long header
+        if data.len() >= 5 {
+            let version = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+            // QUIC v1 (RFC 9000) or draft versions
+            if version == 0x00000001
+                || version == 0xff00001d
+                || version == 0xff00001e
+                || version == 0xff00001f
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,5 +636,22 @@ mod tests {
 
         assert_eq!(src.port(), 49152);
         assert_eq!(dst.port(), 53);
+    }
+
+    #[test]
+    fn quic_detection() {
+        // QUIC Initial packet with long header
+        let quic_packet = vec![
+            0xC0, // Long header, Initial
+            0x00, 0x00, 0x00, 0x01, // Version
+            0x00, // DCID length
+            0x00, // SCID length
+            0x00, // Token length
+        ];
+        assert!(is_quic_packet(&quic_packet));
+
+        // Not QUIC
+        let not_quic = vec![0x00, 0x01, 0x02, 0x03];
+        assert!(!is_quic_packet(&not_quic));
     }
 }

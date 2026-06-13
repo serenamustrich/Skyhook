@@ -503,7 +503,7 @@ impl Telemetry {
                 },
             )
             .collect();
-        items.sort_by(|a, b| b.total.cmp(&a.total));
+        items.sort_by_key(|b| std::cmp::Reverse(b.total));
         items
     }
 
@@ -528,7 +528,7 @@ impl Telemetry {
                 },
             )
             .collect();
-        items.sort_by(|a, b| b.total.cmp(&a.total));
+        items.sort_by_key(|b| std::cmp::Reverse(b.total));
         items
     }
 

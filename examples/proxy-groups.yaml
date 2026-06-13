@@ -1,0 +1,40 @@
+# Skyhook Proxy Group Example
+# This configuration uses proxy groups for automatic failover.
+
+core:
+  mixed_listen: "127.0.0.1:7890"
+  default_outbound: "auto"
+
+dns:
+  enabled: true
+  server: "8.8.8.8:53"
+
+outbounds:
+  - name: "direct"
+    type: "direct"
+  
+  - name: "proxy-1"
+    type: "shadowsocks"
+    server: "proxy1.example.com"
+    port: 8388
+    method: "aes-256-gcm"
+    password: "your-password"
+  
+  - name: "proxy-2"
+    type: "shadowsocks"
+    server: "proxy2.example.com"
+    port: 8388
+    method: "aes-256-gcm"
+    password: "your-password"
+  
+  - name: "auto"
+    type: "group"
+    kind: "url-test"
+    members:
+      - "proxy-1"
+      - "proxy-2"
+
+rules:
+  - DOMAIN-SUFFIX,google.com,auto
+  - DOMAIN-SUFFIX,github.com,auto
+  - MATCH,direct

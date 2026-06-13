@@ -75,14 +75,16 @@ async fn prepare_geo_assets_uses_cached_geoip_when_no_url_is_configured() {
     fs::create_dir_all(&cache_dir).unwrap();
     fs::write(cache_dir.join("geoip.mmdb"), b"cached-mmdb").unwrap();
 
-    let mut config = SuperConfig::default();
-    config.geo = GeoConfig {
-        auto_update: true,
-        update_on_start: true,
-        cache_dir: cache_dir.clone(),
-        geoip_url: None,
-        geosite_url: None,
-        update_timeout_secs: 2,
+    let config = SuperConfig {
+        geo: GeoConfig {
+            auto_update: true,
+            update_on_start: true,
+            cache_dir: cache_dir.clone(),
+            geoip_url: None,
+            geosite_url: None,
+            update_timeout_secs: 2,
+        },
+        ..Default::default()
     };
 
     let config = prepare_geo_assets(config).await;

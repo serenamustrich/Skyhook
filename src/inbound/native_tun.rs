@@ -33,6 +33,12 @@ pub struct DnsHijackCounters {
     pub unsupported_ipv6: AtomicU64,
 }
 
+impl Default for DnsHijackCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DnsHijackCounters {
     pub fn new() -> Self {
         Self {
@@ -186,7 +192,7 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
 
     let (dns_response_tx, mut dns_response_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(128);
 
-    let mut session_manager = super::native_tun_session::NativeSessionManager::new();
+    let mut session_manager = super::native_tun_session::NativeSessionManager::new(metrics.clone());
     let tun_addr = config
         .inet4_address
         .first()
@@ -472,7 +478,7 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
                 Some(packet) = l4_egress_rx.recv() => {
                     let encoded = match encode_tun_write_packet(&packet) {
                         Ok(pkt) => pkt,
-                        Err(e) => {
+                        Err(_) => {
                             write_metrics.record_encode_error();
                             continue;
                         }
@@ -538,24 +544,25 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     });
 
     let runtime_clone = runtime.clone();
+    let dispatcher = super::native_tun_dispatcher::NativeL4Dispatcher::with_session_manager(
+        metrics.clone(),
+        session_manager,
+    );
     let l4_handle = tokio::spawn(async move {
-        let mut session_mgr = session_manager;
+        let mut dispatcher = dispatcher;
         let runtime = runtime_clone;
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             tokio::select! {
-                Some((packet, _flow_key)) = l4_packet_rx.recv() => {
-                    session_mgr.inject_packet(packet);
+                Some((packet, flow_key)) = l4_packet_rx.recv() => {
+                    dispatcher
+                        .dispatch_packet_with_channel(packet, &flow_key, &runtime, &l4_egress_tx)
+                        .await;
+                }
+                _ = cleanup_interval.tick() => {
+                    dispatcher.cleanup_expired();
                 }
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {}
-            }
-
-            session_mgr.process_events(&runtime).await;
-
-            let response_packets = session_mgr.take_pending_writes();
-            for packet in response_packets {
-                if l4_egress_tx.send(packet).await.is_err() {
-                    break;
-                }
             }
         }
     });

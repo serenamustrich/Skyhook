@@ -93,6 +93,32 @@ pub struct SmartObservation {
     pub last_probe_at: Option<DateTime<Utc>>,
     #[serde(skip)]
     last_probe_instant: Option<Instant>,
+    // New fields
+    #[serde(default = "Utc::now")]
+    pub first_seen_at: DateTime<Utc>,
+    pub last_proxy_outbound: Option<String>,
+    pub last_selected_group: Option<String>,
+    pub last_selected_country: Option<String>,
+    pub app_name: Option<String>,
+    pub app_bundle_id: Option<String>,
+    pub app_path: Option<String>,
+    pub resolved_ip: Option<String>,
+    pub sni: Option<String>,
+    pub http_host: Option<String>,
+    pub dns_name: Option<String>,
+    pub proxy_success_count: u64,
+    pub proxy_failure_count: u64,
+    #[serde(default)]
+    pub recommendation_state: RecommendationState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecommendationState {
+    #[default]
+    Pending,
+    Enabled,
+    Ignored,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +375,8 @@ impl SmartRuleEngine {
                     item.record_direct_probe(true, latency_ms, None);
                 } else {
                     item.proxy_routed_hits = item.proxy_routed_hits.saturating_add(1);
+                    item.proxy_success_count = item.proxy_success_count.saturating_add(1);
+                    item.last_proxy_outbound = Some(decision.outbound.clone());
                     if is_host_target(target) && self.should_probe_observation(item) {
                         needs_probe = true;
                         item.last_probe_instant = Some(Instant::now());
@@ -369,10 +397,11 @@ impl SmartRuleEngine {
 
     pub fn record_connect_failure(&self, destination: &Destination, decision: &RouteDecision) {
         let config = self.config();
-        if !config.enabled || decision.outbound != config.direct_outbound {
+        if !config.enabled {
             return;
         }
 
+        let routed_direct = decision.outbound == config.direct_outbound;
         let mut observations = self.observations.write().expect("smart observations lock");
         for (target, value) in observation_targets(destination) {
             let key = observation_key(target, &value);
@@ -382,11 +411,40 @@ impl SmartRuleEngine {
             item.visits = item.visits.saturating_add(1);
             item.last_outbound = Some(decision.outbound.clone());
             item.last_seen_at = Utc::now();
-            item.record_direct_probe(false, 0, Some("direct outbound failed".to_string()));
+            if routed_direct {
+                item.record_direct_probe(false, 0, Some("direct outbound failed".to_string()));
+            } else {
+                item.proxy_failure_count = item.proxy_failure_count.saturating_add(1);
+            }
         }
         trim_observations(&mut observations, config.max_observations);
         drop(observations);
         self.persist_state_throttled();
+    }
+
+    pub fn record_direct_probe(
+        &self,
+        value: &str,
+        target: RuleTarget,
+        success: bool,
+        latency_ms: u64,
+    ) {
+        let config = self.config();
+        if !config.enabled {
+            return;
+        }
+
+        let key = observation_key(target, value);
+        let mut observations = self.observations.write().expect("smart observations lock");
+        let item = observations
+            .entry(key.clone())
+            .or_insert_with(|| SmartObservation::new(key, target, value.to_string()));
+        item.record_direct_probe(success, latency_ms, None);
+        item.last_probe_at = Some(Utc::now());
+        item.last_probe_instant = Some(Instant::now());
+        trim_observations(&mut observations, config.max_observations);
+        drop(observations);
+        self.persist_state_force();
     }
 
     pub fn record_direct_probe_result(
@@ -692,6 +750,7 @@ impl SmartRuleEngine {
 
 impl SmartObservation {
     fn new(key: String, target: RuleTarget, value: String) -> Self {
+        let now = Utc::now();
         Self {
             key,
             target,
@@ -705,9 +764,23 @@ impl SmartObservation {
             last_outbound: None,
             last_direct_latency_ms: None,
             last_error: None,
-            last_seen_at: Utc::now(),
+            last_seen_at: now,
             last_probe_at: None,
             last_probe_instant: None,
+            first_seen_at: now,
+            last_proxy_outbound: None,
+            last_selected_group: None,
+            last_selected_country: None,
+            app_name: None,
+            app_bundle_id: None,
+            app_path: None,
+            resolved_ip: None,
+            sni: None,
+            http_host: None,
+            dns_name: None,
+            proxy_success_count: 0,
+            proxy_failure_count: 0,
+            recommendation_state: RecommendationState::Pending,
         }
     }
 
@@ -866,7 +939,7 @@ fn trim_observations(
         .values()
         .map(|item| (item.last_seen_at, item.key.clone()))
         .collect::<Vec<_>>();
-    keys.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+    keys.sort_by_key(|lhs| lhs.0);
     let remove_count = observations.len().saturating_sub(max_observations);
     for (_, key) in keys.into_iter().take(remove_count) {
         observations.remove(&key);

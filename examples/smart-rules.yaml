@@ -1,0 +1,31 @@
+# Skyhook Smart Rules Example
+# This configuration enables smart routing based on traffic observation.
+
+core:
+  mixed_listen: "127.0.0.1:7890"
+  default_outbound: "proxy"
+
+dns:
+  enabled: true
+  server: "8.8.8.8:53"
+
+smart_rules:
+  enabled: true
+  auto_probe: true
+  auto_apply_recommendations: false
+  direct_probe_timeout_ms: 3000
+  probe_cooldown_secs: 300
+
+outbounds:
+  - name: "direct"
+    type: "direct"
+  
+  - name: "proxy"
+    type: "shadowsocks"
+    server: "proxy.example.com"
+    port: 8388
+    method: "aes-256-gcm"
+    password: "your-password"
+
+rules:
+  - MATCH,proxy

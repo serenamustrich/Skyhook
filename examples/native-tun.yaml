@@ -1,0 +1,32 @@
+# Skyhook Native TUN Example
+# This configuration enables native TUN mode for system-wide proxy.
+
+core:
+  mixed_listen: "127.0.0.1:7890"
+  default_outbound: "proxy"
+
+tun:
+  enabled: true
+  backend: "native-l3"
+  setup: true
+  auto_route: true
+  mtu: 1500
+
+dns:
+  enabled: true
+  server: "8.8.8.8:53"
+  hijack_udp_53: true
+
+outbounds:
+  - name: "direct"
+    type: "direct"
+  
+  - name: "proxy"
+    type: "shadowsocks"
+    server: "proxy.example.com"
+    port: 8388
+    method: "aes-256-gcm"
+    password: "your-password"
+
+rules:
+  - MATCH,proxy

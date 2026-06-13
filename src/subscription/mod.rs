@@ -1352,7 +1352,7 @@ fn decode_base64_text(value: &str) -> Option<String> {
         return None;
     }
     let mut padded = compact.clone();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     for engine in [

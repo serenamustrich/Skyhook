@@ -111,7 +111,7 @@ pub fn parse_openvpn_profile(text: &str) -> anyhow::Result<OpenVpnParsedProfile>
             continue;
         }
 
-        if let Some(_) = inline_block {
+        if inline_block.is_some() {
             if !inline_content.is_empty() {
                 inline_content.push('\n');
             }

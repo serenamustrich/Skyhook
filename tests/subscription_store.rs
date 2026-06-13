@@ -232,19 +232,21 @@ fn replace_text_refreshes_counts_without_changing_identity() {
 #[test]
 fn subscription_rules_keep_base_custom_rules_first() {
     let document = parse_subscription(RULE_SUB).expect("subscription");
-    let mut base = SuperConfig::default();
-    base.rules = vec![
-        skyhook::config::RouteRule {
-            target: RuleTarget::DomainSuffix,
-            value: "custom.example".to_string(),
-            outbound: "direct".to_string(),
-        },
-        skyhook::config::RouteRule {
-            target: RuleTarget::Match,
-            value: "*".to_string(),
-            outbound: "direct".to_string(),
-        },
-    ];
+    let base = SuperConfig {
+        rules: vec![
+            skyhook::config::RouteRule {
+                target: RuleTarget::DomainSuffix,
+                value: "custom.example".to_string(),
+                outbound: "direct".to_string(),
+            },
+            skyhook::config::RouteRule {
+                target: RuleTarget::Match,
+                value: "*".to_string(),
+                outbound: "direct".to_string(),
+            },
+        ],
+        ..Default::default()
+    };
 
     let config = runtime_config_from_document(base, &document, true);
 

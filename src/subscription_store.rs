@@ -49,6 +49,24 @@ pub struct SubscriptionMeta {
     pub traffic_upload_total: u64,
     #[serde(default)]
     pub traffic_download_total: u64,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub traffic_total_available: Option<u64>,
+    #[serde(default)]
+    pub traffic_accumulated_upload: u64,
+    #[serde(default)]
+    pub traffic_accumulated_download: u64,
+    #[serde(default)]
+    pub group_count: usize,
+    #[serde(default)]
+    pub rule_count: usize,
+    #[serde(default)]
+    pub raw_text_path: Option<String>,
+    #[serde(default)]
+    pub parsed_config_path: Option<String>,
+    #[serde(default)]
+    pub last_checked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -790,6 +808,15 @@ fn meta_from_document(
         last_update_error,
         traffic_upload_total: 0,
         traffic_download_total: 0,
+        expires_at: None,
+        traffic_total_available: None,
+        traffic_accumulated_upload: 0,
+        traffic_accumulated_download: 0,
+        group_count: document.groups.len(),
+        rule_count: 0,
+        raw_text_path: None,
+        parsed_config_path: None,
+        last_checked_at: None,
     }
 }
 

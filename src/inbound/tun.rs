@@ -30,6 +30,7 @@ pub struct TunProfile {
     pub warnings: Vec<String>,
 }
 
+#[allow(clippy::field_reassign_with_default)]
 pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let runtime_config = runtime.config();
     let config = runtime_config.tun.clone();

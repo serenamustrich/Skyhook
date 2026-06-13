@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../skyhook-${{ github.ref_name }}-${{ matrix.target }}.tar.gz skyhook
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyhook-${{ matrix.target }}
+          path: skyhook-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create checksums
+        run: |
+          for file in */*.tar.gz; do
+            sha256sum "$file" >> checksums.txt
+          done
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            */*.tar.gz
+            checksums.txt
+          generate_release_notes: true

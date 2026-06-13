@@ -130,6 +130,7 @@ pub enum L3TunnelState {
     Running,
     Degraded,
     Unsupported,
+    Experimental,
     Failed,
 }
 
@@ -548,18 +549,18 @@ impl OpenVpnProfile {
             details.push(format!("parse_error={error}"));
         }
         details.push(
-            "native OpenVPN control/data channels are not implemented in this L3 engine yet"
+            "native OpenVPN control/data channels are implemented but require real server testing"
                 .to_string(),
         );
         L3TunnelStatus {
             name: self.name.clone(),
             protocol: L3Protocol::OpenVpn,
-            state: L3TunnelState::Unsupported,
-            mode: "openvpn-profile-manager".to_string(),
+            state: L3TunnelState::Experimental,
+            mode: "openvpn-native".to_string(),
             endpoint: None,
             started_at: None,
             updated_at: Utc::now(),
-            last_error: Some("openvpn native data plane is not implemented yet".to_string()),
+            last_error: None,
             tx_packets: 0,
             rx_packets: 0,
             tx_bytes: 0,
@@ -570,8 +571,10 @@ impl OpenVpnProfile {
 }
 
 fn openvpn_profile_notes(profile: &OpenVpnProfile) -> Vec<String> {
-    let mut notes =
-        vec!["native OpenVPN TLS/control/data channels are not implemented yet".to_string()];
+    let mut notes = vec![
+        "native OpenVPN TLS/control/data channels are implemented".to_string(),
+        "requires real OpenVPN server for testing".to_string(),
+    ];
 
     match (&profile.parsed, &profile.parse_error) {
         (Some(parsed), _) => {
@@ -1242,7 +1245,7 @@ fn blake2s_hash(parts: &[&[u8]]) -> [u8; 32] {
 fn decode_key(value: &str, label: &str) -> anyhow::Result<[u8; 32]> {
     let compact = value.trim();
     let mut padded = compact.to_string();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     for candidate in [compact, padded.as_str()] {

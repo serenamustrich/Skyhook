@@ -1,6 +1,8 @@
 pub mod api;
+pub mod background_tasks;
 pub mod config;
 pub mod core;
+pub mod fake_ip;
 pub mod geo;
 pub mod inbound;
 pub mod l3;
@@ -11,3 +13,4 @@ pub mod smart;
 pub mod subscription;
 pub mod subscription_store;
 pub mod telemetry;
+pub mod traffic_store;

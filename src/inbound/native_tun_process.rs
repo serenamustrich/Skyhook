@@ -24,6 +24,12 @@ pub struct ProcessResolver {
     cache: RwLock<HashMap<SocketAddr, CachedProcess>>,
 }
 
+impl Default for ProcessResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessResolver {
     pub fn new() -> Self {
         Self {
@@ -95,7 +101,7 @@ impl ProcessResolver {
                 continue;
             }
 
-            let process_name = parts.get(0).map(|s| s.to_string());
+            let process_name = parts.first().map(|s| s.to_string());
             let pid: Option<u32> = parts.get(1).and_then(|s| s.parse().ok());
 
             let has_port = parts.iter().any(|p| p.contains(&format!(":{}", port)));

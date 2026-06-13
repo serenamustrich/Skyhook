@@ -1,0 +1,17 @@
+# Skyhook Minimal Direct Example
+# This configuration routes all traffic directly without any proxy.
+
+core:
+  mixed_listen: "127.0.0.1:7890"
+  default_outbound: "direct"
+
+dns:
+  enabled: true
+  server: "8.8.8.8:53"
+
+outbounds:
+  - name: "direct"
+    type: "direct"
+
+rules:
+  - MATCH,direct

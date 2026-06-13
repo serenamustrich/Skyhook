@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::fake_ip::{FakeIpConfig, FakeIpPool};
+
 const DEFAULT_TTL: Duration = Duration::from_secs(60);
 const MAX_ENTRIES: usize = 10000;
 
@@ -15,12 +17,27 @@ struct DnsCacheEntry {
 
 pub struct DnsCache {
     entries: RwLock<HashMap<IpAddr, DnsCacheEntry>>,
+    fake_ip_pool: Option<FakeIpPool>,
+}
+
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DnsCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
+            fake_ip_pool: None,
+        }
+    }
+
+    pub fn with_fake_ip(config: FakeIpConfig) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            fake_ip_pool: Some(FakeIpPool::new(config)),
         }
     }
 
@@ -48,7 +65,21 @@ impl DnsCache {
         );
     }
 
-    pub fn lookup(&self, ip: &IpAddr) -> Option<String> {
+    pub fn allocate_fake_ip(&self, domain: &str) -> Option<Ipv4Addr> {
+        self.fake_ip_pool.as_ref()?.allocate(domain)
+    }
+
+    pub fn reverse_lookup(&self, ip: &IpAddr) -> Option<String> {
+        // First check fake-IP pool
+        if let IpAddr::V4(v4) = ip {
+            if let Some(pool) = &self.fake_ip_pool {
+                if pool.is_fake_ip(v4) {
+                    return pool.reverse_lookup(v4);
+                }
+            }
+        }
+
+        // Then check regular DNS cache
         let entries = match self.entries.read() {
             Ok(guard) => guard,
             Err(_) => return None,
@@ -63,12 +94,27 @@ impl DnsCache {
         })
     }
 
+    pub fn is_fake_ip(&self, ip: &Ipv4Addr) -> bool {
+        self.fake_ip_pool
+            .as_ref()
+            .map(|pool| pool.is_fake_ip(ip))
+            .unwrap_or(false)
+    }
+
+    pub fn lookup(&self, ip: &IpAddr) -> Option<String> {
+        self.reverse_lookup(ip)
+    }
+
     pub fn evict_expired(&self) {
         let mut entries = match self.entries.write() {
             Ok(guard) => guard,
             Err(_) => return,
         };
         self.evict_expired_locked(&mut entries);
+
+        if let Some(pool) = &self.fake_ip_pool {
+            pool.evict_expired();
+        }
     }
 
     fn evict_expired_locked(&self, entries: &mut HashMap<IpAddr, DnsCacheEntry>) {

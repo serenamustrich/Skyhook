@@ -147,6 +147,11 @@ struct ConfigReloadRequest {
     yaml: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct BackgroundTaskRequest {
+    name: String,
+}
+
 pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let control_listen = runtime.config().core.control_listen;
     let app = Router::new()
@@ -203,6 +208,10 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         )
         .route("/skyhook/smart-rules/stats", get(smart_rules_stats))
         .route(
+            "/skyhook/smart-rules/observations",
+            get(smart_rules_observations),
+        )
+        .route(
             "/skyhook/smart-rules/recommendations",
             get(smart_rules_recommendations),
         )
@@ -232,6 +241,10 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         .route("/skyhook/rules/delete", post(delete_rule))
         .route("/skyhook/rules/reorder", post(reorder_rules))
         .route("/skyhook/logs", get(logs))
+        .route("/skyhook/tasks", get(background_tasks_list))
+        .route("/skyhook/tasks/pause", post(background_task_pause))
+        .route("/skyhook/tasks/resume", post(background_task_resume))
+        .route("/skyhook/tasks/run-now", post(background_task_run_now))
         .route("/skyhook/config", get(config))
         .route("/skyhook/config/reload", post(reload_config))
         .layer(TraceLayer::new_for_http())
@@ -514,10 +527,8 @@ async fn tun_reload(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Val
         }));
     }
 
-    Json(serde_json::json!({
-        "ok": true,
-        "message": "hot reload not yet implemented for native-l3",
-    }))
+    let result = runtime.tun_reload(config);
+    Json(serde_json::json!(result))
 }
 
 async fn l3_snapshot(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
@@ -615,6 +626,14 @@ async fn smart_rules_stats(State(runtime): State<Arc<Runtime>>) -> Json<serde_js
         "ok": true,
         "stats": snapshot.stats,
         "recommendation_buckets": snapshot.recommendation_buckets,
+    }))
+}
+
+async fn smart_rules_observations(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let snapshot = runtime.smart_snapshot();
+    Json(serde_json::json!({
+        "ok": true,
+        "observations": snapshot.observations,
     }))
 }
 
@@ -972,6 +991,91 @@ async fn reorder_rules(
 async fn logs(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "logs": runtime.telemetry().logs().await,
+    }))
+}
+
+async fn background_tasks_list(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let tasks = runtime.background_scheduler().list().await;
+    Json(serde_json::json!({
+        "ok": true,
+        "tasks": tasks,
+    }))
+}
+
+async fn background_task_pause(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<BackgroundTaskRequest>,
+) -> Json<serde_json::Value> {
+    let paused = runtime.background_scheduler().pause(&request.name).await;
+    Json(serde_json::json!({
+        "ok": paused,
+        "message": if paused {
+            format!("task '{}' paused", request.name)
+        } else {
+            format!("task '{}' not found", request.name)
+        },
+    }))
+}
+
+async fn background_task_resume(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<BackgroundTaskRequest>,
+) -> Json<serde_json::Value> {
+    let resumed = runtime.background_scheduler().resume(&request.name).await;
+    Json(serde_json::json!({
+        "ok": resumed,
+        "message": if resumed {
+            format!("task '{}' resumed", request.name)
+        } else {
+            format!("task '{}' not found", request.name)
+        },
+    }))
+}
+
+async fn background_task_run_now(
+    State(runtime): State<Arc<Runtime>>,
+    Json(request): Json<BackgroundTaskRequest>,
+) -> Json<serde_json::Value> {
+    let scheduler = runtime.background_scheduler();
+    if !scheduler.is_enabled(&request.name).await {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": format!("task '{}' not found or not enabled", request.name),
+        }));
+    }
+
+    let name = request.name.clone();
+    let runtime_clone = runtime.clone();
+    let scheduler_clone = scheduler.clone();
+    let task_name = name.clone();
+
+    tokio::spawn(async move {
+        match task_name.as_str() {
+            "subscription_update" => {
+                crate::background_tasks::run_subscription_update(&runtime_clone, &scheduler_clone)
+                    .await;
+            }
+            "outbound_probe" => {
+                crate::background_tasks::run_outbound_probe(&runtime_clone, &scheduler_clone).await;
+            }
+            "smart_probe" => {
+                crate::background_tasks::run_smart_probe(&runtime_clone, &scheduler_clone).await;
+            }
+            "traffic_persist" => {
+                crate::background_tasks::run_traffic_persist(&runtime_clone, &scheduler_clone)
+                    .await;
+            }
+            "session_cleanup" => {
+                crate::background_tasks::run_session_cleanup(&runtime_clone, &scheduler_clone)
+                    .await;
+            }
+            _ => {}
+        }
+    });
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": format!("task '{}' triggered", name),
     }))
 }
 

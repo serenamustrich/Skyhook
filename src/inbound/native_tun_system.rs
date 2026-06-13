@@ -345,6 +345,12 @@ impl SetupCommand {
     }
 }
 
+impl Default for NativeTunSetupGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NativeTunSetupGuard {
     pub fn new() -> Self {
         Self {
