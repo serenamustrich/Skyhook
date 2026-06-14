@@ -19,7 +19,7 @@ proxy engine.
 
 ## Downloads
 
-- macOS app DMG: [玥球电梯.dmg](https://github.com/serenamustrich/Skyhook/releases/download/v0.1.1/%E7%8E%A5%E7%90%83%E7%94%B5%E6%A2%AF.dmg)
+- macOS app DMG: [玥球电梯.dmg](https://github.com/serenamustrich/Skyhook/releases/download/v0.1.1/default.dmg)
 - Core binaries are published from GitHub Releases.
 
 ## Core Capabilities
