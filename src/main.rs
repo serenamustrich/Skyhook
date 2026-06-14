@@ -42,6 +42,8 @@ enum Command {
         #[arg(long)]
         timeout_ms: Option<u64>,
         #[arg(long)]
+        concurrency: Option<usize>,
+        #[arg(long)]
         url: Option<String>,
     },
     ImportSubscription {
@@ -182,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Probe {
             config,
             timeout_ms,
+            concurrency,
             url,
         } => {
             let config = load_runtime_config(&config).await?;
@@ -190,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
                 .probe_all_outbounds_with(ProbeOptions {
                     url,
                     timeout_ms,
+                    concurrency,
                     include_failed: true,
                     ..ProbeOptions::default()
                 })

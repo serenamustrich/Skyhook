@@ -17,6 +17,11 @@ The core is built for desktop proxy clients, menu bar apps, automation tools,
 and local network-control surfaces that need a fast, observable, and programmable
 proxy engine.
 
+## Downloads
+
+- macOS app DMG: [玥球电梯.dmg](https://github.com/serenamustrich/Skyhook/releases/download/v0.1.1/%E7%8E%A5%E7%90%83%E7%94%B5%E6%A2%AF.dmg)
+- Core binaries are published from GitHub Releases.
+
 ## Core Capabilities
 
 ### Inbound And TUN
@@ -84,8 +89,12 @@ proxy engine.
 - Active subscription config export.
 - Node metadata preservation.
 - Proxy group preservation.
+- Proxy-provider resolution.
+- Provider-only subscription support.
 - Subscription rule preservation.
 - Rule provider preservation.
+- Direct no-proxy subscription refresh.
+- Direct no-proxy provider refresh.
 - Country metadata extraction.
 - Per-subscription lifetime traffic totals.
 

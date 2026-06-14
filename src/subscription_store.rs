@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,7 +17,9 @@ use crate::{
         OutboundConfig, RouteRule, RuleSetBehavior, RuleSetConfig, RuleTarget, SubscriptionConfig,
         SuperConfig,
     },
-    subscription::{parse_rule_provider_rules, parse_subscription, SubscriptionDocument},
+    subscription::{
+        parse_rule_provider_rules, parse_subscription, SubscriptionDocument, SubscriptionNode,
+    },
 };
 
 pub const DEFAULT_STORE_DIR: &str = "skyhook-subscriptions";
@@ -143,6 +145,7 @@ impl SubscriptionStore {
         let id = id
             .filter(|item| !item.trim().is_empty())
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        self.resolve_proxy_providers(&id, &mut document)?;
 
         if let Some(position) = index.subscriptions.iter().position(|item| item.id == id) {
             let previous = index.subscriptions[position].clone();
@@ -202,6 +205,7 @@ impl SubscriptionStore {
             .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
         let previous = index.subscriptions[position].clone();
         let mut document = parse_subscription(text)?;
+        self.resolve_proxy_providers(&previous.id, &mut document)?;
         let mut meta = meta_from_document(
             previous.id,
             previous.name,
@@ -416,6 +420,70 @@ impl SubscriptionStore {
         Ok(())
     }
 
+    fn resolve_proxy_providers(
+        &self,
+        id: &str,
+        document: &mut SubscriptionDocument,
+    ) -> anyhow::Result<()> {
+        if document.proxy_providers.is_empty() {
+            return Ok(());
+        }
+        let provider_dir = self.subscription_dir(id).join("proxy-providers");
+        fs::create_dir_all(&provider_dir).with_context(|| {
+            format!(
+                "failed to create proxy provider cache dir {}",
+                provider_dir.display()
+            )
+        })?;
+
+        let mut seen_names = document
+            .nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<HashSet<_>>();
+        let mut resolved_nodes = Vec::<SubscriptionNode>::new();
+
+        for provider in &mut document.proxy_providers {
+            let cache_path = provider_dir.join(format!("{}.txt", safe_file_name(&provider.name)));
+            if provider.nodes.is_empty() {
+                match load_proxy_provider_text(
+                    self.root(),
+                    provider.path.as_deref(),
+                    provider.url.as_deref(),
+                ) {
+                    Ok(text) => match parse_proxy_provider_nodes(&text) {
+                        Ok(nodes) => {
+                            provider.nodes = nodes;
+                            fs::write(&cache_path, text).with_context(|| {
+                                format!(
+                                    "failed to write proxy provider cache {}",
+                                    cache_path.display()
+                                )
+                            })?;
+                            provider.cache_path = Some(cache_path.display().to_string());
+                            provider.last_error = None;
+                        }
+                        Err(error) => {
+                            provider.last_error = Some(error.to_string());
+                        }
+                    },
+                    Err(error) => {
+                        provider.last_error = Some(error.to_string());
+                    }
+                }
+            }
+
+            for node in &provider.nodes {
+                if seen_names.insert(node.name.clone()) {
+                    resolved_nodes.push(node.clone());
+                }
+            }
+        }
+
+        document.nodes.extend(resolved_nodes);
+        Ok(())
+    }
+
     fn resolve_rule_providers(
         &self,
         id: &str,
@@ -600,10 +668,23 @@ fn rule_set_behavior(value: &str) -> RuleSetBehavior {
 
 fn document_runtime_outbounds(document: &SubscriptionDocument) -> Vec<OutboundConfig> {
     let mut outbounds = document.supported_outbounds();
-    let mut known_names = outbounds
+    let leaf_names = outbounds
         .iter()
         .map(|item| item.name().to_string())
         .collect::<HashSet<_>>();
+    let provider_members = document
+        .proxy_providers
+        .iter()
+        .map(|provider| {
+            let members = provider
+                .nodes
+                .iter()
+                .filter_map(|node| leaf_names.contains(&node.name).then(|| node.name.clone()))
+                .collect::<Vec<_>>();
+            (provider.name.clone(), members)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut known_names = leaf_names.clone();
     known_names.insert("direct".to_string());
     known_names.insert("reject".to_string());
 
@@ -611,7 +692,7 @@ fn document_runtime_outbounds(document: &SubscriptionDocument) -> Vec<OutboundCo
         if group.name.trim().is_empty() {
             continue;
         }
-        let members = group
+        let mut candidates = group
             .members
             .iter()
             .map(|member| {
@@ -623,8 +704,24 @@ fn document_runtime_outbounds(document: &SubscriptionDocument) -> Vec<OutboundCo
                     member.clone()
                 }
             })
-            .filter(|member| known_names.contains(member.as_str()))
             .collect::<Vec<_>>();
+        if group.include_all {
+            candidates.extend(leaf_names.iter().cloned());
+        }
+        for provider in &group.providers {
+            if let Some(members) = provider_members.get(provider) {
+                candidates.extend(members.iter().cloned());
+            }
+        }
+        let members = candidates
+            .into_iter()
+            .filter(|member| known_names.contains(member.as_str()))
+            .fold(Vec::new(), |mut result, member| {
+                if !result.contains(&member) {
+                    result.push(member);
+                }
+                result
+            });
         if members.is_empty() {
             continue;
         }
@@ -723,6 +820,23 @@ fn load_rule_provider_text(
     path: Option<&str>,
     url: Option<&str>,
 ) -> anyhow::Result<String> {
+    load_provider_text("rule provider", store_root, path, url)
+}
+
+fn load_proxy_provider_text(
+    store_root: &Path,
+    path: Option<&str>,
+    url: Option<&str>,
+) -> anyhow::Result<String> {
+    load_provider_text("proxy provider", store_root, path, url)
+}
+
+fn load_provider_text(
+    kind: &str,
+    store_root: &Path,
+    path: Option<&str>,
+    url: Option<&str>,
+) -> anyhow::Result<String> {
     if let Some(path) = path.filter(|item| !item.trim().is_empty()) {
         let path = PathBuf::from(path);
         let candidates = if path.is_absolute() {
@@ -735,32 +849,47 @@ fn load_rule_provider_text(
                 Ok(text) => return Ok(text),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to read rule provider {}", candidate.display())
-                    });
+                    return Err(error)
+                        .with_context(|| format!("failed to read {kind} {}", candidate.display()));
                 }
             }
         }
     }
     if let Some(url) = url.filter(|item| !item.trim().is_empty()) {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .context("failed to build rule provider HTTP client")?;
-        let response = client
-            .get(url)
-            .header("User-Agent", "Skyhook/0.1")
-            .send()
-            .with_context(|| format!("failed to download rule provider {url}"))?
-            .error_for_status()
-            .with_context(|| format!("rule provider returned error status {url}"))?;
-        return response
-            .text()
-            .with_context(|| format!("failed to read rule provider body {url}"));
+        return fetch_provider_url_blocking(kind, url);
     }
     Err(anyhow!(
-        "rule provider has neither payload, readable path, nor url"
+        "{kind} has neither payload, readable path, nor url"
     ))
+}
+
+fn fetch_provider_url_blocking(kind: &str, url: &str) -> anyhow::Result<String> {
+    let kind = kind.to_string();
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .no_proxy()
+            .build()
+            .with_context(|| format!("failed to build {kind} HTTP client"))?;
+        let response = client
+            .get(&url)
+            .header("User-Agent", concat!("Skyhook/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .with_context(|| format!("failed to download {kind} {url}"))?
+            .error_for_status()
+            .with_context(|| format!("{kind} returned error status {url}"))?;
+        response
+            .text()
+            .with_context(|| format!("failed to read {kind} body {url}"))
+    })
+    .join()
+    .map_err(|_| anyhow!("provider download thread panicked"))?
+}
+
+fn parse_proxy_provider_nodes(text: &str) -> anyhow::Result<Vec<SubscriptionNode>> {
+    let document = parse_subscription(text)?;
+    Ok(document.nodes)
 }
 
 fn safe_file_name(value: &str) -> String {
@@ -862,6 +991,7 @@ async fn fetch_subscription_url_with_options(
     let timeout_secs = options.timeout_secs.clamp(1, 300);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .no_proxy()
         .build()?;
     let attempts = options.retries.saturating_add(1);
     let mut last_error = None;

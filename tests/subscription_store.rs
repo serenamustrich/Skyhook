@@ -206,6 +206,67 @@ fn active_runtime_config_adds_subscription_outbounds_and_can_pick_default() {
 }
 
 #[test]
+fn proxy_provider_only_subscription_resolves_nodes_and_group_use() {
+    let root = unique_store_dir("proxy-provider");
+    let provider_path = root.join("provider.yaml");
+    fs::create_dir_all(&root).expect("store dir");
+    fs::write(
+        &provider_path,
+        r#"
+proxies:
+  - name: Provider-HK
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+"#,
+    )
+    .expect("provider file");
+    let subscription = format!(
+        r#"
+proxy-providers:
+  airport:
+    type: file
+    path: "{}"
+proxy-groups:
+  - name: Proxy
+    type: select
+    use:
+      - airport
+rules:
+  - MATCH,Proxy
+"#,
+        provider_path.display()
+    );
+    let store = SubscriptionStore::new(&root);
+
+    let imported = store
+        .import_text(Some("Provider".to_string()), None, &subscription, false)
+        .expect("import");
+    let document = store.document(&imported.meta.id).expect("document");
+    let config = store
+        .active_runtime_config(SuperConfig::default(), true)
+        .expect("runtime config");
+
+    assert_eq!(imported.meta.node_count, 1);
+    assert_eq!(imported.meta.supported_outbound_count, 1);
+    assert_eq!(document.proxy_providers[0].nodes[0].name, "Provider-HK");
+    assert!(config.outbounds.iter().any(|item| {
+        matches!(item, OutboundConfig::Shadowsocks { name, .. } if name == "Provider-HK")
+    }));
+    assert!(config.outbounds.iter().any(|item| {
+        matches!(
+            item,
+            OutboundConfig::Group { name, members, .. }
+                if name == "Proxy" && members == &vec!["Provider-HK".to_string()]
+        )
+    }));
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn replace_text_refreshes_counts_without_changing_identity() {
     let root = unique_store_dir("replace");
     let store = SubscriptionStore::new(&root);

@@ -1197,7 +1197,7 @@ fn default_connect_timeout_ms() -> u64 {
 }
 
 fn default_probe_url() -> String {
-    "http://cp.cloudflare.com/generate_204".to_string()
+    "http://www.google-analytics.com/generate_204".to_string()
 }
 
 fn default_probe_timeout_ms() -> u64 {
@@ -1209,7 +1209,7 @@ fn default_probe_interval_secs() -> u64 {
 }
 
 fn default_probe_concurrency() -> usize {
-    256
+    50
 }
 
 fn default_probe_only_supported() -> bool {

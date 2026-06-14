@@ -3,10 +3,10 @@ core:
   control_listen: 127.0.0.1:9197
   default_outbound: direct
   connect_timeout_ms: 5000
-  probe_url: http://cp.cloudflare.com/generate_204
+  probe_url: http://www.google-analytics.com/generate_204
   probe_timeout_ms: 500
   probe_interval_secs: 300
-  probe_concurrency: 256
+  probe_concurrency: 50
 
 tun:
   enabled: false

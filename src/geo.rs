@@ -120,6 +120,7 @@ async fn download_geo_asset_inner(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs.max(1)))
         .user_agent("Skyhook/0.1")
+        .no_proxy()
         .build()
         .context("failed to build geo download client")?;
     let response = client

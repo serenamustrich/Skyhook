@@ -14,6 +14,8 @@ pub struct SubscriptionDocument {
     pub nodes: Vec<SubscriptionNode>,
     pub groups: Vec<SubscriptionGroup>,
     #[serde(default)]
+    pub proxy_providers: Vec<SubscriptionProxyProvider>,
+    #[serde(default)]
     pub rule_providers: Vec<SubscriptionRuleProvider>,
     pub rules: Vec<String>,
     pub unsupported: Vec<UnsupportedItem>,
@@ -34,6 +36,29 @@ pub struct SubscriptionGroup {
     pub name: String,
     pub kind: String,
     pub members: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(default)]
+    pub include_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionProxyProvider {
+    pub name: String,
+    #[serde(default)]
+    pub provider_type: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub cache_path: Option<String>,
+    #[serde(default)]
+    pub interval: Option<u64>,
+    #[serde(default)]
+    pub nodes: Vec<SubscriptionNode>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -636,6 +661,7 @@ fn looks_like_clash_yaml(value: &Value) -> bool {
         .as_mapping()
         .map(|mapping| {
             mapping.contains_key(Value::String("proxies".to_string()))
+                || mapping.contains_key(Value::String("proxy-providers".to_string()))
                 || mapping.contains_key(Value::String("proxy-groups".to_string()))
                 || mapping.contains_key(Value::String("rule-providers".to_string()))
                 || mapping.contains_key(Value::String("rules".to_string()))
@@ -649,6 +675,7 @@ fn parse_clash_yaml(value: Value) -> anyhow::Result<SubscriptionDocument> {
         .ok_or_else(|| anyhow!("subscription yaml root must be a mapping"))?;
     let mut nodes = Vec::new();
     let mut groups = Vec::new();
+    let mut proxy_providers = Vec::new();
     let mut rule_providers = Vec::new();
     let mut rules = Vec::new();
     let mut unsupported = Vec::new();
@@ -677,6 +704,24 @@ fn parse_clash_yaml(value: Value) -> anyhow::Result<SubscriptionDocument> {
                 Ok(group) => groups.push(group),
                 Err(error) => unsupported.push(UnsupportedItem {
                     item: serde_yaml::to_string(group).unwrap_or_else(|_| "<group>".to_string()),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+    }
+
+    if let Some(providers) = mapping
+        .get(Value::String("proxy-providers".to_string()))
+        .and_then(Value::as_mapping)
+    {
+        for (name, provider) in providers {
+            let Some(name) = name.as_str() else {
+                continue;
+            };
+            match parse_clash_proxy_provider(name, provider) {
+                Ok(provider) => proxy_providers.push(provider),
+                Err(error) => unsupported.push(UnsupportedItem {
+                    item: name.to_string(),
                     reason: error.to_string(),
                 }),
             }
@@ -717,6 +762,7 @@ fn parse_clash_yaml(value: Value) -> anyhow::Result<SubscriptionDocument> {
         source_format: "clash-yaml".to_string(),
         nodes,
         groups,
+        proxy_providers,
         rule_providers,
         rules,
         unsupported,
@@ -790,10 +836,52 @@ fn parse_clash_group(value: &Value) -> anyhow::Result<SubscriptionGroup> {
                 .collect()
         })
         .unwrap_or_default();
+    let providers = mapping
+        .get(Value::String("use".to_string()))
+        .and_then(Value::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(SubscriptionGroup {
         name,
         kind,
         members,
+        providers,
+        include_all: yaml_bool(mapping, "include-all").unwrap_or(false),
+    })
+}
+
+fn parse_clash_proxy_provider(
+    name: &str,
+    value: &Value,
+) -> anyhow::Result<SubscriptionProxyProvider> {
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| anyhow!("proxy provider {name} must be a mapping"))?;
+    let nodes = mapping
+        .get(Value::String("proxies".to_string()))
+        .and_then(Value::as_sequence)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| parse_clash_proxy(item).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(SubscriptionProxyProvider {
+        name: name.to_string(),
+        provider_type: yaml_string(mapping, "type").unwrap_or_else(|| "http".to_string()),
+        url: yaml_string(mapping, "url"),
+        path: yaml_string(mapping, "path"),
+        cache_path: None,
+        interval: yaml_u64(mapping, "interval"),
+        nodes,
+        last_error: None,
     })
 }
 
@@ -880,6 +968,7 @@ fn parse_uri_subscription(text: &str) -> anyhow::Result<SubscriptionDocument> {
         source_format: "uri-list".to_string(),
         nodes,
         groups: Vec::new(),
+        proxy_providers: Vec::new(),
         rule_providers: Vec::new(),
         rules: Vec::new(),
         unsupported,
@@ -1305,6 +1394,20 @@ fn yaml_u64(mapping: &serde_yaml::Mapping, key: &str) -> Option<u64> {
         .and_then(|value| match value {
             Value::Number(number) => number.as_u64(),
             Value::String(text) => text.parse().ok(),
+            _ => None,
+        })
+}
+
+fn yaml_bool(mapping: &serde_yaml::Mapping, key: &str) -> Option<bool> {
+    mapping
+        .get(Value::String(key.to_string()))
+        .and_then(|value| match value {
+            Value::Bool(value) => Some(*value),
+            Value::Number(number) => number.as_u64().map(|item| item != 0),
+            Value::String(text) => Some(matches!(
+                text.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "y"
+            )),
             _ => None,
         })
 }

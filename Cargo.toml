@@ -1,6 +1,6 @@
 [package]
 name = "skyhook"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Skyhook, a Rust-native intelligent proxy core"
 license = "MIT OR Apache-2.0"
