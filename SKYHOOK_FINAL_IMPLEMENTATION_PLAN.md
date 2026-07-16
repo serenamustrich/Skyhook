@@ -145,6 +145,7 @@
 - `bf0fb62 Core: make outbound capabilities explicit`
 - `dbed82f Core: modularize target and TLS outbounds`
 - `2646d9d Core: split Shadowsocks family runtimes`
+- `09ff4a6 Core: isolate Shadowsocks protocol families`
 
 已经完成的基础：
 
@@ -200,10 +201,10 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 ### 5.3 当前结构债务
 
-- `Supercore/src/outbound/mod.rs`：提交基线约 9,794 行；`NEXT-004` 拆分后为 5,399 行。
-  公共 trait、factory、错误上下文、target、SOCKS5、AnyTLS、ShadowTLS、SSH、
-  WireGuard，以及 SS/SSR/Snell 的完整协议实现已经迁出；下一批迁移 Trojan、VMess、
-  VLESS、Hysteria2 和 TUIC。
+- `Supercore/src/outbound/mod.rs`：`NEXT-005` 拆分后为 3,457 行，其中生产实现只剩
+  Hysteria2 和 TUIC；其余主要体积为父模块既有回归测试。公共 trait、factory、错误
+  上下文、target、SOCKS5、AnyTLS、ShadowTLS、SSH、WireGuard、SS/SSR/Snell、Trojan、
+  VMess 和 VLESS/Reality 均已迁出。
 - `Supercore/src/core/mod.rs`：当前 16 行，只保留模块声明和公共导出；运行时职责已迁移
   到 `connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、`reload.rs`、
   `runtime.rs`、`selection.rs` 和 `subscription.rs`。协议能力由 Outbound 实现显式声明，
@@ -305,24 +306,16 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `2646d9d` 和当前未提交工作区上重新核对：
+2026-07-17 在 `09ff4a6` 和当前未提交工作区上重新核对：
 
-- 当前分支为 `main`，已提交基线停在 `2646d9d`。
-- 本批次协议实现只触及以下 5 个源码文件：
-  - `Supercore/src/outbound/mod.rs`
-  - `Supercore/src/outbound/io.rs`
-  - `Supercore/src/outbound/shadowsocks.rs`
-  - `Supercore/src/outbound/ssr.rs`
-  - `Supercore/src/outbound/snell.rs`
-- 当前 diff 是协议代码机械迁移，不得回退或覆盖；共享 IO 已独立为
-  `outbound/io.rs`，跨协议 crypto/obfs 依赖使用显式 sibling import 和最小
-  `pub(super)` 可见性。
-- 当前工作区已重新通过 `cargo check --all-targets` 且无 warning；SS/SSR/Snell 定向
-  真实拨号和 outbound 单元回归全部通过。
-- `outbound/mod.rs` 当前为 5,399 行，仍需迁出的主要生产实现为：
-  - Trojan
-  - VMess
-  - VLESS
+- 当前分支为 `main`，已提交基线停在 `09ff4a6`。
+- 当前批次新增 `trojan.rs`、`vmess.rs` 和 `vless.rs`，factory 全部通过构造函数创建
+  协议实例，不再依赖父模块私有字段。
+- VMess/VLESS 复用 `udp/session_pool.rs` 的按目标隔离 round-robin pool，目标之间不会
+  共享流式 UDP session，失败 session 会从对应目标 bucket 中移除。
+- 当前工作区已通过 `cargo check --all-targets` 且无 warning；outbound、Trojan、VMess、
+  VLESS 和 runtime 定向回归全部通过。
+- `outbound/mod.rs` 当前为 3,457 行，仍需迁出的生产实现为：
   - Hysteria2
   - TUIC
 - `UnsupportedProtocolOutbound` 仍承载：
@@ -344,18 +337,17 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 从 `NEXT-005` 迁移 Trojan、VMess 和 VLESS，保持 transport/wire format 行为不变。
-2. 完成 `NEXT-006` 迁移 Hysteria2 和 TUIC，并收敛公共 QUIC 生命周期。
-3. 完成 `NEXT-007` 至 `NEXT-009`，关闭 M1：清空巨型 `outbound/mod.rs`，统一
+1. 完成 `NEXT-006` 迁移 Hysteria2 和 TUIC，并收敛公共 QUIC 生命周期。
+2. 完成 `NEXT-007` 至 `NEXT-009`，关闭 M1：清空巨型 `outbound/mod.rs`，统一
    TCP/TLS/transport/UDP 和 cancellation。
-4. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
-5. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
-6. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、
+3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
+4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
+5. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、
    日志和 Doctor。
-7. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
-8. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
+6. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
+7. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
 
-在第 8 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
+在第 7 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
 
 ## 6. 不可违反的开发规则
 
@@ -524,8 +516,8 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
 3. [ ] `Core: modularize outbound protocol registry`
    - 已完成 trait、registry/factory 基础、显式 capability、错误上下文、SSH、
      WireGuard、target、SOCKS5、AnyTLS、ShadowTLS 迁移。
-   - SS/SSR/Snell 生命周期已提交，完整 helper 迁移正在当前工作区收口。
-   - 剩余按公共依赖关系迁移 Trojan、VMess、VLESS、Hysteria2 和 TUIC。
+   - SS/SSR/Snell、Trojan、VMess 和 VLESS/Reality 已完整迁移。
+   - 剩余按公共依赖关系迁移 Hysteria2 和 TUIC。
    - 不在同一个提交中同时重写协议 wire format。
 4. [ ] `Network: complete shared TCP TLS transports and UDP`
    - 完成 cancellation、deadline、Happy Eyeballs、TLS、transport 和 UDP session 基础。
@@ -730,9 +722,13 @@ SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS，以及 SS/SSR/Snell 生命周
      - 运行 `outbound::`、`ss_real_dial`、`ssr_real_dial`、`snell_real_dial`。
      - 更新 `protocol-matrix.md` 和本计划的真实状态，不夸大协议能力。
      - secret scan 通过后提交 `Core: isolate Shadowsocks protocol families`。
-5. [ ] `NEXT-005`：迁移 Trojan、VMess 和 VLESS。
+5. [x] `NEXT-005`：迁移 Trojan、VMess 和 VLESS。
    - transport 组合只依赖公共 transport 接口。
    - Reality/Vision 保持独立状态机，不塞回公共 TLS 模块。
+   - VMess/VLESS 共用按目标隔离的有界 round-robin UDP session pool。
+   - 验证：`cargo check --all-targets` 无 warning；outbound lib 44 passed；
+     `trojan_vmess_real_dial` 19 passed；`vless_hy2_tuic` 19 passed；
+     `config_and_runtime` 20 passed。
 6. [ ] `NEXT-006`：迁移 Hysteria2 和 TUIC。
    - 公共 QUIC endpoint/session 生命周期下沉到 transport。
    - 协议帧、认证和 UDP association 保留在各自协议模块。

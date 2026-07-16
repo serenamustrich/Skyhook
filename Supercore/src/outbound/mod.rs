@@ -1,37 +1,19 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     io::{Error, ErrorKind, IoSliceMut},
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context as TaskContext, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use aes::cipher::{BlockEncrypt, KeyInit as BlockKeyInit};
-use aes::Aes128;
-use aes_gcm::{aead::Aead, Aes128Gcm, Aes256Gcm};
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use blake2::{digest::VariableOutput, Blake2bVar};
 use bytes::Bytes;
-use chacha20poly1305::ChaCha20Poly1305;
-use hkdf::Hkdf;
 use ipnet::IpNet;
-use md5::{Digest, Md5};
 use russh::{client as ssh_client, ChannelMsg, Disconnect};
-use rustls::{
-    client::{DangerousClientHelloSessionIdProvider, Resumption},
-    crypto::{aws_lc_rs, ActiveKeyExchange, SharedSecret, SupportedKxGroup},
-    ffdhe_groups::FfdheGroup,
-    ClientConfig, Error as RustlsError, NamedGroup, ProtocolVersion, RootCertStore,
-};
-use rustls_pki_types::ServerName;
-use sha2::{Sha224, Sha256};
-use sha3::{
-    digest::{ExtendableOutput, XofReader},
-    Shake128,
-};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
     net::lookup_host,
@@ -39,9 +21,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
-use tokio_rustls::TlsConnector;
 use uuid::Uuid;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 
 use crate::{config::OutboundConfig, routing::Destination, telemetry::Telemetry};
 
@@ -66,14 +46,16 @@ mod ssr;
 mod target;
 mod traits;
 mod transports;
+mod trojan;
 mod udp;
 mod unsupported;
+mod vless;
+mod vmess;
 mod wireguard;
 
 use anytls::AnyTlsOutbound;
 use direct::DirectOutbound;
 use http_proxy::HttpOutbound;
-use io::read_exact_or_eof;
 use naive::NaiveOutbound;
 use pool::IdlePool;
 use registry::{attach_groups, insert_leaf};
@@ -84,14 +66,13 @@ use snell::SnellOutbound;
 use socks5::Socks5Outbound;
 use ssh::SshOutbound;
 use ssr::SsrOutbound;
-use target::{parse_socks5_destination_prefix, read_socks5_destination_after_atyp};
-use transports::{
-    connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
-    perform_websocket_handshake, perform_websocket_handshake_with_headers, quic_client_config,
-    spawn_websocket_stream, tls_client_config, NoCertificateVerification,
-};
+use target::parse_socks5_destination_prefix;
+use transports::{connect_tcp, quic_client_config};
+use trojan::TrojanOutbound;
 use udp::{resolve_udp_socket_addr, RoundRobinSessionPool};
 use unsupported::UnsupportedProtocolOutbound;
+use vless::VlessOutbound;
+use vmess::VmessOutbound;
 use wireguard::WireGuardOutbound;
 
 pub use factory::build_outbounds;
@@ -106,6 +87,15 @@ use self::{
 
 #[cfg(test)]
 use std::io::Cursor;
+
+#[cfg(test)]
+use std::collections::BTreeMap;
+
+#[cfg(test)]
+use md5::Digest;
+
+#[cfg(test)]
+use sha2::Sha224;
 
 #[cfg(test)]
 use bytes::BytesMut;
@@ -124,107 +114,40 @@ use shadowsocks::{
 };
 
 #[cfg(test)]
+use vmess::{
+    read_vmess_chunk, vmess_aes128gcm_decrypt, vmess_aes128gcm_encrypt, vmess_fnv1a,
+    vmess_instruction_key, vmess_kdf, vmess_sha256_16, write_vmess_chunk, VmessAeadState,
+    VmessCipher, VmessDownloadState, VmessLengthMask, VmessUploadState, VMESS_TAG_LEN,
+};
+
+#[cfg(test)]
+use vless::{
+    build_vless_request, build_vless_request_with_flow, decode_reality_public_key,
+    decode_reality_short_id, seal_reality_session_id, REALITY_CLIENT_VERSION,
+};
+
+#[cfg(test)]
+use trojan::{build_trojan_request, trojan_alpn_protocols};
+
+#[cfg(test)]
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm,
+};
+
+#[cfg(test)]
+use rustls::crypto::aws_lc_rs;
+
+#[cfg(test)]
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+
+#[cfg(test)]
 use transports::{
     read_websocket_frame, render_transport_headers, websocket_accept_key,
     write_websocket_binary_frame, write_websocket_frame,
 };
 
 const UDP_SESSION_POOL_SIZE: usize = 4;
-
-struct TrojanOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    password: String,
-    sni: Option<String>,
-    skip_cert_verify: bool,
-    network: Option<String>,
-    ws_path: Option<String>,
-    ws_host: Option<String>,
-    grpc_service_name: Option<String>,
-    transport_headers: BTreeMap<String, String>,
-    alpn: Vec<String>,
-    udp_sessions: TokioMutex<TrojanUdpPool>,
-}
-
-type TrojanUdpPool = RoundRobinSessionPool<TrojanUdpSession>;
-
-struct TrojanUdpSession {
-    stream: BoxedStream,
-}
-
-struct VmessOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    uuid: String,
-    cipher: String,
-    tls: bool,
-    sni: Option<String>,
-    skip_cert_verify: bool,
-    network: Option<String>,
-    ws_path: Option<String>,
-    ws_host: Option<String>,
-    grpc_service_name: Option<String>,
-    udp_sessions: TokioMutex<VmessUdpPool>,
-}
-
-struct VlessOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    uuid: String,
-    flow: Option<String>,
-    security: Option<String>,
-    tls: bool,
-    sni: Option<String>,
-    skip_cert_verify: bool,
-    network: Option<String>,
-    ws_path: Option<String>,
-    ws_host: Option<String>,
-    grpc_service_name: Option<String>,
-    reality_public_key: Option<String>,
-    reality_short_id: Option<String>,
-    reality_fingerprint: Option<String>,
-    reality_spider_x: Option<String>,
-    udp_sessions: TokioMutex<VlessUdpPool>,
-}
-
-#[derive(Default)]
-struct VmessUdpPool {
-    buckets: HashMap<String, UdpSessionBucket<VmessUdpSession>>,
-}
-
-#[derive(Default)]
-struct VlessUdpPool {
-    buckets: HashMap<String, UdpSessionBucket<VlessUdpSession>>,
-}
-
-struct UdpSessionBucket<T> {
-    sessions: Vec<Arc<TokioMutex<T>>>,
-    next_index: usize,
-}
-
-impl<T> Default for UdpSessionBucket<T> {
-    fn default() -> Self {
-        Self {
-            sessions: Vec::new(),
-            next_index: 0,
-        }
-    }
-}
-
-struct VmessUdpSession {
-    stream: BoxedStream,
-    upload: VmessUploadState,
-    download: VmessDownloadState,
-    response_header_read: bool,
-}
-
-struct VlessUdpSession {
-    stream: BoxedStream,
-    response_header_read: bool,
-}
 
 struct Hysteria2Outbound {
     name: String,
@@ -301,545 +224,6 @@ impl Drop for TuicUdpSession {
     fn drop(&mut self) {
         self.connection
             .close(quinn::VarInt::from_u32(0), b"supercore close");
-    }
-}
-
-#[async_trait]
-impl Outbound for VmessOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "vmess"
-    }
-
-    fn capability(&self) -> OutboundCapability {
-        OutboundCapability::tcp_udp("vmess-command-udp-session-pool")
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let user_id = Uuid::parse_str(&self.uuid)
-            .map_err(|error| anyhow!("invalid vmess uuid for {}: {error}", self.name))?;
-        let cipher = VmessCipher::from_name(&self.cipher)?;
-        let stream = self.open_transport(timeout_ms).await?;
-        setup_vmess_stream(stream, &user_id, cipher, destination).await
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let session_handle = self.vmess_udp_session(destination, timeout_ms).await?;
-        let exchange = {
-            let mut session = session_handle.lock().await;
-            let VmessUdpSession {
-                stream,
-                upload,
-                download,
-                response_header_read,
-            } = &mut *session;
-            timeout(Duration::from_millis(timeout_ms), async {
-                write_vmess_chunk(stream, upload, payload).await?;
-                if !*response_header_read {
-                    read_vmess_response_header(stream, download).await?;
-                    *response_header_read = true;
-                }
-                read_vmess_chunk(stream, download)
-                    .await?
-                    .ok_or_else(|| anyhow!("vmess udp response ended before payload"))
-            })
-            .await
-            .context("vmess udp exchange timed out")?
-        };
-        if exchange.is_err() {
-            self.remove_vmess_udp_session(destination, &session_handle)
-                .await;
-        }
-        exchange
-    }
-}
-
-impl VmessOutbound {
-    async fn open_transport(&self, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .to_ascii_lowercase();
-        if !matches!(
-            network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http"
-        ) {
-            return Err(anyhow!("unsupported vmess network {network}"));
-        }
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-
-        if self.tls {
-            let server_name = self.sni.as_deref().unwrap_or(&self.server).to_string();
-            let mut tls_config = tls_client_config(self.skip_cert_verify)?;
-            if matches!(network.as_str(), "grpc" | "h2" | "http") {
-                tls_config.alpn_protocols = vec![b"h2".to_vec()];
-            }
-            let connector = TlsConnector::from(Arc::new(tls_config));
-            let tls_server_name = ServerName::try_from(server_name.clone())
-                .map_err(|error| anyhow!("invalid vmess server name: {error}"))?;
-            let mut stream = timeout(
-                Duration::from_millis(timeout_ms),
-                connector.connect(tls_server_name, tcp),
-            )
-            .await
-            .context("vmess tls handshake timed out")?
-            .context("vmess tls handshake failed")?;
-            if network == "ws" || network == "websocket" {
-                perform_websocket_handshake(
-                    &mut stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                )
-                .await?;
-                return Ok(Box::new(spawn_websocket_stream(stream)));
-            }
-            if network == "grpc" {
-                return open_grpc_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.grpc_service_name.as_deref(),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            if matches!(network.as_str(), "h2" | "http") {
-                return open_h2_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            Ok(Box::new(stream))
-        } else {
-            let mut stream = tcp;
-            if network == "ws" || network == "websocket" {
-                perform_websocket_handshake(
-                    &mut stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                )
-                .await?;
-                return Ok(Box::new(spawn_websocket_stream(stream)));
-            }
-            if network == "grpc" {
-                return open_grpc_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
-                    self.grpc_service_name.as_deref(),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            if matches!(network.as_str(), "h2" | "http") {
-                return open_h2_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            Ok(Box::new(stream))
-        }
-    }
-
-    async fn vmess_udp_session(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<Arc<TokioMutex<VmessUdpSession>>> {
-        let key = destination.authority();
-        let mut pool = self.udp_sessions.lock().await;
-        let bucket = pool.buckets.entry(key.clone()).or_default();
-        if bucket.sessions.len() < UDP_SESSION_POOL_SIZE {
-            let session = Arc::new(TokioMutex::new(
-                self.open_vmess_udp_session(destination, timeout_ms).await?,
-            ));
-            bucket.sessions.push(session.clone());
-            bucket.next_index = bucket.sessions.len() % UDP_SESSION_POOL_SIZE;
-            return Ok(session);
-        }
-        let index = bucket.next_index % bucket.sessions.len();
-        bucket.next_index = (bucket.next_index + 1) % bucket.sessions.len();
-        Ok(bucket.sessions[index].clone())
-    }
-
-    async fn open_vmess_udp_session(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<VmessUdpSession> {
-        let user_id = Uuid::parse_str(&self.uuid)
-            .map_err(|error| anyhow!("invalid vmess uuid for {}: {error}", self.name))?;
-        let cipher = VmessCipher::from_name(&self.cipher)?;
-        let mut stream = self.open_transport(timeout_ms).await?;
-        let setup = build_vmess_setup_with_command(&user_id, cipher, destination, VMESS_CMD_UDP)?;
-        timeout(Duration::from_millis(timeout_ms), async {
-            stream.write_all(&setup.request).await?;
-            stream.flush().await
-        })
-        .await
-        .context("vmess udp session setup timed out")??;
-        Ok(VmessUdpSession {
-            stream,
-            upload: setup.upload,
-            download: setup.download,
-            response_header_read: false,
-        })
-    }
-
-    async fn remove_vmess_udp_session(
-        &self,
-        destination: &Destination,
-        target: &Arc<TokioMutex<VmessUdpSession>>,
-    ) {
-        let mut pool = self.udp_sessions.lock().await;
-        let key = destination.authority();
-        let Some(bucket) = pool.buckets.get_mut(&key) else {
-            return;
-        };
-        bucket
-            .sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !bucket.sessions.is_empty() {
-            bucket.next_index %= bucket.sessions.len();
-        } else {
-            pool.buckets.remove(&key);
-        }
-    }
-}
-
-#[async_trait]
-impl Outbound for VlessOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "vless"
-    }
-
-    fn capability(&self) -> OutboundCapability {
-        if self
-            .security
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("reality"))
-            && self
-                .reality_public_key
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
-            OutboundCapability::unsupported("VLESS Reality public key is required")
-        } else {
-            OutboundCapability::tcp_udp("vless-command-udp-session-pool")
-        }
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let user_id = Uuid::parse_str(&self.uuid)
-            .map_err(|error| anyhow!("invalid vless uuid for {}: {error}", self.name))?;
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .to_ascii_lowercase();
-        if !matches!(
-            network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http"
-        ) {
-            return Err(anyhow!("unsupported vless network {network}"));
-        }
-        let security = self
-            .security
-            .as_deref()
-            .unwrap_or(if self.tls { "tls" } else { "none" })
-            .to_ascii_lowercase();
-        if !matches!(security.as_str(), "tls" | "none" | "" | "reality") {
-            return Err(anyhow!("unsupported vless security {security}"));
-        }
-        let flow = self
-            .flow
-            .as_deref()
-            .map(str::trim)
-            .filter(|flow| !flow.is_empty());
-        if let Some(flow) = flow {
-            if flow != "xtls-rprx-vision" {
-                return Err(anyhow!("unsupported vless flow {flow}"));
-            }
-            if (!self.tls && security != "reality") || network != "tcp" {
-                return Err(anyhow!(
-                    "vless flow {flow} requires tls/reality over tcp transport"
-                ));
-            }
-        }
-        let request = build_vless_request_with_flow(&user_id, destination, flow)?;
-        let mut stream = self.open_transport(&network, timeout_ms).await?;
-        stream.write_all(&request).await?;
-        read_vless_response_header(&mut stream).await?;
-        Ok(stream)
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let user_id = Uuid::parse_str(&self.uuid)
-            .map_err(|error| anyhow!("invalid vless uuid for {}: {error}", self.name))?;
-        let network = self.network_name()?;
-        let security = self.security_name();
-        if !matches!(security.as_str(), "tls" | "none" | "" | "reality") {
-            return Err(anyhow!("unsupported vless security {security}"));
-        }
-        if self
-            .flow
-            .as_deref()
-            .map(str::trim)
-            .filter(|flow| !flow.is_empty())
-            .is_some()
-        {
-            return Err(anyhow!("vless udp does not support xtls flow addons"));
-        }
-
-        let packet = encode_length_prefixed_packet(payload, "vless udp")?;
-        let session_handle = self
-            .vless_udp_session(&user_id, destination, &network, timeout_ms)
-            .await?;
-        let exchange = {
-            let mut session = session_handle.lock().await;
-            timeout(Duration::from_millis(timeout_ms), async {
-                session.stream.write_all(&packet).await?;
-                session.stream.flush().await?;
-                if !session.response_header_read {
-                    read_vless_response_header(&mut session.stream).await?;
-                    session.response_header_read = true;
-                }
-                read_length_prefixed_packet(&mut session.stream, "vless udp").await
-            })
-            .await
-            .context("vless udp exchange timed out")?
-        };
-        if exchange.is_err() {
-            self.remove_vless_udp_session(destination, &session_handle)
-                .await;
-        }
-        exchange
-    }
-}
-
-impl VlessOutbound {
-    fn network_name(&self) -> anyhow::Result<String> {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .to_ascii_lowercase();
-        if !matches!(
-            network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http"
-        ) {
-            return Err(anyhow!("unsupported vless network {network}"));
-        }
-        Ok(network)
-    }
-
-    fn security_name(&self) -> String {
-        self.security
-            .as_deref()
-            .unwrap_or(if self.tls { "tls" } else { "none" })
-            .to_ascii_lowercase()
-    }
-
-    async fn open_transport(&self, network: &str, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let security = self.security_name();
-        let tls_enabled = self.tls || security == "reality";
-        if security == "reality" && matches!(network, "ws" | "websocket") {
-            return Err(anyhow!(
-                "vless reality does not support websocket transport"
-            ));
-        }
-        if tls_enabled {
-            let server_name = self.sni.as_deref().unwrap_or(&self.server).to_string();
-            let mut tls_config = if security == "reality" {
-                reality_tls_client_config(
-                    self.skip_cert_verify,
-                    self.reality_public_key.as_deref(),
-                    self.reality_short_id.as_deref(),
-                    self.reality_fingerprint.as_deref(),
-                    self.reality_spider_x.as_deref(),
-                )?
-            } else {
-                tls_client_config(self.skip_cert_verify)?
-            };
-            if matches!(network, "grpc" | "h2" | "http") {
-                tls_config.alpn_protocols = vec![b"h2".to_vec()];
-            }
-            let connector = TlsConnector::from(Arc::new(tls_config));
-            let tls_server_name = ServerName::try_from(server_name.clone())
-                .map_err(|error| anyhow!("invalid vless server name: {error}"))?;
-            let mut stream = timeout(
-                Duration::from_millis(timeout_ms),
-                connector.connect(tls_server_name, tcp),
-            )
-            .await
-            .context("vless tls handshake timed out")?
-            .context("vless tls handshake failed")?;
-            if network == "ws" || network == "websocket" {
-                perform_websocket_handshake(
-                    &mut stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                )
-                .await?;
-                return Ok(Box::new(spawn_websocket_stream(stream)));
-            }
-            if network == "grpc" {
-                return open_grpc_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.grpc_service_name.as_deref(),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            if matches!(network, "h2" | "http") {
-                return open_h2_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            Ok(Box::new(stream))
-        } else {
-            let mut stream = tcp;
-            if network == "ws" || network == "websocket" {
-                perform_websocket_handshake(
-                    &mut stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                )
-                .await?;
-                return Ok(Box::new(spawn_websocket_stream(stream)));
-            }
-            if network == "grpc" {
-                return open_grpc_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
-                    self.grpc_service_name.as_deref(),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            if matches!(network, "h2" | "http") {
-                return open_h2_tunnel(
-                    stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                    timeout_ms,
-                )
-                .await
-                .map(|stream| Box::new(stream) as BoxedStream);
-            }
-            Ok(Box::new(stream))
-        }
-    }
-
-    async fn vless_udp_session(
-        &self,
-        user_id: &Uuid,
-        destination: &Destination,
-        network: &str,
-        timeout_ms: u64,
-    ) -> anyhow::Result<Arc<TokioMutex<VlessUdpSession>>> {
-        let key = destination.authority();
-        let mut pool = self.udp_sessions.lock().await;
-        let bucket = pool.buckets.entry(key.clone()).or_default();
-        if bucket.sessions.len() < UDP_SESSION_POOL_SIZE {
-            let session = Arc::new(TokioMutex::new(
-                self.open_vless_udp_session(user_id, destination, network, timeout_ms)
-                    .await?,
-            ));
-            bucket.sessions.push(session.clone());
-            bucket.next_index = bucket.sessions.len() % UDP_SESSION_POOL_SIZE;
-            return Ok(session);
-        }
-        let index = bucket.next_index % bucket.sessions.len();
-        bucket.next_index = (bucket.next_index + 1) % bucket.sessions.len();
-        Ok(bucket.sessions[index].clone())
-    }
-
-    async fn open_vless_udp_session(
-        &self,
-        user_id: &Uuid,
-        destination: &Destination,
-        network: &str,
-        timeout_ms: u64,
-    ) -> anyhow::Result<VlessUdpSession> {
-        let mut stream = self.open_transport(network, timeout_ms).await?;
-        let request =
-            build_vless_request_with_command_and_flow(user_id, destination, None, VLESS_CMD_UDP)?;
-        timeout(Duration::from_millis(timeout_ms), async {
-            stream.write_all(&request).await?;
-            stream.flush().await
-        })
-        .await
-        .context("vless udp session setup timed out")??;
-        Ok(VlessUdpSession {
-            stream,
-            response_header_read: false,
-        })
-    }
-
-    async fn remove_vless_udp_session(
-        &self,
-        destination: &Destination,
-        target: &Arc<TokioMutex<VlessUdpSession>>,
-    ) {
-        let mut pool = self.udp_sessions.lock().await;
-        let key = destination.authority();
-        let Some(bucket) = pool.buckets.get_mut(&key) else {
-            return;
-        };
-        bucket
-            .sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !bucket.sessions.is_empty() {
-            bucket.next_index %= bucket.sessions.len();
-        } else {
-            pool.buckets.remove(&key);
-        }
     }
 }
 
@@ -2309,1330 +1693,12 @@ fn skip_tuic_address(input: &[u8], cursor: &mut usize) -> anyhow::Result<()> {
     }
 }
 
-#[async_trait]
-impl Outbound for TrojanOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "trojan"
-    }
-
-    fn capability(&self) -> OutboundCapability {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .trim()
-            .to_ascii_lowercase();
-        match trojan_alpn_protocols(&network, &self.alpn) {
-            Ok(_) => OutboundCapability::tcp_udp("trojan-udp-associate-stream-pool"),
-            Err(error) => OutboundCapability::unsupported(error.to_string()),
-        }
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let mut stream = self.open_transport(timeout_ms).await?;
-        let request = build_trojan_request(&self.password, destination)?;
-        stream.write_all(&request).await?;
-        stream.flush().await?;
-        Ok(stream)
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let session_handle = self.trojan_udp_session(timeout_ms).await?;
-        let mut session = session_handle.lock().await;
-        let packet = encode_trojan_udp_packet(destination, payload)?;
-        let exchange = timeout(Duration::from_millis(timeout_ms), async {
-            session.stream.write_all(&packet).await?;
-            session.stream.flush().await?;
-            let (_response_destination, response) =
-                read_trojan_udp_packet(&mut session.stream).await?;
-            anyhow::Ok(response)
-        })
-        .await
-        .context("trojan udp exchange timed out")?;
-        if exchange.is_err() {
-            drop(session);
-            self.remove_trojan_udp_session(&session_handle).await;
-        }
-        exchange
-    }
-}
-
-impl TrojanOutbound {
-    async fn open_transport(&self, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .trim()
-            .to_ascii_lowercase();
-        if !matches!(
-            network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http" | "httpupgrade" | "http-upgrade"
-        ) {
-            return Err(anyhow!("unsupported trojan network {network}"));
-        }
-
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let server_name = self.sni.as_deref().unwrap_or(&self.server).to_string();
-        let mut tls_config = tls_client_config(self.skip_cert_verify)?;
-        tls_config.alpn_protocols = trojan_alpn_protocols(&network, &self.alpn)?;
-        let connector = TlsConnector::from(Arc::new(tls_config));
-        let tls_server_name = ServerName::try_from(server_name.clone())
-            .map_err(|error| anyhow!("invalid trojan server name: {error}"))?;
-        let mut stream = timeout(
-            Duration::from_millis(timeout_ms),
-            connector.connect(tls_server_name, tcp),
-        )
-        .await
-        .context("trojan tls handshake timed out")?
-        .context("trojan tls handshake failed")?;
-
-        match network.as_str() {
-            "tcp" => Ok(Box::new(stream)),
-            "ws" | "websocket" => {
-                perform_websocket_handshake_with_headers(
-                    &mut stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
-                    self.ws_path.as_deref().unwrap_or("/"),
-                    &self.transport_headers,
-                )
-                .await?;
-                Ok(Box::new(spawn_websocket_stream(stream)))
-            }
-            "grpc" => open_grpc_tunnel(
-                stream,
-                self.ws_host.as_deref().unwrap_or(&server_name),
-                self.grpc_service_name.as_deref(),
-                timeout_ms,
-            )
-            .await
-            .map(|stream| Box::new(stream) as BoxedStream),
-            "h2" | "http" => open_h2_tunnel(
-                stream,
-                self.ws_host.as_deref().unwrap_or(&server_name),
-                self.ws_path.as_deref().unwrap_or("/"),
-                timeout_ms,
-            )
-            .await
-            .map(|stream| Box::new(stream) as BoxedStream),
-            "httpupgrade" | "http-upgrade" => open_http_upgrade_tunnel(
-                stream,
-                self.ws_host.as_deref().unwrap_or(&server_name),
-                self.ws_path.as_deref().unwrap_or("/"),
-                &self.transport_headers,
-            )
-            .await
-            .map(|stream| Box::new(stream) as BoxedStream),
-            _ => unreachable!("trojan network was validated"),
-        }
-    }
-
-    async fn trojan_udp_session(
-        &self,
-        timeout_ms: u64,
-    ) -> anyhow::Result<Arc<TokioMutex<TrojanUdpSession>>> {
-        let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
-            let session = Arc::new(TokioMutex::new(
-                self.open_trojan_udp_session(timeout_ms).await?,
-            ));
-            pool.push(session.clone());
-            return Ok(session);
-        }
-        pool.next()
-            .ok_or_else(|| anyhow!("trojan UDP session pool is unexpectedly empty"))
-    }
-
-    async fn open_trojan_udp_session(&self, timeout_ms: u64) -> anyhow::Result<TrojanUdpSession> {
-        let mut stream = self.open_transport(timeout_ms).await?;
-        let request = build_trojan_request_with_command(
-            &self.password,
-            &Destination::new("0.0.0.0", 0),
-            TROJAN_CMD_UDP_ASSOCIATE,
-        )?;
-        stream.write_all(&request).await?;
-        stream.flush().await?;
-        Ok(TrojanUdpSession { stream })
-    }
-
-    async fn remove_trojan_udp_session(&self, target: &Arc<TokioMutex<TrojanUdpSession>>) {
-        let mut pool = self.udp_sessions.lock().await;
-        pool.remove(target);
-    }
-}
-
-fn trojan_alpn_protocols(network: &str, configured: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
-    let mut protocols = Vec::new();
-    for value in configured {
-        for protocol in value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-        {
-            if !protocol.is_ascii() || protocol.len() > u8::MAX as usize {
-                return Err(anyhow!("invalid trojan ALPN value {protocol:?}"));
-            }
-            if !protocols
-                .iter()
-                .any(|existing: &Vec<u8>| existing.as_slice() == protocol.as_bytes())
-            {
-                protocols.push(protocol.as_bytes().to_vec());
-            }
-        }
-    }
-
-    if protocols.is_empty() {
-        return Ok(match network {
-            "grpc" | "h2" | "http" => vec![b"h2".to_vec()],
-            "ws" | "websocket" | "httpupgrade" | "http-upgrade" => {
-                vec![b"http/1.1".to_vec()]
-            }
-            _ => Vec::new(),
-        });
-    }
-    if matches!(network, "grpc" | "h2" | "http")
-        && !protocols.iter().any(|item| item.as_slice() == b"h2")
-    {
-        return Err(anyhow!("trojan {network} transport requires h2 in ALPN"));
-    }
-    if matches!(network, "ws" | "websocket" | "httpupgrade" | "http-upgrade")
-        && !protocols.iter().any(|item| item.as_slice() == b"http/1.1")
-    {
-        return Err(anyhow!(
-            "trojan {network} transport requires http/1.1 in ALPN"
-        ));
-    }
-    Ok(protocols)
-}
-
 fn destination_socket_addr(destination: &Destination) -> String {
     if destination.host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{}]:{}", destination.host, destination.port)
     } else {
         destination.authority()
     }
-}
-
-fn reality_tls_client_config(
-    skip_cert_verify: bool,
-    public_key: Option<&str>,
-    short_id: Option<&str>,
-    fingerprint: Option<&str>,
-    spider_x: Option<&str>,
-) -> anyhow::Result<ClientConfig> {
-    let public_key = public_key.ok_or_else(|| anyhow!("vless reality public key is required"))?;
-    validate_reality_fingerprint(fingerprint)?;
-    validate_reality_spider_x(spider_x)?;
-    let mut provider = aws_lc_rs::default_provider();
-    provider.kx_groups = vec![&REALITY_X25519_KX_GROUP];
-    let builder = ClientConfig::builder_with_provider(provider.into())
-        .with_protocol_versions(&[&rustls::version::TLS13])?;
-    let mut config = if skip_cert_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
-    } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
-    config.alpn_protocols.clear();
-    config.resumption = Resumption::disabled();
-    config
-        .dangerous()
-        .set_client_hello_session_id_provider(Arc::new(RealitySessionIdProvider {
-            public_key: decode_reality_public_key(public_key)?.to_bytes(),
-            short_id: decode_reality_short_id(short_id)?,
-        }));
-    Ok(config)
-}
-
-const VMESS_TAG_LEN: usize = 16;
-const VMESS_MAX_CHUNK_PLAINTEXT: usize = 8192;
-const VMESS_CMD_TCP: u8 = 0x01;
-const VMESS_CMD_UDP: u8 = 0x02;
-type VmessMaskReader = digest::core_api::XofReaderCoreWrapper<sha3::Shake128ReaderCore>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmessCipher {
-    Aes128Gcm,
-    Chacha20Poly1305,
-    None,
-}
-
-struct VmessSetup {
-    request: Vec<u8>,
-    upload: VmessUploadState,
-    download: VmessDownloadState,
-}
-
-struct VmessUploadState {
-    cipher: Option<VmessAeadState>,
-    length_mask: VmessLengthMask,
-}
-
-struct VmessDownloadState {
-    response_header_key: [u8; 16],
-    response_header_iv: [u8; 16],
-    response_authentication: u8,
-    cipher: Option<VmessAeadState>,
-    length_mask: VmessLengthMask,
-}
-
-struct VmessLengthMask {
-    reader: VmessMaskReader,
-}
-
-struct VmessAeadState {
-    cipher: VmessCipher,
-    key: Vec<u8>,
-    nonce: [u8; 12],
-    counter: u16,
-}
-
-impl VmessCipher {
-    fn from_name(name: &str) -> anyhow::Result<Self> {
-        match name.to_ascii_lowercase().as_str() {
-            "auto" | "chacha20-poly1305" | "chacha20-ietf-poly1305" => Ok(Self::Chacha20Poly1305),
-            "aes-128-gcm" => Ok(Self::Aes128Gcm),
-            "none" => Ok(Self::None),
-            _ => Err(anyhow!("unsupported vmess cipher {name}")),
-        }
-    }
-
-    fn method_byte(self) -> u8 {
-        match self {
-            Self::Aes128Gcm => 3,
-            Self::Chacha20Poly1305 => 4,
-            Self::None => 5,
-        }
-    }
-
-    fn tag_len(self) -> usize {
-        match self {
-            Self::None => 0,
-            Self::Aes128Gcm | Self::Chacha20Poly1305 => VMESS_TAG_LEN,
-        }
-    }
-}
-
-impl VmessLengthMask {
-    fn new(seed: &[u8]) -> Self {
-        let mut shake = Shake128::default();
-        sha3::digest::Update::update(&mut shake, seed);
-        Self {
-            reader: shake.finalize_xof(),
-        }
-    }
-
-    fn next(&mut self) -> u16 {
-        let mut mask = [0u8; 2];
-        self.reader.read(&mut mask);
-        u16::from_be_bytes(mask)
-    }
-}
-
-impl VmessAeadState {
-    fn new(cipher: VmessCipher, key: &[u8], iv: &[u8]) -> anyhow::Result<Option<Self>> {
-        if cipher == VmessCipher::None {
-            return Ok(None);
-        }
-        if iv.len() < 12 {
-            return Err(anyhow!("vmess iv is too short"));
-        }
-        let mut nonce = [0u8; 12];
-        nonce[2..].copy_from_slice(&iv[2..12]);
-        let key = match cipher {
-            VmessCipher::Aes128Gcm => key.to_vec(),
-            VmessCipher::Chacha20Poly1305 => vmess_chacha_key(key).to_vec(),
-            VmessCipher::None => unreachable!(),
-        };
-        Ok(Some(Self {
-            cipher,
-            key,
-            nonce,
-            counter: 0,
-        }))
-    }
-
-    fn next_nonce(&mut self) -> [u8; 12] {
-        let mut nonce = self.nonce;
-        nonce[0..2].copy_from_slice(&self.counter.to_be_bytes());
-        self.counter = self.counter.wrapping_add(1);
-        nonce
-    }
-
-    fn encrypt(&mut self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let nonce = self.next_nonce();
-        match self.cipher {
-            VmessCipher::Aes128Gcm => Aes128Gcm::new_from_slice(&self.key)
-                .map_err(|_| anyhow!("invalid vmess aes-128-gcm key"))?
-                .encrypt(aes_gcm::Nonce::from_slice(&nonce), plaintext)
-                .map_err(|_| anyhow!("vmess encrypt failed")),
-            VmessCipher::Chacha20Poly1305 => ChaCha20Poly1305::new_from_slice(&self.key)
-                .map_err(|_| anyhow!("invalid vmess chacha20-poly1305 key"))?
-                .encrypt(chacha20poly1305::Nonce::from_slice(&nonce), plaintext)
-                .map_err(|_| anyhow!("vmess encrypt failed")),
-            VmessCipher::None => Ok(plaintext.to_vec()),
-        }
-    }
-
-    fn decrypt(&mut self, ciphertext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let nonce = self.next_nonce();
-        match self.cipher {
-            VmessCipher::Aes128Gcm => Aes128Gcm::new_from_slice(&self.key)
-                .map_err(|_| anyhow!("invalid vmess aes-128-gcm key"))?
-                .decrypt(aes_gcm::Nonce::from_slice(&nonce), ciphertext)
-                .map_err(|_| anyhow!("vmess decrypt failed")),
-            VmessCipher::Chacha20Poly1305 => ChaCha20Poly1305::new_from_slice(&self.key)
-                .map_err(|_| anyhow!("invalid vmess chacha20-poly1305 key"))?
-                .decrypt(chacha20poly1305::Nonce::from_slice(&nonce), ciphertext)
-                .map_err(|_| anyhow!("vmess decrypt failed")),
-            VmessCipher::None => Ok(ciphertext.to_vec()),
-        }
-    }
-}
-
-async fn setup_vmess_stream<S>(
-    mut stream: S,
-    user_id: &Uuid,
-    cipher: VmessCipher,
-    destination: &Destination,
-) -> anyhow::Result<BoxedStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let setup = build_vmess_setup(user_id, cipher, destination)?;
-    stream.write_all(&setup.request).await?;
-    stream.flush().await?;
-    Ok(Box::new(spawn_vmess_stream(
-        stream,
-        setup.upload,
-        setup.download,
-    )))
-}
-
-fn spawn_vmess_stream<S>(
-    stream: S,
-    mut upload_state: VmessUploadState,
-    mut download_state: VmessDownloadState,
-) -> DuplexStream
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (app_side, relay_side) = tokio::io::duplex(64 * 1024);
-    let (mut local_read, mut local_write) = tokio::io::split(relay_side);
-    let (mut remote_read, mut remote_write) = tokio::io::split(stream);
-
-    tokio::spawn(async move {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match local_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = write_vmess_chunk(&mut remote_write, &mut upload_state, &[]).await;
-                    let _ = remote_write.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    for chunk in buf[..n].chunks(VMESS_MAX_CHUNK_PLAINTEXT) {
-                        if write_vmess_chunk(&mut remote_write, &mut upload_state, chunk)
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        if read_vmess_response_header(&mut remote_read, &download_state)
-            .await
-            .is_err()
-        {
-            let _ = local_write.shutdown().await;
-            return;
-        }
-        loop {
-            match read_vmess_chunk(&mut remote_read, &mut download_state).await {
-                Ok(Some(chunk)) => {
-                    if local_write.write_all(&chunk).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    let _ = local_write.shutdown().await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = local_write.shutdown().await;
-                    break;
-                }
-            }
-        }
-    });
-
-    app_side
-}
-
-async fn write_vmess_chunk<W>(
-    writer: &mut W,
-    state: &mut VmessUploadState,
-    payload: &[u8],
-) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let body = match &mut state.cipher {
-        Some(cipher) => cipher.encrypt(payload)?,
-        None => payload.to_vec(),
-    };
-    if body.len() > u16::MAX as usize {
-        return Err(anyhow!("vmess chunk is too large"));
-    }
-    let masked_len = (body.len() as u16) ^ state.length_mask.next();
-    writer.write_all(&masked_len.to_be_bytes()).await?;
-    writer.write_all(&body).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn read_vmess_chunk<R>(
-    reader: &mut R,
-    state: &mut VmessDownloadState,
-) -> anyhow::Result<Option<Vec<u8>>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut length = [0u8; 2];
-    if !read_exact_or_eof(reader, &mut length).await? {
-        return Ok(None);
-    }
-    let body_len = (u16::from_be_bytes(length) ^ state.length_mask.next()) as usize;
-    let tag_len = state
-        .cipher
-        .as_ref()
-        .map(|cipher| cipher.cipher.tag_len())
-        .unwrap_or(0);
-    if body_len == tag_len {
-        let mut eof = vec![0u8; body_len];
-        if body_len > 0 {
-            reader.read_exact(&mut eof).await?;
-        }
-        return Ok(None);
-    }
-    if body_len > u16::MAX as usize {
-        return Err(anyhow!("vmess response chunk is too large"));
-    }
-    if body_len < tag_len {
-        return Err(anyhow!("vmess response chunk is shorter than tag"));
-    }
-    let mut body = vec![0u8; body_len];
-    reader.read_exact(&mut body).await?;
-    match &mut state.cipher {
-        Some(cipher) => cipher.decrypt(&body).map(Some),
-        None => Ok(Some(body)),
-    }
-}
-
-async fn read_vmess_response_header<R>(
-    reader: &mut R,
-    state: &VmessDownloadState,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let len_key = vmess_kdf(&state.response_header_key, &[b"AEAD Resp Header Len Key"]);
-    let len_nonce = vmess_kdf(&state.response_header_iv, &[b"AEAD Resp Header Len IV"]);
-    let mut encrypted_len = [0u8; 2 + VMESS_TAG_LEN];
-    reader.read_exact(&mut encrypted_len).await?;
-    let len = vmess_aes128gcm_decrypt(&len_key[..16], &len_nonce[..12], &[], &encrypted_len)?;
-    if len.len() != 2 {
-        return Err(anyhow!("invalid vmess response header length"));
-    }
-    let header_len = u16::from_be_bytes([len[0], len[1]]) as usize;
-
-    let header_key = vmess_kdf(&state.response_header_key, &[b"AEAD Resp Header Key"]);
-    let header_nonce = vmess_kdf(&state.response_header_iv, &[b"AEAD Resp Header IV"]);
-    let mut encrypted_header = vec![0u8; header_len + VMESS_TAG_LEN];
-    reader.read_exact(&mut encrypted_header).await?;
-    let header = vmess_aes128gcm_decrypt(
-        &header_key[..16],
-        &header_nonce[..12],
-        &[],
-        &encrypted_header,
-    )?;
-    if header.len() < 4 {
-        return Err(anyhow!("vmess response header is too short"));
-    }
-    if header[0] != state.response_authentication {
-        return Err(anyhow!(
-            "invalid vmess response auth value: expected {}, got {}",
-            state.response_authentication,
-            header[0]
-        ));
-    }
-    Ok(())
-}
-
-fn build_vmess_setup(
-    user_id: &Uuid,
-    cipher: VmessCipher,
-    destination: &Destination,
-) -> anyhow::Result<VmessSetup> {
-    build_vmess_setup_with_command(user_id, cipher, destination, VMESS_CMD_TCP)
-}
-
-fn build_vmess_setup_with_command(
-    user_id: &Uuid,
-    cipher: VmessCipher,
-    destination: &Destination,
-    command: u8,
-) -> anyhow::Result<VmessSetup> {
-    let instruction_key = vmess_instruction_key(user_id);
-    let auth_id = vmess_auth_id(&instruction_key)?;
-
-    let mut data_iv = [0u8; 16];
-    let mut data_key = [0u8; 16];
-    getrandom::fill(&mut data_iv)
-        .map_err(|error| anyhow!("failed to generate vmess iv: {error}"))?;
-    getrandom::fill(&mut data_key)
-        .map_err(|error| anyhow!("failed to generate vmess key: {error}"))?;
-    let mut response_auth = [0u8; 1];
-    getrandom::fill(&mut response_auth)
-        .map_err(|error| anyhow!("failed to generate vmess response auth: {error}"))?;
-
-    let response_header_iv = vmess_sha256_16(&data_iv);
-    let response_header_key = vmess_sha256_16(&data_key);
-
-    let mut header = Vec::with_capacity(316);
-    header.push(0x01);
-    header.extend_from_slice(&data_iv);
-    header.extend_from_slice(&data_key);
-    header.push(response_auth[0]);
-    header.push(0x01 | 0x04);
-    header.push(cipher.method_byte());
-    header.push(0x00);
-    header.push(command);
-    encode_vmess_destination(destination, &mut header)?;
-    let checksum = vmess_fnv1a(&header).to_be_bytes();
-    header.extend_from_slice(&checksum);
-
-    let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce)
-        .map_err(|error| anyhow!("failed to generate vmess header nonce: {error}"))?;
-
-    let len_key = vmess_kdf(
-        &instruction_key,
-        &[b"VMess Header AEAD Key_Length", &auth_id, &nonce],
-    );
-    let len_nonce = vmess_kdf(
-        &instruction_key,
-        &[b"VMess Header AEAD Nonce_Length", &auth_id, &nonce],
-    );
-    let encrypted_len = vmess_aes128gcm_encrypt(
-        &len_key[..16],
-        &len_nonce[..12],
-        &auth_id,
-        &(header.len() as u16).to_be_bytes(),
-    )?;
-
-    let header_key = vmess_kdf(
-        &instruction_key,
-        &[b"VMess Header AEAD Key", &auth_id, &nonce],
-    );
-    let header_nonce = vmess_kdf(
-        &instruction_key,
-        &[b"VMess Header AEAD Nonce", &auth_id, &nonce],
-    );
-    let encrypted_header =
-        vmess_aes128gcm_encrypt(&header_key[..16], &header_nonce[..12], &auth_id, &header)?;
-
-    let mut request =
-        Vec::with_capacity(16 + encrypted_len.len() + nonce.len() + encrypted_header.len());
-    request.extend_from_slice(&auth_id);
-    request.extend_from_slice(&encrypted_len);
-    request.extend_from_slice(&nonce);
-    request.extend_from_slice(&encrypted_header);
-
-    Ok(VmessSetup {
-        request,
-        upload: VmessUploadState {
-            cipher: VmessAeadState::new(cipher, &data_key, &data_iv)?,
-            length_mask: VmessLengthMask::new(&data_iv),
-        },
-        download: VmessDownloadState {
-            response_header_key,
-            response_header_iv,
-            response_authentication: response_auth[0],
-            cipher: VmessAeadState::new(cipher, &response_header_key, &response_header_iv)?,
-            length_mask: VmessLengthMask::new(&response_header_iv),
-        },
-    })
-}
-
-fn encode_vmess_destination(destination: &Destination, output: &mut Vec<u8>) -> anyhow::Result<()> {
-    output.extend_from_slice(&destination.port.to_be_bytes());
-    if let Ok(ip) = destination.host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(ip) => {
-                output.push(0x01);
-                output.extend_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => {
-                output.push(0x03);
-                output.extend_from_slice(&ip.octets());
-            }
-        }
-        return Ok(());
-    }
-    let host = destination.host.as_bytes();
-    if host.len() > u8::MAX as usize {
-        return Err(anyhow!("vmess destination host is too long"));
-    }
-    output.push(0x02);
-    output.push(host.len() as u8);
-    output.extend_from_slice(host);
-    Ok(())
-}
-
-fn vmess_instruction_key(user_id: &Uuid) -> [u8; 16] {
-    let mut data = user_id.as_bytes().to_vec();
-    data.extend_from_slice(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-    Md5::digest(&data).into()
-}
-
-fn vmess_auth_id(instruction_key: &[u8; 16]) -> anyhow::Result<[u8; 16]> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| anyhow!("system time before unix epoch: {error}"))?
-        .as_secs();
-    let mut auth = [0u8; 16];
-    auth[0..8].copy_from_slice(&now.to_be_bytes());
-    getrandom::fill(&mut auth[8..12])
-        .map_err(|error| anyhow!("failed to generate vmess auth random: {error}"))?;
-    let checksum = crc32c::crc32c(&auth[0..12]).to_be_bytes();
-    auth[12..16].copy_from_slice(&checksum);
-
-    let key = vmess_kdf(instruction_key, &[b"AES Auth ID Encryption"]);
-    let cipher =
-        Aes128::new_from_slice(&key[..16]).map_err(|_| anyhow!("invalid vmess auth key"))?;
-    cipher.encrypt_block((&mut auth).into());
-    Ok(auth)
-}
-
-fn vmess_aes128gcm_encrypt(
-    key: &[u8],
-    nonce: &[u8],
-    aad: &[u8],
-    plaintext: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    Aes128Gcm::new_from_slice(key)
-        .map_err(|_| anyhow!("invalid vmess aes-gcm key"))?
-        .encrypt(
-            aes_gcm::Nonce::from_slice(nonce),
-            aes_gcm::aead::Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow!("vmess aes-gcm encrypt failed"))
-}
-
-fn vmess_aes128gcm_decrypt(
-    key: &[u8],
-    nonce: &[u8],
-    aad: &[u8],
-    ciphertext: &[u8],
-) -> anyhow::Result<Vec<u8>> {
-    Aes128Gcm::new_from_slice(key)
-        .map_err(|_| anyhow!("invalid vmess aes-gcm key"))?
-        .decrypt(
-            aes_gcm::Nonce::from_slice(nonce),
-            aes_gcm::aead::Payload {
-                msg: ciphertext,
-                aad,
-            },
-        )
-        .map_err(|_| anyhow!("vmess aes-gcm decrypt failed"))
-}
-
-fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
-    let mut keys = Vec::with_capacity(path.len() + 1);
-    keys.push(b"VMess AEAD KDF".as_slice());
-    keys.extend_from_slice(path);
-    vmess_recursive_hash(&keys, keys.len(), key)
-}
-
-fn vmess_recursive_hash(keys: &[&[u8]], level: usize, data: &[u8]) -> [u8; 32] {
-    if level == 0 {
-        return Sha256::digest(data).into();
-    }
-    let (inner_pad, outer_pad) = vmess_hmac_pads(keys[level - 1]);
-    let mut inner_input = Vec::with_capacity(inner_pad.len() + data.len());
-    inner_input.extend_from_slice(&inner_pad);
-    inner_input.extend_from_slice(data);
-    let inner_digest = vmess_recursive_hash(keys, level - 1, &inner_input);
-
-    let mut outer_input = Vec::with_capacity(outer_pad.len() + inner_digest.len());
-    outer_input.extend_from_slice(&outer_pad);
-    outer_input.extend_from_slice(&inner_digest);
-    vmess_recursive_hash(keys, level - 1, &outer_input)
-}
-
-fn vmess_hmac_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
-    let key_material = if key.len() > 64 {
-        Sha256::digest(key).to_vec()
-    } else {
-        key.to_vec()
-    };
-    let mut inner = [0x36u8; 64];
-    let mut outer = [0x5cu8; 64];
-    for (index, byte) in key_material.iter().enumerate() {
-        inner[index] ^= byte;
-        outer[index] ^= byte;
-    }
-    (inner, outer)
-}
-
-fn vmess_sha256_16(data: &[u8]) -> [u8; 16] {
-    let digest = Sha256::digest(data);
-    let mut output = [0u8; 16];
-    output.copy_from_slice(&digest[..16]);
-    output
-}
-
-fn vmess_chacha_key(data: &[u8]) -> [u8; 32] {
-    let first: [u8; 16] = Md5::digest(data).into();
-    let second: [u8; 16] = Md5::digest(first).into();
-    let mut output = [0u8; 32];
-    output[..16].copy_from_slice(&first);
-    output[16..].copy_from_slice(&second);
-    output
-}
-
-fn vmess_fnv1a(data: &[u8]) -> u32 {
-    let mut hash = 0x811c9dc5u32;
-    for byte in data {
-        hash ^= *byte as u32;
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash
-}
-
-const TROJAN_CMD_CONNECT: u8 = 0x01;
-const TROJAN_CMD_UDP_ASSOCIATE: u8 = 0x03;
-
-fn build_trojan_request(password: &str, destination: &Destination) -> anyhow::Result<Vec<u8>> {
-    build_trojan_request_with_command(password, destination, TROJAN_CMD_CONNECT)
-}
-
-fn build_trojan_request_with_command(
-    password: &str,
-    destination: &Destination,
-    command: u8,
-) -> anyhow::Result<Vec<u8>> {
-    let mut hasher = Sha224::new();
-    hasher.update(password.as_bytes());
-    let password_hash = hasher.finalize();
-    let mut request = hex_lower(&password_hash).into_bytes();
-    request.extend_from_slice(b"\r\n");
-    request.push(command);
-    encode_socks5_destination(destination, &mut request)?;
-    request.extend_from_slice(b"\r\n");
-    Ok(request)
-}
-
-fn encode_trojan_udp_packet(destination: &Destination, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if payload.len() > u16::MAX as usize {
-        return Err(anyhow!("trojan udp payload is too large"));
-    }
-    let mut packet = Vec::with_capacity(1 + 255 + 2 + 2 + 2 + payload.len());
-    encode_socks5_destination(destination, &mut packet)?;
-    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    packet.extend_from_slice(b"\r\n");
-    packet.extend_from_slice(payload);
-    Ok(packet)
-}
-
-async fn read_trojan_udp_packet<R>(reader: &mut R) -> anyhow::Result<(Destination, Vec<u8>)>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut atyp = [0u8; 1];
-    reader.read_exact(&mut atyp).await?;
-    let destination = read_socks5_destination_after_atyp(reader, atyp[0]).await?;
-    let mut length = [0u8; 2];
-    reader.read_exact(&mut length).await?;
-    let payload_len = u16::from_be_bytes(length) as usize;
-    let mut crlf = [0u8; 2];
-    reader.read_exact(&mut crlf).await?;
-    if crlf != *b"\r\n" {
-        return Err(anyhow!("invalid trojan udp packet separator"));
-    }
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload).await?;
-    Ok((destination, payload))
-}
-
-const VLESS_CMD_TCP: u8 = 0x01;
-const VLESS_CMD_UDP: u8 = 0x02;
-
-#[cfg(test)]
-fn build_vless_request(user_id: &Uuid, destination: &Destination) -> anyhow::Result<Vec<u8>> {
-    build_vless_request_with_flow(user_id, destination, None)
-}
-
-fn build_vless_request_with_flow(
-    user_id: &Uuid,
-    destination: &Destination,
-    flow: Option<&str>,
-) -> anyhow::Result<Vec<u8>> {
-    build_vless_request_with_command_and_flow(user_id, destination, flow, VLESS_CMD_TCP)
-}
-
-fn build_vless_request_with_command_and_flow(
-    user_id: &Uuid,
-    destination: &Destination,
-    flow: Option<&str>,
-    command: u8,
-) -> anyhow::Result<Vec<u8>> {
-    let mut request = Vec::with_capacity(32 + destination.host.len());
-    request.push(0x00);
-    request.extend_from_slice(user_id.as_bytes());
-    let addons = encode_vless_addons(flow)?;
-    if addons.len() > u8::MAX as usize {
-        return Err(anyhow!("vless addons are too large"));
-    }
-    request.push(addons.len() as u8);
-    request.extend_from_slice(&addons);
-    request.push(command);
-    encode_vless_destination(destination, &mut request)?;
-    Ok(request)
-}
-
-fn encode_length_prefixed_packet(payload: &[u8], context: &str) -> anyhow::Result<Vec<u8>> {
-    if payload.len() > u16::MAX as usize {
-        return Err(anyhow!("{context} payload is too large"));
-    }
-    let mut packet = Vec::with_capacity(2 + payload.len());
-    packet.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    packet.extend_from_slice(payload);
-    Ok(packet)
-}
-
-async fn read_length_prefixed_packet<R>(reader: &mut R, context: &str) -> anyhow::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut length = [0u8; 2];
-    reader
-        .read_exact(&mut length)
-        .await
-        .with_context(|| format!("failed to read {context} packet length"))?;
-    let payload_len = u16::from_be_bytes(length) as usize;
-    let mut payload = vec![0u8; payload_len];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .with_context(|| format!("failed to read {context} packet payload"))?;
-    Ok(payload)
-}
-
-fn encode_vless_addons(flow: Option<&str>) -> anyhow::Result<Vec<u8>> {
-    let Some(flow) = flow.map(str::trim).filter(|flow| !flow.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    if flow != "xtls-rprx-vision" {
-        return Err(anyhow!("unsupported vless flow {flow}"));
-    }
-    let mut output = Vec::with_capacity(flow.len() + 2);
-    output.push(0x0a);
-    encode_protobuf_varint(flow.len() as u64, &mut output);
-    output.extend_from_slice(flow.as_bytes());
-    Ok(output)
-}
-
-fn encode_protobuf_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 0x80 {
-        output.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
-}
-
-fn encode_vless_destination(destination: &Destination, output: &mut Vec<u8>) -> anyhow::Result<()> {
-    output.extend_from_slice(&destination.port.to_be_bytes());
-    if let Ok(addr) = destination.host.parse::<SocketAddr>() {
-        match addr {
-            SocketAddr::V4(v4) => {
-                output.push(0x01);
-                output.extend_from_slice(&v4.ip().octets());
-            }
-            SocketAddr::V6(v6) => {
-                output.push(0x03);
-                output.extend_from_slice(&v6.ip().octets());
-            }
-        }
-    } else if let Ok(ip) = destination.host.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(ip) => {
-                output.push(0x01);
-                output.extend_from_slice(&ip.octets());
-            }
-            std::net::IpAddr::V6(ip) => {
-                output.push(0x03);
-                output.extend_from_slice(&ip.octets());
-            }
-        }
-    } else {
-        if destination.host.len() > 255 {
-            return Err(anyhow!("domain name too long"));
-        }
-        output.push(0x02);
-        output.push(destination.host.len() as u8);
-        output.extend_from_slice(destination.host.as_bytes());
-    }
-    Ok(())
-}
-
-const REALITY_CLIENT_VERSION: [u8; 3] = [1, 8, 24];
-static REALITY_X25519_KX_GROUP: RealityX25519KxGroup = RealityX25519KxGroup;
-
-#[derive(Debug)]
-struct RealityX25519KxGroup;
-
-impl SupportedKxGroup for RealityX25519KxGroup {
-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, RustlsError> {
-        let secret = X25519StaticSecret::random();
-        let public = X25519PublicKey::from(&secret).to_bytes();
-        Ok(Box::new(RealityX25519KeyExchange { secret, public }))
-    }
-
-    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        None
-    }
-
-    fn name(&self) -> NamedGroup {
-        NamedGroup::X25519
-    }
-
-    fn usable_for_version(&self, version: ProtocolVersion) -> bool {
-        version == ProtocolVersion::TLSv1_3
-    }
-}
-
-struct RealityX25519KeyExchange {
-    secret: X25519StaticSecret,
-    public: [u8; 32],
-}
-
-impl ActiveKeyExchange for RealityX25519KeyExchange {
-    fn complete(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, RustlsError> {
-        reality_x25519_shared_secret(&self.secret, peer_pub_key)
-    }
-
-    fn dangerous_shared_secret_for_client_hello(
-        &self,
-        peer_pub_key: &[u8],
-    ) -> Option<Result<SharedSecret, RustlsError>> {
-        Some(reality_x25519_shared_secret(&self.secret, peer_pub_key))
-    }
-
-    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
-        None
-    }
-
-    fn group(&self) -> NamedGroup {
-        NamedGroup::X25519
-    }
-
-    fn pub_key(&self) -> &[u8] {
-        &self.public
-    }
-}
-
-fn reality_x25519_shared_secret(
-    secret: &X25519StaticSecret,
-    peer_pub_key: &[u8],
-) -> Result<SharedSecret, RustlsError> {
-    let peer_pub_key: [u8; 32] = peer_pub_key
-        .try_into()
-        .map_err(|_| RustlsError::General("invalid X25519 peer key share".into()))?;
-    let peer = X25519PublicKey::from(peer_pub_key);
-    Ok(SharedSecret::from(
-        secret.diffie_hellman(&peer).as_bytes().as_slice(),
-    ))
-}
-
-#[derive(Debug)]
-struct RealitySessionIdProvider {
-    public_key: [u8; 32],
-    short_id: Vec<u8>,
-}
-
-impl DangerousClientHelloSessionIdProvider for RealitySessionIdProvider {
-    fn plaintext_session_id(&self) -> [u8; 32] {
-        let unix_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs().min(u32::MAX as u64) as u32)
-            .unwrap_or(0);
-        let mut session_id = [0u8; 32];
-        session_id[..3].copy_from_slice(&REALITY_CLIENT_VERSION);
-        session_id[3] = 0;
-        session_id[4..8].copy_from_slice(&unix_time.to_be_bytes());
-        session_id[8..8 + self.short_id.len()].copy_from_slice(&self.short_id);
-        session_id
-    }
-
-    fn seal_session_id(
-        &self,
-        client_hello_random: &[u8; 32],
-        client_hello_raw: &[u8],
-        key_exchange: &dyn ActiveKeyExchange,
-    ) -> Result<[u8; 32], RustlsError> {
-        let shared_secret = key_exchange
-            .dangerous_shared_secret_for_client_hello(&self.public_key)
-            .ok_or_else(|| {
-                RustlsError::General("Reality X25519 shared secret is not available".into())
-            })??;
-        seal_reality_session_id_from_client_hello(
-            shared_secret.secret_bytes(),
-            client_hello_random,
-            client_hello_raw,
-        )
-        .map_err(|error| RustlsError::General(format!("Reality session id failed: {error}")))
-    }
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct RealityClientHelloMaterial {
-    session_id: [u8; 32],
-    auth_key: [u8; 32],
-    client_public_key: [u8; 32],
-    unix_time: u32,
-}
-
-#[allow(dead_code)]
-fn build_reality_client_hello_material(
-    public_key: &str,
-    short_id: Option<&str>,
-    hello_random: &[u8; 32],
-    hello_raw: &[u8],
-) -> anyhow::Result<RealityClientHelloMaterial> {
-    let server_public_key = decode_reality_public_key(public_key)?;
-    let short_id = decode_reality_short_id(short_id)?;
-    let client_secret = X25519StaticSecret::random();
-    let client_public_key = X25519PublicKey::from(&client_secret).to_bytes();
-    let shared_secret = client_secret.diffie_hellman(&server_public_key);
-    let unix_time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?
-        .as_secs()
-        .min(u32::MAX as u64) as u32;
-    let (session_id, auth_key) = seal_reality_session_id(
-        shared_secret.as_bytes(),
-        &short_id,
-        hello_random,
-        hello_raw,
-        unix_time,
-    )?;
-    Ok(RealityClientHelloMaterial {
-        session_id,
-        auth_key,
-        client_public_key,
-        unix_time,
-    })
-}
-
-fn seal_reality_session_id_from_client_hello(
-    shared_secret: &[u8],
-    hello_random: &[u8; 32],
-    hello_raw: &[u8],
-) -> anyhow::Result<[u8; 32]> {
-    if shared_secret.len() != 32 {
-        return Err(anyhow!("vless reality shared secret must be 32 bytes"));
-    }
-    if hello_raw.len() < 55 {
-        return Err(anyhow!("vless reality ClientHello is too short"));
-    }
-    let mut shared = [0u8; 32];
-    shared.copy_from_slice(shared_secret);
-    let mut auth_key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(&hello_random[..20]), &shared)
-        .expand(b"REALITY", &mut auth_key)
-        .map_err(|_| anyhow!("failed to derive vless reality auth key"))?;
-
-    let cipher = Aes256Gcm::new_from_slice(&auth_key)
-        .map_err(|_| anyhow!("failed to initialize vless reality aead"))?;
-    let encrypted = cipher
-        .encrypt(
-            aes_gcm::Nonce::from_slice(&hello_random[20..]),
-            aes_gcm::aead::Payload {
-                msg: &hello_raw[39..55],
-                aad: hello_raw,
-            },
-        )
-        .map_err(|_| anyhow!("failed to seal vless reality session id"))?;
-    encrypted
-        .try_into()
-        .map_err(|_| anyhow!("vless reality sealed session id has invalid length"))
-}
-
-fn decode_reality_public_key(value: &str) -> anyhow::Result<X25519PublicKey> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Err(anyhow!("vless reality public key is empty"));
-    }
-    let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, value)
-        .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE, value))
-        .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, value))
-        .map_err(|error| anyhow!("invalid vless reality public key: {error}"))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("vless reality public key must decode to 32 bytes"))?;
-    Ok(X25519PublicKey::from(bytes))
-}
-
-fn decode_reality_short_id(value: Option<&str>) -> anyhow::Result<Vec<u8>> {
-    let value = value.map(str::trim).unwrap_or("");
-    if value.is_empty() {
-        return Ok(Vec::new());
-    }
-    if value.len() > 16 {
-        return Err(anyhow!("vless reality short_id cannot exceed 8 bytes"));
-    }
-    if value.len() % 2 != 0 {
-        return Err(anyhow!(
-            "vless reality short_id must be hex with even length"
-        ));
-    }
-    let mut output = Vec::with_capacity(value.len() / 2);
-    let bytes = value.as_bytes();
-    for index in (0..bytes.len()).step_by(2) {
-        let high = decode_hex_nibble(bytes[index])
-            .ok_or_else(|| anyhow!("vless reality short_id contains non-hex character"))?;
-        let low = decode_hex_nibble(bytes[index + 1])
-            .ok_or_else(|| anyhow!("vless reality short_id contains non-hex character"))?;
-        output.push((high << 4) | low);
-    }
-    Ok(output)
-}
-
-fn validate_reality_fingerprint(value: Option<&str>) -> anyhow::Result<()> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
-    let supported = matches!(
-        value.to_ascii_lowercase().as_str(),
-        "chrome"
-            | "firefox"
-            | "safari"
-            | "ios"
-            | "android"
-            | "edge"
-            | "qq"
-            | "random"
-            | "randomized"
-    );
-    if supported {
-        Ok(())
-    } else {
-        Err(anyhow!("unsupported vless reality fingerprint {value}"))
-    }
-}
-
-fn validate_reality_spider_x(value: Option<&str>) -> anyhow::Result<()> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
-    if value.starts_with('/') {
-        Ok(())
-    } else {
-        Err(anyhow!("vless reality spider_x must start with /"))
-    }
-}
-
-fn decode_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[allow(dead_code)]
-fn seal_reality_session_id(
-    shared_secret: &[u8; 32],
-    short_id: &[u8],
-    hello_random: &[u8; 32],
-    hello_raw: &[u8],
-    unix_time: u32,
-) -> anyhow::Result<([u8; 32], [u8; 32])> {
-    if short_id.len() > 8 {
-        return Err(anyhow!("vless reality short_id cannot exceed 8 bytes"));
-    }
-    let mut auth_key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(&hello_random[..20]), shared_secret)
-        .expand(b"REALITY", &mut auth_key)
-        .map_err(|_| anyhow!("failed to derive vless reality auth key"))?;
-
-    let mut plaintext = [0u8; 16];
-    plaintext[..3].copy_from_slice(&REALITY_CLIENT_VERSION);
-    plaintext[3] = 0;
-    plaintext[4..8].copy_from_slice(&unix_time.to_be_bytes());
-    plaintext[8..8 + short_id.len()].copy_from_slice(short_id);
-
-    let cipher = Aes256Gcm::new_from_slice(&auth_key)
-        .map_err(|_| anyhow!("failed to initialize vless reality aead"))?;
-    let encrypted = cipher
-        .encrypt(
-            aes_gcm::Nonce::from_slice(&hello_random[20..]),
-            aes_gcm::aead::Payload {
-                msg: &plaintext,
-                aad: hello_raw,
-            },
-        )
-        .map_err(|_| anyhow!("failed to seal vless reality session id"))?;
-    let session_id: [u8; 32] = encrypted
-        .try_into()
-        .map_err(|_| anyhow!("vless reality sealed session id has invalid length"))?;
-    Ok((session_id, auth_key))
-}
-
-async fn read_vless_response_header<R>(reader: &mut R) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 2];
-    reader.read_exact(&mut header).await?;
-    if header[0] != 0x00 {
-        return Err(anyhow!("unsupported vless response version {}", header[0]));
-    }
-    if header[1] > 0 {
-        let mut addon = vec![0u8; header[1] as usize];
-        reader.read_exact(&mut addon).await?;
-    }
-    Ok(())
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -4183,21 +2249,20 @@ mod tests {
             stream.write_all(b"pong").await.unwrap();
         });
 
-        let outbound = TrojanOutbound {
-            name: "trojan-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            password: "secret".to_string(),
-            sni: Some("localhost".to_string()),
-            skip_cert_verify: true,
-            network: None,
-            ws_path: None,
-            ws_host: None,
-            grpc_service_name: None,
-            transport_headers: BTreeMap::new(),
-            alpn: Vec::new(),
-            udp_sessions: TokioMutex::new(TrojanUdpPool::default()),
-        };
+        let outbound = TrojanOutbound::new(
+            "trojan-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "secret".to_string(),
+            Some("localhost".to_string()),
+            true,
+            None,
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+            Vec::new(),
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         let mut response = [0u8; 4];
         stream.read_exact(&mut response).await.unwrap();
@@ -4293,26 +2358,25 @@ mod tests {
             stream.write_all(b"pong").await.unwrap();
         });
 
-        let outbound = VlessOutbound {
-            name: "vless-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            flow: None,
-            security: None,
-            tls: true,
-            sni: Some("localhost".to_string()),
-            skip_cert_verify: true,
-            network: None,
-            ws_path: None,
-            ws_host: None,
-            grpc_service_name: None,
-            reality_public_key: None,
-            reality_short_id: None,
-            reality_fingerprint: None,
-            reality_spider_x: None,
-            udp_sessions: TokioMutex::new(VlessUdpPool::default()),
-        };
+        let outbound = VlessOutbound::new(
+            "vless-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            None,
+            None,
+            true,
+            Some("localhost".to_string()),
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut response = [0u8; 4];
@@ -4419,26 +2483,25 @@ mod tests {
                 .unwrap();
         });
 
-        let outbound = VlessOutbound {
-            name: "vless-ws-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            flow: None,
-            security: None,
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            network: Some("ws".to_string()),
-            ws_path: Some("/ray".to_string()),
-            ws_host: Some("cdn.example.com".to_string()),
-            grpc_service_name: None,
-            reality_public_key: None,
-            reality_short_id: None,
-            reality_fingerprint: None,
-            reality_spider_x: None,
-            udp_sessions: TokioMutex::new(VlessUdpPool::default()),
-        };
+        let outbound = VlessOutbound::new(
+            "vless-ws-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some("ws".to_string()),
+            Some("/ray".to_string()),
+            Some("cdn.example.com".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut response = [0u8; 4];
@@ -4500,26 +2563,25 @@ mod tests {
             driver.abort();
         });
 
-        let outbound = VlessOutbound {
-            name: "vless-grpc-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            flow: None,
-            security: None,
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            network: Some("grpc".to_string()),
-            ws_path: None,
-            ws_host: Some("cdn.example.com".to_string()),
-            grpc_service_name: Some("ray".to_string()),
-            reality_public_key: None,
-            reality_short_id: None,
-            reality_fingerprint: None,
-            reality_spider_x: None,
-            udp_sessions: TokioMutex::new(VlessUdpPool::default()),
-        };
+        let outbound = VlessOutbound::new(
+            "vless-grpc-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some("grpc".to_string()),
+            None,
+            Some("cdn.example.com".to_string()),
+            Some("ray".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
         let mut stream =
             tokio::time::timeout(Duration::from_secs(2), outbound.connect(&destination, 1000))
                 .await
@@ -4582,26 +2644,25 @@ mod tests {
             driver.abort();
         });
 
-        let outbound = VlessOutbound {
-            name: "vless-h2-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            flow: None,
-            security: None,
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            network: Some("h2".to_string()),
-            ws_path: Some("/h2".to_string()),
-            ws_host: Some("cdn.example.com".to_string()),
-            grpc_service_name: None,
-            reality_public_key: None,
-            reality_short_id: None,
-            reality_fingerprint: None,
-            reality_spider_x: None,
-            udp_sessions: TokioMutex::new(VlessUdpPool::default()),
-        };
+        let outbound = VlessOutbound::new(
+            "vless-h2-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            None,
+            None,
+            false,
+            None,
+            false,
+            Some("h2".to_string()),
+            Some("/h2".to_string()),
+            Some("cdn.example.com".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         let mut stream =
             tokio::time::timeout(Duration::from_secs(2), outbound.connect(&destination, 1000))
                 .await
@@ -4669,21 +2730,20 @@ mod tests {
                 .unwrap();
         });
 
-        let outbound = VmessOutbound {
-            name: "vmess-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            cipher: "auto".to_string(),
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            network: None,
-            ws_path: None,
-            ws_host: None,
-            grpc_service_name: None,
-            udp_sessions: TokioMutex::new(VmessUdpPool::default()),
-        };
+        let outbound = VmessOutbound::new(
+            "vmess-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            "auto".to_string(),
+            false,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();
@@ -4765,21 +2825,20 @@ mod tests {
             driver.abort();
         });
 
-        let outbound = VmessOutbound {
-            name: "vmess-grpc-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            cipher: "auto".to_string(),
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            network: Some("grpc".to_string()),
-            ws_path: None,
-            ws_host: Some("cdn.example.com".to_string()),
-            grpc_service_name: Some("vmess".to_string()),
-            udp_sessions: TokioMutex::new(VmessUdpPool::default()),
-        };
+        let outbound = VmessOutbound::new(
+            "vmess-grpc-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            "auto".to_string(),
+            false,
+            None,
+            false,
+            Some("grpc".to_string()),
+            None,
+            Some("cdn.example.com".to_string()),
+            Some("vmess".to_string()),
+        );
         let mut stream =
             tokio::time::timeout(Duration::from_secs(2), outbound.connect(&destination, 1000))
                 .await
@@ -4867,21 +2926,20 @@ mod tests {
             driver.abort();
         });
 
-        let outbound = VmessOutbound {
-            name: "vmess-h2-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            uuid: "11111111-1111-1111-1111-111111111111".to_string(),
-            cipher: "auto".to_string(),
-            tls: false,
-            sni: None,
-            skip_cert_verify: false,
-            network: Some("h2".to_string()),
-            ws_path: Some("/vmess-h2".to_string()),
-            ws_host: Some("cdn.example.com".to_string()),
-            grpc_service_name: None,
-            udp_sessions: TokioMutex::new(VmessUdpPool::default()),
-        };
+        let outbound = VmessOutbound::new(
+            "vmess-h2-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            "auto".to_string(),
+            false,
+            None,
+            false,
+            Some("h2".to_string()),
+            Some("/vmess-h2".to_string()),
+            Some("cdn.example.com".to_string()),
+            None,
+        );
         let mut stream =
             tokio::time::timeout(Duration::from_secs(2), outbound.connect(&destination, 1000))
                 .await

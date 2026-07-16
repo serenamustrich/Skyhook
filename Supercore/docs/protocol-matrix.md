@@ -55,6 +55,14 @@
   `src/outbound/ssr.rs`。
 - Snell v1-v5、connection reuse、UDP-over-TCP 和 obfs 位于
   `src/outbound/snell.rs`。
+- Trojan 的 TLS、transport、UDP associate、ALPN 和 framing 位于
+  `src/outbound/trojan.rs`。
+- VMess AEAD、TCP/UDP command、stream framing 和 transport 位于
+  `src/outbound/vmess.rs`。
+- VLESS、Reality、Vision、TCP/UDP command 和 transport 位于
+  `src/outbound/vless.rs`。
+- VMess/VLESS 按目标隔离的 session 轮转能力由
+  `src/outbound/udp/session_pool.rs` 提供。
 - 跨协议精确读取 helper 位于 `src/outbound/io.rs`；协议私有 crypto/framing 不进入
   公共 outbound 根模块。
 

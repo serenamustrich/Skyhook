@@ -29,10 +29,12 @@ use crate::{config::ShadowsocksPluginConfig, routing::Destination};
 
 use super::io::read_exact_or_eof;
 use super::{
-    connect_tcp, encode_socks5_destination, parse_socks5_destination_prefix,
-    perform_websocket_handshake, resolve_udp_socket_addr, spawn_websocket_stream,
-    tls_client_config, BoxedStream, Outbound, OutboundCapability, RoundRobinSessionPool,
-    UDP_SESSION_POOL_SIZE,
+    target::{encode_socks5_destination, parse_socks5_destination_prefix},
+    transports::{
+        connect_tcp, perform_websocket_handshake, spawn_websocket_stream, tls_client_config,
+    },
+    udp::{resolve_udp_socket_addr, RoundRobinSessionPool},
+    BoxedStream, Outbound, OutboundCapability, UDP_SESSION_POOL_SIZE,
 };
 
 pub(super) struct ShadowsocksOutbound {
