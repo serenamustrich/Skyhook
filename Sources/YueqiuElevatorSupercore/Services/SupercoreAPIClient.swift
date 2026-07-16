@@ -126,10 +126,10 @@ final class SupercoreAPIClient: @unchecked Sendable {
         }
         payload["group"] = name
         let body = try JSONSerialization.data(withJSONObject: payload)
-        let response: SupercoreProbeGroupResponse = try await request(
+        let response: SupercoreProbeGroupResponse = try await requestTask(
             path: "/v1/probes/group",
             method: "POST",
-            timeoutInterval: TimeInterval(timeoutMilliseconds) / 1000.0 + 10,
+            taskTimeout: TimeInterval(timeoutMilliseconds) / 1000.0 + 10,
             body: body
         )
         guard response.ok else {
@@ -175,10 +175,10 @@ final class SupercoreAPIClient: @unchecked Sendable {
             names: names
         )
         let body = try JSONSerialization.data(withJSONObject: payload)
-        let response: SupercoreProbeResponse = try await request(
+        let response: SupercoreProbeResponse = try await requestTask(
             path: "/v1/probes",
             method: "POST",
-            timeoutInterval: requestTimeout,
+            taskTimeout: requestTimeout,
             body: body
         )
         return response
@@ -202,10 +202,10 @@ final class SupercoreAPIClient: @unchecked Sendable {
             payload["name"] = name
         }
         let body = try JSONSerialization.data(withJSONObject: payload)
-        let response: SupercoreOKResponse = try await request(
+        let response: SupercoreOKResponse = try await requestTask(
             path: "/v1/subscriptions/import",
             method: "POST",
-            timeoutInterval: 20,
+            taskTimeout: 20,
             body: body
         )
         try response.throwIfNeeded()
@@ -222,10 +222,10 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func updateAllSubscriptions() async throws {
-        let response: SupercoreOKResponse = try await request(
+        let response: SupercoreOKResponse = try await requestTask(
             path: "/v1/subscriptions/update-all",
             method: "POST",
-            timeoutInterval: 60
+            taskTimeout: 60
         )
         try response.throwIfNeeded()
     }
@@ -353,10 +353,127 @@ final class SupercoreAPIClient: @unchecked Sendable {
         return try Self.makeDecoder().decode(T.self, from: data)
     }
 
+    private func requestTask<T: Decodable>(
+        path: String,
+        method: String,
+        taskTimeout: TimeInterval,
+        body: Data? = nil
+    ) async throws -> T {
+        let start: SupercoreTaskStart<T> = try await request(
+            path: path,
+            method: method,
+            timeoutInterval: min(max(taskTimeout, 1), 10),
+            body: body
+        )
+        switch start {
+        case .completed(let result):
+            return result
+        case .accepted(let taskID):
+            return try await waitForTask(taskID, timeout: taskTimeout)
+        }
+    }
+
+    private func waitForTask<T: Decodable>(_ taskID: String, timeout: TimeInterval) async throws -> T {
+        let deadline = Date().addingTimeInterval(max(timeout, 1))
+        do {
+            while Date() < deadline {
+                try Task.checkCancellation()
+                let snapshot: SupercoreTaskSnapshot<T> = try await request(
+                    path: "/v1/tasks/\(taskID)",
+                    timeoutInterval: min(max(deadline.timeIntervalSinceNow, 0.5), 3)
+                )
+                switch snapshot.status {
+                case .queued, .running:
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                case .succeeded:
+                    guard let result = snapshot.result else {
+                        throw AppError.processFailed("Supercore 任务 \(taskID) 完成但没有结果")
+                    }
+                    return result
+                case .failed:
+                    let failure = snapshot.error
+                    let trace = failure?.traceID.map { "，trace \($0)" } ?? ""
+                    throw AppError.processFailed(
+                        "\(failure?.message ?? snapshot.message)（\(failure?.code ?? "task_failed")/\(failure?.kind ?? "internal")\(trace)）"
+                    )
+                case .cancelled:
+                    throw CancellationError()
+                }
+            }
+        } catch is CancellationError {
+            await cancelTask(taskID)
+            throw CancellationError()
+        }
+        await cancelTask(taskID)
+        throw AppError.processFailed("Supercore 任务 \(taskID) 等待超时")
+    }
+
+    private func cancelTask(_ taskID: String) async {
+        let client = self
+        await Task.detached {
+            let response: SupercoreOKResponse? = try? await client.request(
+                path: "/v1/tasks/\(taskID)/cancel",
+                method: "POST",
+                timeoutInterval: 2
+            )
+            _ = response
+        }.value
+    }
+
     private static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
+    }
+}
+
+private enum SupercoreTaskStart<Result: Decodable>: Decodable {
+    case accepted(taskID: String)
+    case completed(Result)
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "task_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let taskID = try container.decodeIfPresent(String.self, forKey: .taskID) {
+            self = .accepted(taskID: taskID)
+        } else {
+            self = .completed(try Result(from: decoder))
+        }
+    }
+}
+
+private enum SupercoreTaskStatus: String, Decodable {
+    case queued
+    case running
+    case succeeded
+    case failed
+    case cancelled
+}
+
+private struct SupercoreTaskSnapshot<Result: Decodable>: Decodable {
+    let id: String
+    let status: SupercoreTaskStatus
+    let message: String
+    let result: Result?
+    let error: SupercoreTaskFailure?
+}
+
+private struct SupercoreTaskFailure: Decodable {
+    let code: String
+    let kind: String
+    let message: String
+    let retryable: Bool
+    let traceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case kind
+        case message
+        case retryable
+        case traceID = "trace_id"
     }
 }
 

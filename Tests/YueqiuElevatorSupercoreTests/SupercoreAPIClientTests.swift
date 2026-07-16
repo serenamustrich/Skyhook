@@ -10,6 +10,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             private var _lastBody: Data?
             private var _responseBody = Data("{\"ok\":true,\"group\":\"\",\"results\":[]}".utf8)
             private var _responseStatusCode = 200
+            private var _queuedResponses: [(Int, Data)] = []
 
             func reset() {
                 lock.lock()
@@ -18,6 +19,7 @@ final class SupercoreAPIClientTests: XCTestCase {
                 _lastBody = nil
                 _responseBody = Data("{\"ok\":true,\"group\":\"\",\"results\":[]}".utf8)
                 _responseStatusCode = 200
+                _queuedResponses = []
             }
 
             func setLastRequest(_ request: URLRequest?, body: Data?) {
@@ -37,6 +39,12 @@ final class SupercoreAPIClientTests: XCTestCase {
                 lock.lock()
                 defer { lock.unlock() }
                 _responseStatusCode = statusCode
+            }
+
+            func enqueueResponse(statusCode: Int, body: Data) {
+                lock.lock()
+                defer { lock.unlock() }
+                _queuedResponses.append((statusCode, body))
             }
 
             func lastRequest() -> URLRequest? {
@@ -62,6 +70,15 @@ final class SupercoreAPIClientTests: XCTestCase {
                 defer { lock.unlock() }
                 return _responseStatusCode
             }
+
+            func nextResponse() -> (Int, Data) {
+                lock.lock()
+                defer { lock.unlock() }
+                if !_queuedResponses.isEmpty {
+                    return _queuedResponses.removeFirst()
+                }
+                return (_responseStatusCode, _responseBody)
+            }
         }
 
         private static let captureState = State()
@@ -84,6 +101,10 @@ final class SupercoreAPIClientTests: XCTestCase {
             set { captureState.setResponseStatusCode(newValue) }
         }
 
+        static func enqueueResponse(statusCode: Int = 200, body: Data) {
+            captureState.enqueueResponse(statusCode: statusCode, body: body)
+        }
+
         static func reset() {
             captureState.reset()
         }
@@ -100,16 +121,17 @@ final class SupercoreAPIClientTests: XCTestCase {
             guard let client else { return }
             let requestBody = captureBody(from: request)
             Self.captureState.setLastRequest(request, body: requestBody)
+            let (statusCode, responseBody) = Self.captureState.nextResponse()
             let response = HTTPURLResponse(
                 url: request.url!,
-                statusCode: Self.responseStatusCode,
+                statusCode: statusCode,
                 httpVersion: nil,
                 headerFields: ["Content-Type": "application/json"]
             )
             if let response {
                 client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             }
-            client.urlProtocol(self, didLoad: Self.responseBody)
+            client.urlProtocol(self, didLoad: responseBody)
             client.urlProtocolDidFinishLoading(self)
         }
 
@@ -211,6 +233,100 @@ final class SupercoreAPIClientTests: XCTestCase {
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("control_auth_invalid"))
             XCTAssertTrue(error.localizedDescription.contains("trace-123"))
+        }
+    }
+
+    func testProbeWaitsForAcceptedTaskResult() async throws {
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        SupercoreProbeGroupCaptureProtocol.enqueueResponse(
+            statusCode: 202,
+            body: Data(
+                """
+                {"task_id":"task-123","kind":"probe_outbounds","status":"queued"}
+                """.utf8
+            )
+        )
+        SupercoreProbeGroupCaptureProtocol.enqueueResponse(
+            body: Data(
+                """
+                {
+                  "id":"task-123",
+                  "kind":"probe_outbounds",
+                  "status":"succeeded",
+                  "current":1,
+                  "total":1,
+                  "message":"completed",
+                  "result":{
+                    "results":[
+                      {"name":"HK-01","kind":"ss","success":true,"latency_ms":42,"error":null}
+                    ],
+                    "failure_summary":{}
+                  },
+                  "error":null
+                }
+                """.utf8
+            )
+        )
+
+        let response = try await client.probeOutboundsResponse(
+            timeoutMilliseconds: 500,
+            url: DelayPolicy.probeURL,
+            concurrency: 1,
+            names: ["HK-01"]
+        )
+
+        XCTAssertEqual(response.results.first?.name, "HK-01")
+        XCTAssertEqual(response.results.first?.latencyMs, 42)
+        XCTAssertEqual(SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path, "/v1/tasks/task-123")
+    }
+
+    func testCancellingProbeSendsCoreTaskCancellation() async throws {
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        SupercoreProbeGroupCaptureProtocol.enqueueResponse(
+            statusCode: 202,
+            body: Data(
+                """
+                {"task_id":"task-cancel","kind":"probe_outbounds","status":"queued"}
+                """.utf8
+            )
+        )
+        SupercoreProbeGroupCaptureProtocol.enqueueResponse(
+            body: Data(
+                """
+                {
+                  "id":"task-cancel",
+                  "kind":"probe_outbounds",
+                  "status":"running",
+                  "current":0,
+                  "total":1,
+                  "message":"running",
+                  "result":null,
+                  "error":null
+                }
+                """.utf8
+            )
+        )
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data("{\"ok\":true}".utf8)
+
+        let probe = Task {
+            try await client.probeOutboundsResponse(
+                timeoutMilliseconds: 500,
+                url: DelayPolicy.probeURL,
+                concurrency: 1,
+                names: ["HK-01"]
+            )
+        }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        probe.cancel()
+
+        do {
+            _ = try await probe.value
+            XCTFail("cancelled probe should throw")
+        } catch is CancellationError {
+            XCTAssertEqual(
+                SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path,
+                "/v1/tasks/task-cancel/cancel"
+            )
         }
     }
 

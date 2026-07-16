@@ -60,12 +60,22 @@ TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未
 - `POST /v1/smart-rules`
 - `GET /v1/tun`
 - `GET /v1/doctor`
+- `GET /v1/tasks`
+- `GET /v1/tasks/{id}`
+- `POST /v1/tasks/{id}/cancel`
+- `GET /v1/events`
 
 控制接口只允许监听本机 loopback。读取接口可直接访问，所有写操作必须携带
 `Authorization: Bearer <token>`。普通核心进程每次启动使用新的 256-bit Token；TUN
 LaunchDaemon 从 root-only `0600` 文件读取 Token，plist 中不保存明文凭据。
 
 `POST /v1/probes/group` 使用 JSON body 传递 `group`，避免路径二次编码问题，支持包含 `/`、中文、emoji 的组名。
+
+全量测速、代理组测速、订阅导入和更新全部订阅使用异步任务模型。写请求会先返回
+HTTP `202` 和 `task_id`，客户端随后读取 `/v1/tasks/{id}` 获取真实进度、结果和结构化
+错误，并可通过 `/v1/tasks/{id}/cancel` 取消底层操作。任务记录有界保留，终态默认
+保留 24 小时且最多 512 条；`/v1/events` 当前通过 SSE 推送带版本、事件 ID 和时间戳的
+任务状态变化，后续流量、连接和日志事件将在统一事件总线阶段接入。
 
 启动代理只加载本地订阅缓存，不在启动过程中下载订阅或立即执行全局测速。后台订阅更新和定时测速在各自间隔到期后独立执行。
 

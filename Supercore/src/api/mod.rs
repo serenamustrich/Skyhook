@@ -1,25 +1,36 @@
-use std::{collections::HashMap, collections::HashSet, path::PathBuf, sync::Arc};
+mod tasks;
+
+use std::{
+    collections::HashMap, collections::HashSet, convert::Infallible, path::PathBuf, sync::Arc,
+    time::Duration,
+};
 
 use anyhow::anyhow;
 use axum::{
-    extract::{Request, State},
+    extract::{FromRef, Path as AxumPath, Request, State},
     http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::trace::TraceLayer;
 
 use crate::{
     config::{OutboundConfig, RuleTarget, SmartRouteRule, SuperConfig},
-    core::{ProbeOptions, Runtime},
+    core::{ProbeOptions, ProbeProgress, Runtime},
     outbound::error::{classify_message, OutboundErrorKind},
     routing::Destination,
     smart::SmartRecommendationAction,
     subscription_store::SubscriptionStore,
 };
+
+use tasks::{TaskFailure, TaskManager, TaskRecord};
 
 const CONTROL_TOKEN_ENV: &str = "SKYHOOK_CONTROL_TOKEN";
 const CONTROL_TOKEN_FILE_ENV: &str = "SKYHOOK_CONTROL_TOKEN_FILE";
@@ -28,6 +39,24 @@ const MIN_CONTROL_TOKEN_BYTES: usize = 32;
 #[derive(Clone)]
 struct ControlAuthState {
     token: Option<Arc<str>>,
+}
+
+#[derive(Clone)]
+struct ApiState {
+    runtime: Arc<Runtime>,
+    tasks: TaskManager,
+}
+
+impl FromRef<ApiState> for Arc<Runtime> {
+    fn from_ref(state: &ApiState) -> Self {
+        state.runtime.clone()
+    }
+}
+
+impl FromRef<ApiState> for TaskManager {
+    fn from_ref(state: &ApiState) -> Self {
+        state.tasks.clone()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -162,7 +191,23 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
             "control API write operations are disabled because no control token was configured"
         );
     }
-    let app = Router::new()
+    let app = build_router(runtime, auth);
+    let listener = tokio::net::TcpListener::bind(control_listen).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn build_router(runtime: Arc<Runtime>, auth: ControlAuthState) -> Router {
+    build_router_with_tasks(runtime, auth, TaskManager::default())
+}
+
+fn build_router_with_tasks(
+    runtime: Arc<Runtime>,
+    auth: ControlAuthState,
+    tasks: TaskManager,
+) -> Router {
+    let state = ApiState { runtime, tasks };
+    Router::new()
         .route("/health", get(health))
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
@@ -211,12 +256,13 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         .route("/v1/config/reload", post(reload_config))
         .route("/v1/tun", get(tun_status))
         .route("/v1/doctor", get(doctor))
+        .route("/v1/tasks", get(task_list))
+        .route("/v1/tasks/:id", get(task_status))
+        .route("/v1/tasks/:id/cancel", post(cancel_task))
+        .route("/v1/events", get(task_events))
         .layer(middleware::from_fn_with_state(auth, authorize_writes))
         .layer(TraceLayer::new_for_http())
-        .with_state(runtime);
-    let listener = tokio::net::TcpListener::bind(control_listen).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 fn validate_control_listen(control_listen: std::net::SocketAddr) -> anyhow::Result<()> {
@@ -385,8 +431,95 @@ fn invalid_request(code: &'static str, message: impl Into<String>) -> Response {
     )
 }
 
+fn task_accepted(record: &TaskRecord) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "task_id": record.id,
+            "kind": record.kind,
+            "status": record.status,
+        })),
+    )
+        .into_response()
+}
+
+fn task_failure(code: &'static str, error: impl std::fmt::Display) -> TaskFailure {
+    let message = error.to_string();
+    let kind = classify_message(&message);
+    TaskFailure {
+        code: code.to_string(),
+        kind: kind.as_str().to_string(),
+        message,
+        retryable: kind.retryable(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+    }
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn task_list(State(tasks): State<TaskManager>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "tasks": tasks.list().await }))
+}
+
+async fn task_status(State(tasks): State<TaskManager>, AxumPath(id): AxumPath<String>) -> Response {
+    match tasks.get(&id).await {
+        Some(task) => Json(task).into_response(),
+        None => api_error_response(
+            StatusCode::NOT_FOUND,
+            "task_not_found",
+            OutboundErrorKind::Internal,
+            format!("task {id} does not exist"),
+            serde_json::json!({ "task_id": id }),
+        ),
+    }
+}
+
+async fn cancel_task(State(tasks): State<TaskManager>, AxumPath(id): AxumPath<String>) -> Response {
+    match tasks.cancel(&id).await {
+        Some(task) => json_response(serde_json::json!({
+            "ok": true,
+            "task": task,
+        })),
+        None => api_error_response(
+            StatusCode::NOT_FOUND,
+            "task_not_found",
+            OutboundErrorKind::Internal,
+            format!("task {id} does not exist"),
+            serde_json::json!({ "task_id": id }),
+        ),
+    }
+}
+
+async fn task_events(
+    State(tasks): State<TaskManager>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let stream = BroadcastStream::new(tasks.subscribe()).filter_map(|item| match item {
+        Ok(event) => {
+            let id = event.id.clone();
+            let name = event.event;
+            serde_json::to_string(&event)
+                .ok()
+                .map(|data| Ok(Event::default().id(id).event(name).data(data)))
+        }
+        Err(error) => {
+            let id = uuid::Uuid::new_v4().to_string();
+            Some(Ok(Event::default().id(id).event("lagged").data(
+                serde_json::json!({
+                    "schema_version": 1,
+                    "timestamp": chrono::Utc::now(),
+                    "message": error.to_string(),
+                })
+                .to_string(),
+            )))
+        }
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 async fn version() -> Json<VersionResponse> {
@@ -543,7 +676,7 @@ async fn use_country(
 }
 
 async fn probe_outbounds(
-    State(runtime): State<Arc<Runtime>>,
+    State(state): State<ApiState>,
     request: Option<Json<ProbeRequest>>,
 ) -> Response {
     let options = request
@@ -554,19 +687,59 @@ async fn probe_outbounds(
             names: request.names,
         })
         .unwrap_or_default();
-    let results = runtime.probe_all_outbounds_with(options).await;
-    let failure_summary = build_probe_failure_summary(&results);
-    json_response(serde_json::json!({
-        "results": results,
-        "failure_summary": failure_summary,
-    }))
+    let total = state.runtime.probe_target_count(&options);
+    let (record, cancellation) = state.tasks.create("probe_outbounds", Some(total)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, format!("probing {total} outbounds"))
+            .await;
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ProbeProgress>();
+        let progress_tasks = tasks.clone();
+        let progress_task_id = task_id.clone();
+        let progress_handle = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                progress_tasks
+                    .progress(
+                        &progress_task_id,
+                        progress.completed,
+                        Some(progress.total),
+                        format!("tested {}", progress.name),
+                    )
+                    .await;
+            }
+        });
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            results = runtime.probe_all_outbounds_with_progress(options, Some(progress_tx)) => {
+                let failure_summary = build_probe_failure_summary(&results);
+                tasks.progress(
+                    &task_id,
+                    results.len() as u64,
+                    Some(total),
+                    "finalizing probe results",
+                ).await;
+                tasks.succeed(&task_id, serde_json::json!({
+                    "results": results,
+                    "failure_summary": failure_summary,
+                })).await;
+            }
+        }
+        let _ = progress_handle.await;
+    });
+    task_accepted(&record)
 }
 
 async fn probe_group_body(
-    State(runtime): State<Arc<Runtime>>,
+    State(state): State<ApiState>,
     Json(request): Json<ProbeGroupRequest>,
 ) -> Response {
-    let config = runtime.config();
+    let config = state.runtime.config();
     let member_names = collect_group_probe_members(&config, &request.group);
     if member_names.is_empty() {
         return invalid_request(
@@ -574,20 +747,61 @@ async fn probe_group_body(
             format!("group '{}' has no probeable members", request.group),
         );
     }
+    let total = member_names.len() as u64;
+    let group = request.group;
     let options = ProbeOptions {
         url: request.url,
         timeout_ms: request.timeout_ms,
         concurrency: request.concurrency,
         names: Some(member_names),
     };
-    let results = runtime.probe_all_outbounds_with(options).await;
-    let failure_summary = build_probe_failure_summary(&results);
-    json_response(serde_json::json!({
-        "ok": true,
-        "group": request.group,
-        "results": results,
-        "failure_summary": failure_summary,
-    }))
+    let (record, cancellation) = state.tasks.create("probe_group", Some(total)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, format!("probing group {group}"))
+            .await;
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<ProbeProgress>();
+        let progress_tasks = tasks.clone();
+        let progress_task_id = task_id.clone();
+        let progress_handle = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                progress_tasks
+                    .progress(
+                        &progress_task_id,
+                        progress.completed,
+                        Some(progress.total),
+                        format!("tested {}", progress.name),
+                    )
+                    .await;
+            }
+        });
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            results = runtime.probe_all_outbounds_with_progress(options, Some(progress_tx)) => {
+                let failure_summary = build_probe_failure_summary(&results);
+                tasks.progress(
+                    &task_id,
+                    results.len() as u64,
+                    Some(total),
+                    "finalizing group probe results",
+                ).await;
+                tasks.succeed(&task_id, serde_json::json!({
+                    "ok": true,
+                    "group": group,
+                    "results": results,
+                    "failure_summary": failure_summary,
+                })).await;
+            }
+        }
+        let _ = progress_handle.await;
+    });
+    task_accepted(&record)
 }
 
 fn build_probe_failure_summary(results: &[crate::core::ProbeResult]) -> HashMap<String, usize> {
@@ -684,51 +898,60 @@ async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Response {
 }
 
 async fn import_subscription(
-    State(runtime): State<Arc<Runtime>>,
+    State(state): State<ApiState>,
     Json(request): Json<SubscriptionImportRequest>,
 ) -> Response {
-    let url = request.url.clone();
-    let update_timeout_secs = runtime.config().subscriptions.update_timeout_secs;
-    let text = match subscription_source_text(request.text, request.url, update_timeout_secs).await
-    {
-        Ok(text) => text,
-        Err(error) => {
-            return classified_api_error("subscription_download_failed", error);
-        }
-    };
-
-    match subscription_store(&runtime).import_text_with_id(
-        request.id,
-        request.name,
-        url,
-        &text,
-        request.switch,
-    ) {
-        Ok(result) => {
+    let (record, cancellation) = state.tasks.create("subscription_import", Some(1)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, "downloading subscription")
+            .await;
+        let operation = async {
+            let url = request.url.clone();
+            let update_timeout_secs = runtime.config().subscriptions.update_timeout_secs;
+            let text =
+                subscription_source_text(request.text, request.url, update_timeout_secs).await?;
+            let result = subscription_store(&runtime).import_text_with_id(
+                request.id,
+                request.name,
+                url,
+                &text,
+                request.switch,
+            )?;
             let reload = if result.active_changed {
-                reload_active_subscription_config(&runtime).map(
-                    |config| serde_json::json!({ "reloaded": true, "summary": config.summary() }),
-                )
+                let config = reload_active_subscription_config(&runtime)?;
+                serde_json::json!({ "reloaded": true, "summary": config.summary() })
             } else {
-                Ok(serde_json::json!({ "reloaded": false }))
+                serde_json::json!({ "reloaded": false })
             };
-            match reload {
-                Ok(reload) => json_response(serde_json::json!({
-                    "ok": true,
-                    "result": result,
-                    "runtime": reload,
-                })),
-                Err(error) => api_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "subscription_reload_failed",
-                    classify_message(&error.to_string()),
-                    error.to_string(),
-                    serde_json::json!({ "result": result }),
-                ),
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
+                "ok": true,
+                "result": result,
+                "runtime": reload,
+            }))
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            result = operation => {
+                match result {
+                    Ok(result) => {
+                        tasks.progress(&task_id, 1, Some(1), "saving subscription").await;
+                        tasks.succeed(&task_id, result).await;
+                    }
+                    Err(error) => tasks.fail(
+                        &task_id,
+                        task_failure("subscription_import_failed", error),
+                    ).await,
+                }
             }
         }
-        Err(error) => classified_api_error("subscription_import_failed", error),
-    }
+    });
+    task_accepted(&record)
 }
 
 async fn use_outbound(
@@ -774,36 +997,63 @@ async fn use_subscription(
     }
 }
 
-async fn update_all_subscriptions(State(runtime): State<Arc<Runtime>>) -> Response {
-    let store = subscription_store(&runtime);
-    let options = (&runtime.config().subscriptions).into();
-    match store.update_all_from_urls_with(options).await {
-        Ok(results) => {
+async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
+    let store = subscription_store(&state.runtime);
+    let total = match store.index() {
+        Ok(index) => index.subscriptions.len() as u64,
+        Err(error) => return classified_api_error("subscription_index_read_failed", error),
+    };
+    let options = (&state.runtime.config().subscriptions).into();
+    let (record, cancellation) = state
+        .tasks
+        .create("subscription_update_all", Some(total))
+        .await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, format!("updating {total} subscriptions"))
+            .await;
+        let operation = async {
+            let results = store.update_all_from_urls_with(options).await?;
             let updated = results.iter().any(|item| item.updated);
             let reload = if updated {
-                reload_active_subscription_config(&runtime).map(
-                    |config| serde_json::json!({ "reloaded": true, "summary": config.summary() }),
-                )
+                let config = reload_active_subscription_config(&runtime)?;
+                serde_json::json!({ "reloaded": true, "summary": config.summary() })
             } else {
-                Ok(serde_json::json!({ "reloaded": false }))
+                serde_json::json!({ "reloaded": false })
             };
-            match reload {
-                Ok(reload) => json_response(serde_json::json!({
-                    "ok": true,
-                    "results": results,
-                    "runtime": reload,
-                })),
-                Err(error) => api_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "subscription_reload_failed",
-                    classify_message(&error.to_string()),
-                    error.to_string(),
-                    serde_json::json!({ "results": results }),
-                ),
+            Ok::<serde_json::Value, anyhow::Error>(serde_json::json!({
+                "ok": true,
+                "results": results,
+                "runtime": reload,
+            }))
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            result = operation => {
+                match result {
+                    Ok(result) => {
+                        tasks.progress(
+                            &task_id,
+                            total,
+                            Some(total),
+                            "finalizing subscription updates",
+                        ).await;
+                        tasks.succeed(&task_id, result).await;
+                    }
+                    Err(error) => tasks.fail(
+                        &task_id,
+                        task_failure("subscription_update_failed", error),
+                    ).await,
+                }
             }
         }
-        Err(error) => classified_api_error("subscription_update_failed", error),
-    }
+    });
+    task_accepted(&record)
 }
 
 async fn reload_active_subscription(State(runtime): State<Arc<Runtime>>) -> Response {
@@ -1012,7 +1262,11 @@ async fn fetch_subscription_url(url: String, timeout_secs: u64) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{HeaderValue, Request},
+    };
+    use tower::ServiceExt;
 
     #[test]
     fn control_api_accepts_loopback_only() {
@@ -1058,6 +1312,210 @@ mod tests {
         assert!(constant_time_eq(b"same-value", b"same-value"));
         assert!(!constant_time_eq(b"same-value", b"different!"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[tokio::test]
+    async fn router_enforces_write_auth_and_accepts_task_requests() {
+        let runtime = Arc::new(Runtime::new(SuperConfig::default()).unwrap());
+        let token: Arc<str> = Arc::from("0123456789abcdef0123456789abcdef");
+        let app = build_router(
+            runtime,
+            ControlAuthState {
+                token: Some(token.clone()),
+            },
+        );
+
+        let public_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_response.status(), StatusCode::OK);
+
+        let event_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(event_response.status(), StatusCode::OK);
+        assert_eq!(
+            event_response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/probes")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/probes")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"names":["direct"],"timeout_ms":50,"concurrency":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(accepted.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+
+        let mut snapshot = serde_json::Value::Null;
+        for _ in 0..50 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            snapshot = serde_json::from_slice(&body).unwrap();
+            if snapshot["status"] == "succeeded" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(snapshot["status"], "succeeded");
+        assert_eq!(
+            snapshot["result"]["results"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_task_returns_missing_nodes_even_when_probe_url_is_invalid() {
+        let runtime = Arc::new(Runtime::new(SuperConfig::default()).unwrap());
+        let token: Arc<str> = Arc::from("0123456789abcdef0123456789abcdef");
+        let app = build_router(
+            runtime,
+            ControlAuthState {
+                token: Some(token.clone()),
+            },
+        );
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/probes")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "url":"://invalid",
+                            "names":["direct","missing","direct"," "],
+                            "timeout_ms":500,
+                            "concurrency":2
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(accepted.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+
+        let mut snapshot = serde_json::Value::Null;
+        for _ in 0..50 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            snapshot = serde_json::from_slice(&body).unwrap();
+            if snapshot["status"] == "succeeded" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(snapshot["status"], "succeeded");
+        assert_eq!(snapshot["total"], 2);
+        assert_eq!(snapshot["current"], 2);
+        let results = snapshot["result"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["name"], "direct");
+        assert_eq!(results[0]["failure_kind"], "invalid_probe_url");
+        assert_eq!(results[1]["name"], "missing");
+        assert_eq!(results[1]["failure_kind"], "outbound_not_found");
+    }
+
+    #[tokio::test]
+    async fn task_cancel_route_cancels_the_operation_token() {
+        let runtime = Arc::new(Runtime::new(SuperConfig::default()).unwrap());
+        let token: Arc<str> = Arc::from("0123456789abcdef0123456789abcdef");
+        let tasks = TaskManager::default();
+        let (record, cancellation) = tasks.create("long_operation", None).await;
+        tasks.mark_running(&record.id, "running").await;
+        let app = build_router_with_tasks(
+            runtime,
+            ControlAuthState {
+                token: Some(token.clone()),
+            },
+            tasks.clone(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/v1/tasks/{}/cancel", record.id))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            tasks.get(&record.id).await.unwrap().status,
+            tasks::TaskStatus::Cancelled
+        );
     }
 
     #[test]

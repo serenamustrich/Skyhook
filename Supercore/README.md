@@ -158,11 +158,23 @@ is passed.
 - `POST /v1/config/reload`
 - `GET /v1/tun`
 - `GET /v1/doctor`
+- `GET /v1/tasks`
+- `GET /v1/tasks/{id}`
+- `POST /v1/tasks/{id}/cancel`
+- `GET /v1/events`
 
 The control listener is restricted to loopback addresses. `GET`, `HEAD`, and `OPTIONS` are
 read-only operations. Every write request must send `Authorization: Bearer <token>`. The macOS App
 generates a fresh 256-bit token for each user-mode core process. The TUN LaunchDaemon reads its
 token from a root-owned `0600` file; the token is never embedded in the launchd plist.
+
+Full and group probes, subscription imports, and update-all requests return HTTP `202` with a
+`task_id`. Clients read `/v1/tasks/{id}` for bounded progress, structured failures, and results, or
+cancel the underlying operation through `/v1/tasks/{id}/cancel`. Terminal task records are retained
+for up to 24 hours with a default maximum of 512 records, without evicting active work.
+`/v1/events` currently streams versioned task updates over SSE with event IDs and timestamps. The
+same event surface will carry traffic, connection, and log events after the telemetry event bus is
+completed.
 
 `POST /v1/probes` accepts an optional JSON body:
 

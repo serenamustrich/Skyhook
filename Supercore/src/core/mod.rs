@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, RwLock},
     time::Instant,
 };
@@ -102,6 +102,13 @@ pub struct ProbeOptions {
     pub timeout_ms: Option<u64>,
     pub concurrency: Option<usize>,
     pub names: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeProgress {
+    pub completed: u64,
+    pub total: u64,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -652,14 +659,31 @@ impl Runtime {
     }
 
     pub async fn probe_all_outbounds_with(&self, options: ProbeOptions) -> Vec<ProbeResult> {
-        let requested_names = options.names.as_ref().map(|names| {
-            names
-                .iter()
-                .map(|name| name.trim())
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<HashSet<_>>()
-        });
+        self.probe_all_outbounds_with_progress(options, None).await
+    }
+
+    pub fn probe_target_count(&self, options: &ProbeOptions) -> u64 {
+        if let Some(names) = normalized_probe_names(options.names.as_ref()) {
+            return names.len() as u64;
+        }
+        self.state
+            .read()
+            .map(|state| {
+                state
+                    .outbounds
+                    .values()
+                    .filter(|outbound| outbound.kind() != "reject")
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    }
+
+    pub async fn probe_all_outbounds_with_progress(
+        &self,
+        options: ProbeOptions,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<ProbeProgress>>,
+    ) -> Vec<ProbeResult> {
+        let requested_names = normalized_probe_names(options.names.as_ref());
         let (probe_url, probe_timeout_ms, probe_concurrency, outbounds) = {
             let state = match self.state.read() {
                 Ok(state) => state,
@@ -693,13 +717,17 @@ impl Runtime {
                     .collect::<Vec<_>>(),
             )
         };
+        let total = requested_names
+            .as_ref()
+            .map(|names| names.len() as u64)
+            .unwrap_or(outbounds.len() as u64);
         let target = match ProbeTarget::from_url(&probe_url) {
             Ok(target) => target,
             Err(error) => {
                 self.telemetry
                     .log("warn", format!("invalid probe url: {error:#}"))
                     .await;
-                return outbounds
+                let mut results = outbounds
                     .into_iter()
                     .map(|outbound| ProbeResult {
                         name: outbound.name().to_string(),
@@ -709,7 +737,11 @@ impl Runtime {
                         failure_kind: Some("invalid_probe_url".to_string()),
                         error: Some(format!("invalid probe url: {error:#}")),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                results.extend(missing_probe_results(&results, requested_names.as_ref()));
+                results.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
+                publish_probe_progress(&progress, &results, total);
+                return results;
             }
         };
 
@@ -741,6 +773,9 @@ impl Runtime {
                     error: Some(format!("probe task failed: {error}")),
                 }),
             }
+            if let Some(result) = results.last() {
+                publish_probe_result_progress(&progress, results.len() as u64, total, &result.name);
+            }
             if let Some(outbound) = pending.next() {
                 spawn_probe_job(
                     &mut jobs,
@@ -751,23 +786,10 @@ impl Runtime {
                 );
             }
         }
-        if let Some(requested_names) = requested_names {
-            let returned = results
-                .iter()
-                .map(|result| result.name.clone())
-                .collect::<HashSet<_>>();
-            for name in requested_names {
-                if returned.contains(&name) {
-                    continue;
-                }
-                results.push(ProbeResult {
-                    name,
-                    kind: "unknown".to_string(),
-                    success: false,
-                    latency_ms: None,
-                    failure_kind: Some("outbound_not_found".to_string()),
-                    error: Some("outbound not found".to_string()),
-                });
+        for missing in missing_probe_results(&results, requested_names.as_ref()) {
+            results.push(missing);
+            if let Some(result) = results.last() {
+                publish_probe_result_progress(&progress, results.len() as u64, total, &result.name);
             }
         }
         results.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
@@ -1097,6 +1119,67 @@ fn effective_smart_config(config: &SuperConfig) -> crate::config::SmartRulesConf
         smart_config.proxy_outbound = Some(config.core.default_outbound.clone());
     }
     smart_config
+}
+
+fn publish_probe_progress(
+    progress: &Option<tokio::sync::mpsc::UnboundedSender<ProbeProgress>>,
+    results: &[ProbeResult],
+    total: u64,
+) {
+    for (index, result) in results.iter().enumerate() {
+        publish_probe_result_progress(progress, index as u64 + 1, total, &result.name);
+    }
+}
+
+fn normalized_probe_names(names: Option<&Vec<String>>) -> Option<BTreeSet<String>> {
+    names.map(|names| {
+        names
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
+fn missing_probe_results(
+    results: &[ProbeResult],
+    requested_names: Option<&BTreeSet<String>>,
+) -> Vec<ProbeResult> {
+    let Some(requested_names) = requested_names else {
+        return Vec::new();
+    };
+    let returned = results
+        .iter()
+        .map(|result| result.name.as_str())
+        .collect::<HashSet<_>>();
+    requested_names
+        .iter()
+        .filter(|name| !returned.contains(name.as_str()))
+        .map(|name| ProbeResult {
+            name: name.clone(),
+            kind: "unknown".to_string(),
+            success: false,
+            latency_ms: None,
+            failure_kind: Some("outbound_not_found".to_string()),
+            error: Some("outbound not found".to_string()),
+        })
+        .collect()
+}
+
+fn publish_probe_result_progress(
+    progress: &Option<tokio::sync::mpsc::UnboundedSender<ProbeProgress>>,
+    completed: u64,
+    total: u64,
+    name: &str,
+) {
+    if let Some(progress) = progress {
+        let _ = progress.send(ProbeProgress {
+            completed,
+            total,
+            name: name.to_string(),
+        });
+    }
 }
 
 fn sanitize_probe_timeout_ms(value: u64) -> u64 {
@@ -2010,7 +2093,9 @@ fn classify_probe_failure(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_probe_failure;
+    use crate::config::SuperConfig;
+
+    use super::{classify_probe_failure, ProbeOptions, Runtime};
 
     #[test]
     fn test_classify_probe_failure_protocol_not_implemented() {
@@ -2028,6 +2113,46 @@ mod tests {
             classify_probe_failure("lookup example.com failed"),
             "dns_error"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_probe_url_reports_every_requested_node_and_progress() {
+        let runtime = Runtime::new(SuperConfig::default()).unwrap();
+        let options = ProbeOptions {
+            url: Some("://invalid".to_string()),
+            timeout_ms: Some(500),
+            concurrency: Some(2),
+            names: Some(vec![
+                "direct".to_string(),
+                "missing".to_string(),
+                "direct".to_string(),
+                " ".to_string(),
+            ]),
+        };
+        assert_eq!(runtime.probe_target_count(&options), 2);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let results = runtime
+            .probe_all_outbounds_with_progress(options, Some(progress_tx))
+            .await;
+        let mut progress = Vec::new();
+        while let Some(item) = progress_rx.recv().await {
+            progress.push(item);
+        }
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "direct");
+        assert_eq!(
+            results[0].failure_kind.as_deref(),
+            Some("invalid_probe_url")
+        );
+        assert_eq!(results[1].name, "missing");
+        assert_eq!(
+            results[1].failure_kind.as_deref(),
+            Some("outbound_not_found")
+        );
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress.last().unwrap().completed, 2);
+        assert_eq!(progress.last().unwrap().total, 2);
     }
 }
 
