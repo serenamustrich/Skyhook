@@ -8,7 +8,7 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.3（按 2026-07-17 `2646d9d` 及当前未提交工作区重新核对）
+> 计划版本：v1.5（按 2026-07-17 `a7047a2` 基线及 `NEXT-007` 已验证工作区重新核对）
 >
 > 当前文档状态：`EXECUTING`。M1 正按本文档直接实施。
 >
@@ -147,6 +147,7 @@
 - `2646d9d Core: split Shadowsocks family runtimes`
 - `09ff4a6 Core: isolate Shadowsocks protocol families`
 - `94bd50a Core: isolate Trojan VMess and VLESS`
+- `a7047a2 Core: isolate QUIC protocol runtimes`
 
 已经完成的基础：
 
@@ -202,9 +203,8 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 ### 5.3 当前结构债务
 
-- `Supercore/src/outbound/mod.rs`：`NEXT-006` 拆分后为 1,924 行，其中生产入口约 180
-  行，其余为父模块既有回归测试。所有已实现协议的生产代码均已迁出；下一步清理根
-  模块的隐式 import、共享常量和测试入口。
+- `Supercore/src/outbound/mod.rs`：`NEXT-007` 后为 37 行，只保留模块声明、公共导出和
+  测试入口；1,791 行既有回归测试已迁入 `outbound/tests.rs`。
 - `Supercore/src/core/mod.rs`：当前 16 行，只保留模块声明和公共导出；运行时职责已迁移
   到 `connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、`reload.rs`、
   `runtime.rs`、`selection.rs` 和 `subscription.rs`。协议能力由 Outbound 实现显式声明，
@@ -216,7 +216,8 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 - `AppState.swift`：约 3,046 行。
 - `SettingsWindow.swift`：约 1,614 行。
 - `SupercoreAPIClient.swift`：约 1,264 行。
-- 协议实现仍大量集中在 `outbound/mod.rs`。
+- Outbound 生产模块中的 `use super::*` 已清零；factory、SSH、WireGuard、Snell 和 SSR
+  已改为显式依赖，公共十六进制工具和 UDP session pool 容量常量已归入所属模块。
 - API、核心协调和 UI 状态职责仍过度集中。
 - 当前代码中 Hysteria v1、Mieru、Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
 - Mihomo 当前官方协议列表中的 Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch 尚未进入 Skyhook 正式模型。
@@ -306,16 +307,16 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `94bd50a` 和当前未提交工作区上重新核对：
+2026-07-17 在 `a7047a2` 干净工作区上重新核对：
 
-- 当前分支为 `main`，已提交基线停在 `94bd50a`。
-- 当前批次新增 `hysteria2.rs` 和 `tuic.rs`，factory 继续通过构造函数创建协议实例。
+- 当前分支为 `main`，工作区干净，已提交基线停在 `a7047a2`。
+- `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
-- 当前工作区已通过 `cargo check --all-targets` 且无 warning；outbound 和
-  VLESS/Hysteria2/TUIC 定向回归全部通过。
-- `outbound/mod.rs` 当前为 1,924 行，已经没有协议生产实现；仍需完成根模块 import、
-  factory、SSH/WireGuard 和测试边界收口。
+- `a7047a2` 已通过 `cargo check --all-targets` 且无 warning；outbound 44 项和
+  VLESS/Hysteria2/TUIC 19 项定向回归全部通过。
+- `NEXT-007` 已把 `outbound/mod.rs` 从 1,924 行缩至 37 行；factory、SSH/WireGuard、
+  Snell、SSR 和测试边界均已收口。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
@@ -335,8 +336,8 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 完成 `NEXT-007` 至 `NEXT-009`，关闭 M1：清空巨型 `outbound/mod.rs`，统一
-   TCP/TLS/transport/UDP 和 cancellation。
+1. 完成 `NEXT-008` 至 `NEXT-009`，关闭 M1：统一 TCP/TLS/transport/UDP、通用代理
+   字段和 cancellation，并执行 M1 集中验收。
 2. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
 4. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、
@@ -510,11 +511,11 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
 2. [x] `Core: modularize runtime lifecycle and selection`
    - 拆分 runtime、reload、selection、probe、background jobs 和 subscription merge。
    - reload 改为构建、校验、原子替换；失败继续使用旧 runtime。
-3. [ ] `Core: modularize outbound protocol registry`
+3. [x] `Core: modularize outbound protocol registry`
    - 已完成 trait、registry/factory 基础、显式 capability、错误上下文、SSH、
      WireGuard、target、SOCKS5、AnyTLS、ShadowTLS 迁移。
    - SS/SSR/Snell、Trojan、VMess 和 VLESS/Reality 已完整迁移。
-   - 剩余按公共依赖关系迁移 Hysteria2 和 TUIC。
+   - Hysteria2 和 TUIC 已完成迁移；根模块最小化、显式 import 和测试边界已收口。
    - 不在同一个提交中同时重写协议 wire format。
 4. [ ] `Network: complete shared TCP TLS transports and UDP`
    - 完成 cancellation、deadline、Happy Eyeballs、TLS、transport 和 UDP session 基础。
@@ -685,9 +686,10 @@ tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 
 ### 10.3 Outbound 统一接口
 
 当前进度：trait/factory 已拆分，结构化错误上下文和显式 capability 已接入全部实现；
-SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS，以及 SS/SSR/Snell 生命周期已分别
-提交。当前工作区正在完成 SS/SSR/Snell 的 cipher、framing、obfs、pool 和 relay helper
-迁移，本项保持进行中。
+SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS、SS/SSR/Snell、Trojan、VMess、
+VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交。当前只剩
+根模块最小化已经完成。当前只剩 `NEXT-008` 的公共网络基础设施收口和 `NEXT-009`
+的 M1 集中验收，本项保持进行中。
 
 恢复开发后的精确拆分顺序：
 
@@ -733,7 +735,7 @@ SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS，以及 SS/SSR/Snell 生命周
      和随机 session/packet ID。
    - 验证：`cargo check --all-targets` 无 warning；outbound lib 44 passed；
      `vless_hy2_tuic` 19 passed。
-7. [ ] `NEXT-007`：清空巨型 `outbound/mod.rs`。
+7. [x] `NEXT-007`：清空巨型 `outbound/mod.rs`。
    - 只保留模块声明、公共 re-export 和 registry/factory 入口。
    - 删除跨协议隐式 import、重复 target helper 和字符串错误分类。
 8. [ ] `NEXT-008`：完成公共 TCP/TLS、transport、UDP 和通用代理字段。
@@ -772,6 +774,16 @@ SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS，以及 SS/SSR/Snell 生命周
 - `ss_real_dial`：15 passed。
 - `ssr_real_dial`：41 passed。
 - `snell_real_dial`：18 passed。
+
+`NEXT-007` 验证记录：
+
+- `outbound/mod.rs`：1,924 行降至 37 行，测试迁入独立 `outbound/tests.rs`。
+- 生产路径 `use super::*`：0 处；仅测试模块保留局部通配导入。
+- `cargo check --all-targets`：通过且无 warning。
+- `cargo test --lib outbound::`：44 passed。
+- `config_and_runtime`：20 passed。
+- `remaining_protocols`：29 passed。
+- `git diff --check`：通过。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。

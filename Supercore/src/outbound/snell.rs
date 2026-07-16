@@ -15,14 +15,15 @@ use tokio::{
 use crate::{config::ShadowsocksPluginConfig, routing::Destination};
 
 use super::{
-    connect_tcp,
+    pool::IdlePool,
     shadowsocks::{
         apply_shadowsocks_plugin_request, encode_ss_chunk, increment_nonce, plugin_is_http_obfs,
         plugin_is_tls_obfs, read_http_obfs_response, read_ss_chunk, read_ss_chunk_from_tls_obfs,
         relay_shadowsocks_download, wrap_simple_obfs_tls_app_data, write_ss_plugin_chunk,
         SimpleObfsTlsDecoder, SsCipher, SS_CHUNK_SIZE, SS_NONCE_LEN, SS_TAG_LEN,
     },
-    BoxedStream, IdlePool, Outbound, OutboundCapability,
+    transports::connect_tcp,
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct SnellOutbound {

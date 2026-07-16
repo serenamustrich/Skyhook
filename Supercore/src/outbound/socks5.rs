@@ -14,8 +14,8 @@ use crate::routing::Destination;
 use super::{
     target::{encode_socks5_destination, parse_socks5_destination_prefix},
     transports::connect_tcp,
-    udp::{resolve_udp_socket_addr, RoundRobinSessionPool},
-    BoxedStream, Outbound, OutboundCapability, UDP_SESSION_POOL_SIZE,
+    udp::{resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct Socks5Outbound {

@@ -33,8 +33,8 @@ use super::{
     transports::{
         connect_tcp, perform_websocket_handshake, spawn_websocket_stream, tls_client_config,
     },
-    udp::{resolve_udp_socket_addr, RoundRobinSessionPool},
-    BoxedStream, Outbound, OutboundCapability, UDP_SESSION_POOL_SIZE,
+    udp::{resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct ShadowsocksOutbound {

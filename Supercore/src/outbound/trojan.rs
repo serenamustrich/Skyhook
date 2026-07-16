@@ -14,13 +14,14 @@ use tokio_rustls::TlsConnector;
 use crate::routing::Destination;
 
 use super::{
-    hex_lower,
     target::{encode_socks5_destination, read_socks5_destination_after_atyp},
     transports::{
         connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
         perform_websocket_handshake_with_headers, spawn_websocket_stream, tls_client_config,
     },
-    BoxedStream, Outbound, OutboundCapability, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    util::hex_lower,
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct TrojanOutbound {

@@ -1,17 +1,57 @@
-use super::*;
+use std::{sync::Arc, time::Duration};
+
+use anyhow::anyhow;
+use async_trait::async_trait;
+use ipnet::IpNet;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::routing::Destination;
+
+use super::{BoxedStream, Outbound, OutboundCapability};
 
 pub(super) struct WireGuardOutbound {
-    pub(super) name: String,
-    pub(super) server: String,
-    pub(super) port: u16,
-    pub(super) private_key: String,
-    pub(super) public_key: String,
-    pub(super) preshared_key: Option<String>,
-    pub(super) ip: Vec<String>,
-    pub(super) ipv6: Vec<String>,
-    pub(super) allowed_ips: Vec<String>,
-    pub(super) reserved: Vec<u8>,
-    pub(super) mtu: u16,
+    name: String,
+    server: String,
+    port: u16,
+    private_key: String,
+    public_key: String,
+    preshared_key: Option<String>,
+    ip: Vec<String>,
+    ipv6: Vec<String>,
+    allowed_ips: Vec<String>,
+    reserved: Vec<u8>,
+    mtu: u16,
+}
+
+impl WireGuardOutbound {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        name: String,
+        server: String,
+        port: u16,
+        private_key: String,
+        public_key: String,
+        preshared_key: Option<String>,
+        ip: Vec<String>,
+        ipv6: Vec<String>,
+        allowed_ips: Vec<String>,
+        reserved: Vec<u8>,
+        mtu: u16,
+    ) -> Self {
+        Self {
+            name,
+            server,
+            port,
+            private_key,
+            public_key,
+            preshared_key,
+            ip,
+            ipv6,
+            allowed_ips,
+            reserved,
+            mtu,
+        }
+    }
 }
 
 #[async_trait]

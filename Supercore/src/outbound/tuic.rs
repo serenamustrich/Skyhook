@@ -24,7 +24,8 @@ use super::{
     transports::{
         connect_quic_endpoint, quic_bind_addr, quic_client_config, random_u16, resolve_quic_remote,
     },
-    BoxedStream, Outbound, OutboundCapability, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct TuicOutbound {

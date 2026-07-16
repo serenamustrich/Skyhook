@@ -1,13 +1,47 @@
-use super::*;
+use std::{sync::Arc, time::Duration};
+
+use anyhow::{anyhow, Context};
+use async_trait::async_trait;
+use russh::{client as ssh_client, ChannelMsg, Disconnect};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+    time::timeout,
+};
+
+use crate::routing::Destination;
+
+use super::{BoxedStream, Outbound, OutboundCapability};
 
 pub(super) struct SshOutbound {
-    pub(super) name: String,
-    pub(super) server: String,
-    pub(super) port: u16,
-    pub(super) username: String,
-    pub(super) password: Option<String>,
-    pub(super) private_key: Option<String>,
-    pub(super) private_key_passphrase: Option<String>,
+    name: String,
+    server: String,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    private_key: Option<String>,
+    private_key_passphrase: Option<String>,
+}
+
+impl SshOutbound {
+    pub(super) fn new(
+        name: String,
+        server: String,
+        port: u16,
+        username: String,
+        password: Option<String>,
+        private_key: Option<String>,
+        private_key_passphrase: Option<String>,
+    ) -> Self {
+        Self {
+            name,
+            server,
+            port,
+            username,
+            password,
+            private_key,
+            private_key_passphrase,
+        }
+    }
 }
 
 struct AcceptAnySshServerKey;

@@ -34,8 +34,8 @@ use super::{
         connect_tcp, open_grpc_tunnel, open_h2_tunnel, perform_websocket_handshake,
         spawn_websocket_stream, tls_client_config,
     },
-    udp::KeyedRoundRobinSessionPool,
-    BoxedStream, Outbound, OutboundCapability, UDP_SESSION_POOL_SIZE,
+    udp::{KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct VmessOutbound {

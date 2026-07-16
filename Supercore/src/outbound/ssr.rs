@@ -21,12 +21,13 @@ use tokio::{
 use crate::routing::Destination;
 
 use super::{
-    connect_tcp, encode_socks5_destination, parse_socks5_destination_prefix,
-    resolve_udp_socket_addr,
     shadowsocks::{
         evp_bytes_to_key, read_http_obfs_response, read_simple_obfs_tls_record,
         wrap_simple_obfs_tls_app_data,
     },
+    target::{encode_socks5_destination, parse_socks5_destination_prefix},
+    transports::connect_tcp,
+    udp::resolve_udp_socket_addr,
     BoxedStream, Outbound, OutboundCapability,
 };
 

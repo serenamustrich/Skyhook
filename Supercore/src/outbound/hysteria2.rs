@@ -27,7 +27,8 @@ use super::{
         connect_quic_endpoint, encode_quic_varint, quic_bind_addr, quic_client_config, random_u16,
         random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
     },
-    BoxedStream, Outbound, OutboundCapability, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) struct Hysteria2Outbound {

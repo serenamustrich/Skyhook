@@ -1,4 +1,31 @@
-use super::*;
+use std::{collections::HashMap, sync::Arc};
+
+use anyhow::anyhow;
+
+use crate::{config::OutboundConfig, telemetry::Telemetry};
+
+use super::{
+    anytls::AnyTlsOutbound,
+    direct::DirectOutbound,
+    http_proxy::HttpOutbound,
+    hysteria2::Hysteria2Outbound,
+    naive::NaiveOutbound,
+    registry::{attach_groups, insert_leaf},
+    reject::RejectOutbound,
+    shadowsocks::ShadowsocksOutbound,
+    shadowtls::ShadowTlsOutbound,
+    snell::SnellOutbound,
+    socks5::Socks5Outbound,
+    ssh::SshOutbound,
+    ssr::SsrOutbound,
+    traits::{Outbound, OutboundMap},
+    trojan::TrojanOutbound,
+    tuic::TuicOutbound,
+    unsupported::UnsupportedProtocolOutbound,
+    vless::VlessOutbound,
+    vmess::VmessOutbound,
+    wireguard::WireGuardOutbound,
+};
 
 pub fn build_outbounds(
     configs: &[OutboundConfig],
@@ -308,19 +335,19 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             allowed_ips,
             reserved,
             mtu,
-        } => Arc::new(WireGuardOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            private_key: private_key.clone(),
-            public_key: public_key.clone(),
-            preshared_key: preshared_key.clone(),
-            ip: ip.clone(),
-            ipv6: ipv6.clone(),
-            allowed_ips: allowed_ips.clone(),
-            reserved: reserved.clone(),
-            mtu: mtu.unwrap_or(1420),
-        }),
+        } => Arc::new(WireGuardOutbound::new(
+            name.clone(),
+            server.clone(),
+            *port,
+            private_key.clone(),
+            public_key.clone(),
+            preshared_key.clone(),
+            ip.clone(),
+            ipv6.clone(),
+            allowed_ips.clone(),
+            reserved.clone(),
+            mtu.unwrap_or(1420),
+        )),
         OutboundConfig::Ssh {
             name,
             server,
@@ -329,15 +356,15 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             password,
             private_key,
             private_key_passphrase,
-        } => Arc::new(SshOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            username: username.clone(),
-            password: password.clone(),
-            private_key: private_key.clone(),
-            private_key_passphrase: private_key_passphrase.clone(),
-        }),
+        } => Arc::new(SshOutbound::new(
+            name.clone(),
+            server.clone(),
+            *port,
+            username.clone(),
+            password.clone(),
+            private_key.clone(),
+            private_key_passphrase.clone(),
+        )),
         OutboundConfig::Mieru { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
             name.clone(),
             "mieru".to_string(),
