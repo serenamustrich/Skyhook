@@ -8,9 +8,9 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.2（按 2026-07-17 `bf0fb62` 当前工作区重新核对）
+> 计划版本：v1.3（按 2026-07-17 `2646d9d` 及当前未提交工作区重新核对）
 >
-> 当前文档状态：`PLAN_FROZEN`。本轮只列计划，不继续修改核心或 App 业务代码。
+> 当前文档状态：`EXECUTING`。M1 正按本文档直接实施。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -24,8 +24,7 @@
 3. “完成”只按本文档的固定范围和验收门判断，不因后续重复讨论而临时增加完成条件。
 4. 本计划全部达到 `VERIFIED` 后，当前版本即视为开发完成；之后提出的新平台、新协议或新产品功能进入下一版本。
 5. README 只描述已经交付的功能，不写开发过程、剩余计划和未经验证的能力。
-6. 当前回合只冻结计划，不继续修改业务代码；后续收到继续开发指令后，从本文档记录的
-   `NEXT-001` 直接接续。
+6. 当前直接执行点以本文档的“当前直接执行队列”为准；每批完成后同步真实验证证据。
 
 ## 2. 最终产品定义
 
@@ -144,6 +143,8 @@
 - `9585296 Core: split control API route domains`
 - `5c4dd89 Core: modularize runtime lifecycle and selection`
 - `bf0fb62 Core: make outbound capabilities explicit`
+- `dbed82f Core: modularize target and TLS outbounds`
+- `2646d9d Core: split Shadowsocks family runtimes`
 
 已经完成的基础：
 
@@ -199,8 +200,10 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 ### 5.3 当前结构债务
 
-- `Supercore/src/outbound/mod.rs`：当前约 9,794 行；公共 trait、factory、错误上下文、
-  target、SOCKS5、AnyTLS、ShadowTLS、SSH 和 WireGuard 已迁出，其余协议实现继续拆分。
+- `Supercore/src/outbound/mod.rs`：提交基线约 9,794 行；`NEXT-004` 拆分后为 5,399 行。
+  公共 trait、factory、错误上下文、target、SOCKS5、AnyTLS、ShadowTLS、SSH、
+  WireGuard，以及 SS/SSR/Snell 的完整协议实现已经迁出；下一批迁移 Trojan、VMess、
+  VLESS、Hysteria2 和 TUIC。
 - `Supercore/src/core/mod.rs`：当前 16 行，只保留模块声明和公共导出；运行时职责已迁移
   到 `connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、`reload.rs`、
   `runtime.rs`、`selection.rs` 和 `subscription.rs`。协议能力由 Outbound 实现显式声明，
@@ -302,17 +305,21 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `bf0fb62` 上重新核对：
+2026-07-17 在 `2646d9d` 和当前未提交工作区上重新核对：
 
-- 工作区干净，`main` 没有未提交业务代码。
-- `outbound/mod.rs` 仍有约 11,790 行。
-- 仍集中在该文件的协议实现：
-  - AnyTLS
-  - ShadowTLS
-  - ShadowsocksR
-  - Snell
-  - SOCKS5
-  - Shadowsocks
+- 当前分支为 `main`，已提交基线停在 `2646d9d`。
+- 本批次协议实现只触及以下 5 个源码文件：
+  - `Supercore/src/outbound/mod.rs`
+  - `Supercore/src/outbound/io.rs`
+  - `Supercore/src/outbound/shadowsocks.rs`
+  - `Supercore/src/outbound/ssr.rs`
+  - `Supercore/src/outbound/snell.rs`
+- 当前 diff 是协议代码机械迁移，不得回退或覆盖；共享 IO 已独立为
+  `outbound/io.rs`，跨协议 crypto/obfs 依赖使用显式 sibling import 和最小
+  `pub(super)` 可见性。
+- 当前工作区已重新通过 `cargo check --all-targets` 且无 warning；SS/SSR/Snell 定向
+  真实拨号和 outbound 单元回归全部通过。
+- `outbound/mod.rs` 当前为 5,399 行，仍需迁出的主要生产实现为：
   - Trojan
   - VMess
   - VLESS
@@ -337,17 +344,18 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 从 `NEXT-001` 开始完成共享目标地址编解码和 SOCKS5 独立模块。
-2. 继续 M1：拆分其余 Outbound，并统一错误、DialContext、transport、UDP 和
-   cancellation。
-3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
-4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
-5. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、
+1. 从 `NEXT-005` 迁移 Trojan、VMess 和 VLESS，保持 transport/wire format 行为不变。
+2. 完成 `NEXT-006` 迁移 Hysteria2 和 TUIC，并收敛公共 QUIC 生命周期。
+3. 完成 `NEXT-007` 至 `NEXT-009`，关闭 M1：清空巨型 `outbound/mod.rs`，统一
+   TCP/TLS/transport/UDP 和 cancellation。
+4. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
+5. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
+6. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、
    日志和 Doctor。
-6. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
-7. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
+7. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
+8. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
 
-在第 7 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
+在第 8 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
 
 ## 6. 不可违反的开发规则
 
@@ -514,9 +522,10 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
    - 拆分 runtime、reload、selection、probe、background jobs 和 subscription merge。
    - reload 改为构建、校验、原子替换；失败继续使用旧 runtime。
 3. [ ] `Core: modularize outbound protocol registry`
-   - 已完成 trait、registry/factory 基础、显式 capability、错误上下文、SSH 和
-     WireGuard 迁移。
-   - 剩余先迁移 target 和 SOCKS5，再按公共依赖关系逐协议迁移。
+   - 已完成 trait、registry/factory 基础、显式 capability、错误上下文、SSH、
+     WireGuard、target、SOCKS5、AnyTLS、ShadowTLS 迁移。
+   - SS/SSR/Snell 生命周期已提交，完整 helper 迁移正在当前工作区收口。
+   - 剩余按公共依赖关系迁移 Trojan、VMess、VLESS、Hysteria2 和 TUIC。
    - 不在同一个提交中同时重写协议 wire format。
 4. [ ] `Network: complete shared TCP TLS transports and UDP`
    - 完成 cancellation、deadline、Happy Eyeballs、TLS、transport 和 UDP session 基础。
@@ -686,10 +695,10 @@ tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 
 
 ### 10.3 Outbound 统一接口
 
-当前进度：trait/factory 已拆分，结构化错误上下文和显式 capability 已接入全部实现，
-SSH/WireGuard 已迁为独立模块并提交为
-`bf0fb62 Core: make outbound capabilities explicit`；其余协议实现仍在
-`outbound/mod.rs`，本项保持进行中。
+当前进度：trait/factory 已拆分，结构化错误上下文和显式 capability 已接入全部实现；
+SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS，以及 SS/SSR/Snell 生命周期已分别
+提交。当前工作区正在完成 SS/SSR/Snell 的 cipher、framing、obfs、pool 和 relay helper
+迁移，本项保持进行中。
 
 恢复开发后的精确拆分顺序：
 
@@ -704,12 +713,23 @@ SSH/WireGuard 已迁为独立模块并提交为
 3. [x] `NEXT-003`：迁移 AnyTLS 和 ShadowTLS。
    - 抽取其共享 TLS/padding/target 依赖。
    - 保持 capability 限制文本和现有行为不变。
-4. [ ] `NEXT-004`：迁移 Shadowsocks、ShadowsocksR 和 Snell。
+4. [x] `NEXT-004`：迁移 Shadowsocks、ShadowsocksR 和 Snell。
    - 先建立协议私有 crypto/framing 子模块。
    - 共享代码必须有明确协议边界，不能继续依赖 `use super::*`。
    - 迁移后运行 SS、SSR、Snell 真实拨号定向回归。
-   - 当前进度：三个协议的 Outbound 生命周期、构造和拨号入口已迁入独立模块；
-     共享 cipher、framing、obfs、pool 和 relay helper 仍在父模块，本项不关闭。
+   - [x] `NEXT-004A`：恢复当前未提交工作区。
+     - 新增 `outbound/io.rs`，把跨协议 `read_exact_or_eof` 移入独立共享模块。
+     - AnyTLS、ShadowTLS、父模块和 Shadowsocks 改为显式导入该 IO helper。
+     - Snell、SSR 从 `outbound::shadowsocks` 显式导入真正共享的 crypto/obfs helper。
+     - 共享符号只开放到 `pub(super)`，不得扩大为 crate 公共 API。
+     - 父模块测试用 `#[cfg(test)]` 精确导入已迁移测试对象，不把测试依赖泄露到生产路径。
+     - 验收：`cargo check --all-targets` 通过且无 warning，`git diff --check` 通过。
+   - [x] `NEXT-004B`：关闭 Shadowsocks 家族迁移。
+     - 父模块不得残留 SS/SSR/Snell 的 cipher、framing、obfs、pool、relay 或协议常量。
+     - 子模块不得使用 `use super::*`，跨模块依赖必须逐项可审计。
+     - 运行 `outbound::`、`ss_real_dial`、`ssr_real_dial`、`snell_real_dial`。
+     - 更新 `protocol-matrix.md` 和本计划的真实状态，不夸大协议能力。
+     - secret scan 通过后提交 `Core: isolate Shadowsocks protocol families`。
 5. [ ] `NEXT-005`：迁移 Trojan、VMess 和 VLESS。
    - transport 组合只依赖公共 transport 接口。
    - Reality/Vision 保持独立状态机，不塞回公共 TLS 模块。
@@ -745,6 +765,16 @@ SSH/WireGuard 已迁为独立模块并提交为
 - `ssr_real_dial`：41 passed。
 - `snell_real_dial`：18 passed。
 - `outbound/mod.rs`：10,646 行降至 9,794 行。
+
+`NEXT-004` 最终收口验证记录：
+
+- 新增共享 `outbound/io.rs`，跨协议 helper 使用显式 sibling import 和最小可见性。
+- 父模块不再包含 SS/SSR/Snell 生产实现，`outbound/mod.rs` 降至 5,399 行。
+- `cargo check --all-targets`：通过且无 warning。
+- `cargo test --lib outbound::`：43 passed。
+- `ss_real_dial`：15 passed。
+- `ssr_real_dial`：41 passed。
+- `snell_real_dial`：18 passed。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。

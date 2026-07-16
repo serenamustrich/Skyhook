@@ -12,7 +12,7 @@ use tokio::{
 use crate::routing::Destination;
 
 use super::{
-    read_exact_or_eof,
+    io::read_exact_or_eof,
     target::encode_socks5_destination,
     transports::{connect_tcp, tls_client_config},
     BoxedStream, Outbound, OutboundCapability,

@@ -47,6 +47,17 @@
 | XTLS Vision | partial | 基础支持 |
 | Reality | partial | 基础支持 |
 
+## 实现边界
+
+- Shadowsocks 的 AEAD/2022、UDP session、plugin、obfs、framing 和 relay 位于
+  `src/outbound/shadowsocks.rs`。
+- ShadowsocksR 的 cipher、protocol、obfs、UDP 和 relay 位于
+  `src/outbound/ssr.rs`。
+- Snell v1-v5、connection reuse、UDP-over-TCP 和 obfs 位于
+  `src/outbound/snell.rs`。
+- 跨协议精确读取 helper 位于 `src/outbound/io.rs`；协议私有 crypto/framing 不进入
+  公共 outbound 根模块。
+
 ## 与 Mihomo 差距
 
 1. **WireGuard**: 用户态 userspace 版本已到位，但字段校验缺失时会走 parse-only/unsupported 限制

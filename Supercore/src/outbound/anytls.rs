@@ -15,7 +15,8 @@ use tokio_rustls::TlsConnector;
 use crate::routing::Destination;
 
 use super::{
-    hex_lower, read_exact_or_eof,
+    hex_lower,
+    io::read_exact_or_eof,
     target::encode_socks5_destination,
     transports::{connect_tcp, tls_client_config},
     BoxedStream, Outbound, OutboundCapability,
