@@ -6,7 +6,7 @@ use tokio::{net::UdpSocket, time::timeout};
 
 use crate::routing::Destination;
 
-use super::{transports::connect_tcp, BoxedStream, Outbound};
+use super::{transports::connect_tcp, BoxedStream, Outbound, OutboundCapability};
 
 pub(crate) struct DirectOutbound {
     name: String,
@@ -26,6 +26,10 @@ impl Outbound for DirectOutbound {
 
     fn kind(&self) -> &'static str {
         "direct"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::tcp_udp("native")
     }
 
     async fn connect(

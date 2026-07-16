@@ -192,7 +192,8 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 ### 5.3 当前结构债务
 
-- `Supercore/src/outbound/mod.rs`：约 12,446 行。
+- `Supercore/src/outbound/mod.rs`：当前约 11,790 行；公共 trait、factory、错误上下文、
+  SSH 和 WireGuard 已迁出，其余协议实现继续拆分。
 - `Supercore/src/core/mod.rs`：当前 17 行，只保留模块声明和公共导出；运行时职责已迁移
   到 `capability.rs`、`connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、
   `reload.rs`、`runtime.rs`、`selection.rs` 和 `subscription.rs`。
@@ -271,6 +272,22 @@ M1 Core 拆分已实现并验证，等待本批提交：
 - Rust lib：95 passed、0 failed、0 ignored。
 - `config_and_runtime`：20 passed。
 - `plan_behavior`：21 passed。
+
+M1 Outbound 第一批已实现，等待本批提交：
+
+- `outbound/traits.rs`：`Outbound`、`ProxyStream`、`OutboundMap` 和显式能力模型。
+- `outbound/factory.rs`：leaf 构造分派和代理组装配入口。
+- `outbound/error.rs`：补齐 tcp_connect、remote_rejected、io、configuration 等错误
+  分类，以及 node、destination、trace ID 和 source chain。
+- `DialContext` 补齐 deadline、inbound、完整 App identity、network/interface 和 DNS
+  policy 字段。
+- 所有 19 个 Outbound 实现显式声明 TCP/UDP/模式/限制。
+- Runtime capability 汇总直接读取实现声明，删除核心侧协议名能力推断矩阵。
+- SSH 和 WireGuard 已迁入独立协议模块。
+- `cargo check --all-targets`：通过且无 warning。
+- `config_and_runtime`：20 passed。
+- `remaining_protocols`：29 passed。
+- Outbound 仍为 `IN_PROGRESS`；其余协议迁出和公共 transport/UDP 收口完成前，不关闭 M1。
 
 ### 5.5 当前直接执行队列
 
@@ -602,6 +619,9 @@ tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 
 - Core shutdown 使用 cancellation tree，确保监听器、后台任务、连接池和持久化任务可控退出。
 
 ### 10.3 Outbound 统一接口
+
+当前进度：trait/factory 已拆分，结构化错误上下文和显式 capability 已接入全部实现，
+SSH/WireGuard 已迁为独立模块；其余协议实现仍在 `outbound/mod.rs`，本项保持进行中。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。

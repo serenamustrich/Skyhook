@@ -1,4 +1,3 @@
-mod capability;
 mod connection;
 mod dns;
 mod lifecycle;

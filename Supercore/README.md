@@ -57,6 +57,11 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   probing, connection relay, and DNS exchange; `core/mod.rs` is only the public composition entry.
 - A runtime cancellation tree drives graceful control API shutdown, mixed/DNS listener shutdown,
   TUN cancellation, background probe/update cancellation, and active dial contexts.
+- Outbound contracts and construction live in dedicated `traits.rs` and `factory.rs` modules.
+  Every outbound implementation reports its own TCP/UDP capability and limitations; Runtime no
+  longer infers capability from a protocol-name switch.
+- Dial errors carry operation, protocol, node, destination, trace ID, retryability, and source
+  context. SSH and WireGuard implementations are isolated protocol modules.
 - Shared transport modules for TCP, TLS, HTTP CONNECT, WebSocket, HTTP/2, gRPC, HTTPUpgrade, and
   QUIC client configuration.
 - Traceable, cancellable dial contexts propagated through concrete outbounds and proxy groups.

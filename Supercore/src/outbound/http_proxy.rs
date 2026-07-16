@@ -4,7 +4,7 @@ use crate::routing::Destination;
 
 use super::{
     transports::{connect_tcp, establish_http_connect},
-    BoxedStream, Outbound,
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(crate) struct HttpOutbound {
@@ -41,6 +41,10 @@ impl Outbound for HttpOutbound {
 
     fn kind(&self) -> &'static str {
         "http"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::tcp_only("HTTP CONNECT does not provide UDP relay")
     }
 
     async fn connect(

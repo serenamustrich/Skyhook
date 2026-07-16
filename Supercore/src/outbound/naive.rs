@@ -10,7 +10,7 @@ use crate::routing::Destination;
 
 use super::{
     transports::{connect_tcp, establish_http_connect, tls_client_config},
-    BoxedStream, Outbound,
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(crate) struct NaiveOutbound {
@@ -57,6 +57,15 @@ impl Outbound for NaiveOutbound {
 
     fn kind(&self) -> &'static str {
         "naive"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability {
+            tcp_supported: true,
+            udp_supported: false,
+            udp_mode: Some("tls-http-connect".to_string()),
+            limitations: vec!["naive udp is not supported".to_string()],
+        }
     }
 
     async fn connect(

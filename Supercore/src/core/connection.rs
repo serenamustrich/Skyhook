@@ -105,6 +105,11 @@ impl Runtime {
         let mut dial_context = DialContext::new(destination.clone(), connect_timeout_ms);
         dial_context.cancellation = self.cancellation_token();
         dial_context.matched_rule = decision.matched_rule.clone();
+        dial_context.subscription_id = self.active_subscription_context().map(|item| item.id);
+        dial_context.selected_node = Some(outbound_name.clone());
+        if outbound_kind == "group" {
+            dial_context.selected_group = Some(decision.outbound.clone());
+        }
         dial_context.app_id = destination.app.as_ref().and_then(|app| {
             app.bundle_id
                 .clone()
@@ -213,6 +218,11 @@ impl Runtime {
         let mut dial_context = DialContext::new(destination.clone(), connect_timeout_ms);
         dial_context.cancellation = self.cancellation_token();
         dial_context.matched_rule = decision.matched_rule.clone();
+        dial_context.subscription_id = self.active_subscription_context().map(|item| item.id);
+        dial_context.selected_node = Some(outbound_name.clone());
+        if outbound_kind == "group" {
+            dial_context.selected_group = Some(decision.outbound.clone());
+        }
         dial_context.app_id = destination.app.as_ref().and_then(|app| {
             app.bundle_id
                 .clone()

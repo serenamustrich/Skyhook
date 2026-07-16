@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::routing::Destination;
 
-use super::{BoxedStream, Outbound};
+use super::{BoxedStream, Outbound, OutboundCapability};
 
 pub(crate) struct UnsupportedProtocolOutbound {
     name: String,
@@ -24,6 +24,13 @@ impl Outbound for UnsupportedProtocolOutbound {
 
     fn kind(&self) -> &'static str {
         "unsupported-protocol"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::unsupported(format!(
+            "{} native dialing is not implemented yet",
+            self.protocol
+        ))
     }
 
     async fn connect(

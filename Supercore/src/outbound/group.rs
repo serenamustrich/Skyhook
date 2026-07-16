@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::{routing::Destination, telemetry::Telemetry};
 
-use super::{context::DialContext, BoxedStream, Outbound};
+use super::{context::DialContext, BoxedStream, Outbound, OutboundCapability};
 
 pub(crate) struct GroupOutbound {
     name: String,
@@ -78,6 +78,29 @@ impl Outbound for GroupOutbound {
 
     fn kind(&self) -> &'static str {
         "group"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        let capabilities = self
+            .members
+            .iter()
+            .map(|member| member.capability())
+            .collect::<Vec<_>>();
+        let tcp_supported = capabilities.iter().any(|item| item.tcp_supported);
+        let udp_supported = capabilities.iter().any(|item| item.udp_supported);
+        let mut limitations = Vec::new();
+        if !tcp_supported {
+            limitations.push("group has no TCP-capable members".to_string());
+        }
+        if !udp_supported {
+            limitations.push("group has no UDP-capable members".to_string());
+        }
+        OutboundCapability {
+            tcp_supported,
+            udp_supported,
+            udp_mode: udp_supported.then(|| format!("group-{}-delegated", self.kind)),
+            limitations,
+        }
     }
 
     async fn connect(

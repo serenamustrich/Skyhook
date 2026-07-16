@@ -41,13 +41,16 @@ pub(super) fn classified_api_error(code: &'static str, error: impl std::fmt::Dis
         OutboundErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
         OutboundErrorKind::Dns
         | OutboundErrorKind::Tcp
+        | OutboundErrorKind::TcpConnect
         | OutboundErrorKind::Tls
         | OutboundErrorKind::HttpStatus
-        | OutboundErrorKind::EmptyResponse => StatusCode::BAD_GATEWAY,
+        | OutboundErrorKind::RemoteRejected
+        | OutboundErrorKind::EmptyResponse
+        | OutboundErrorKind::Io => StatusCode::BAD_GATEWAY,
         OutboundErrorKind::Cancelled => StatusCode::CONFLICT,
-        OutboundErrorKind::Protocol | OutboundErrorKind::Unsupported => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
+        OutboundErrorKind::Protocol
+        | OutboundErrorKind::Unsupported
+        | OutboundErrorKind::Configuration => StatusCode::UNPROCESSABLE_ENTITY,
         OutboundErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     };
     api_error_response(status, code, kind, message, serde_json::json!({}))

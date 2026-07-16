@@ -3,7 +3,7 @@ use async_trait::async_trait;
 
 use crate::routing::Destination;
 
-use super::{BoxedStream, Outbound};
+use super::{BoxedStream, Outbound, OutboundCapability};
 
 pub(crate) struct RejectOutbound {
     name: String,
@@ -23,6 +23,10 @@ impl Outbound for RejectOutbound {
 
     fn kind(&self) -> &'static str {
         "reject"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::unsupported("reject intentionally blocks traffic")
     }
 
     async fn connect(

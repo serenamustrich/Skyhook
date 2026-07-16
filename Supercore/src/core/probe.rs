@@ -17,7 +17,11 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::{
-    outbound::{context::DialContext, error::classify_message, Outbound},
+    outbound::{
+        context::DialContext,
+        error::{classify_message, OutboundError},
+        Outbound,
+    },
     routing::Destination,
     smart,
     telemetry::Telemetry,
@@ -448,7 +452,10 @@ async fn probe_one(
         }
         Some(Ok(Err(error))) => {
             let error_msg = error.to_string();
-            let failure_kind = classify_probe_failure(&error_msg);
+            let failure_kind = error
+                .downcast_ref::<OutboundError>()
+                .map(|error| error.kind.probe_failure_kind().to_string())
+                .unwrap_or_else(|| classify_probe_failure(&error_msg));
             telemetry
                 .record_outbound_result(
                     name.clone(),

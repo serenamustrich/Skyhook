@@ -10,10 +10,7 @@ use crate::{
     telemetry::OutboundHealth,
 };
 
-use super::{
-    capability::{outbound_capability_snapshot, outbound_config_kind},
-    Runtime,
-};
+use super::Runtime;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyGroupSnapshot {
@@ -183,10 +180,33 @@ impl Runtime {
     }
 
     pub fn outbound_capabilities(&self) -> Vec<OutboundCapabilitySnapshot> {
-        self.config()
+        let state = match self.state.read() {
+            Ok(state) => state,
+            Err(_) => return Vec::new(),
+        };
+        state
+            .config
             .outbounds
             .iter()
-            .map(outbound_capability_snapshot)
+            .map(|config| {
+                let capability = state
+                    .outbounds
+                    .get(config.name())
+                    .map(|outbound| outbound.capability())
+                    .unwrap_or_else(|| {
+                        crate::outbound::OutboundCapability::unsupported(
+                            "outbound implementation is missing from runtime",
+                        )
+                    });
+                OutboundCapabilitySnapshot {
+                    name: config.name().to_string(),
+                    kind: outbound_config_kind(config),
+                    tcp_supported: capability.tcp_supported,
+                    udp_supported: capability.udp_supported,
+                    udp_mode: capability.udp_mode,
+                    limitations: capability.limitations,
+                }
+            })
             .collect()
     }
 
@@ -542,4 +562,33 @@ fn detect_country(value: &str) -> Option<(&'static str, &'static str)> {
         }
     }
     None
+}
+
+fn outbound_config_kind(config: &OutboundConfig) -> String {
+    match config {
+        OutboundConfig::Direct { .. } => "direct".to_string(),
+        OutboundConfig::Reject { .. } => "reject".to_string(),
+        OutboundConfig::Http { .. } => "http".to_string(),
+        OutboundConfig::Socks5 { .. } => "socks5".to_string(),
+        OutboundConfig::Shadowsocks { .. } => "shadowsocks".to_string(),
+        OutboundConfig::Trojan { .. } => "trojan".to_string(),
+        OutboundConfig::Vmess { .. } => "vmess".to_string(),
+        OutboundConfig::Vless { .. } => "vless".to_string(),
+        OutboundConfig::Hysteria2 { .. } => "hysteria2".to_string(),
+        OutboundConfig::Tuic { .. } => "tuic".to_string(),
+        OutboundConfig::Naive { .. } => "naive".to_string(),
+        OutboundConfig::Ssr { .. } => "ssr".to_string(),
+        OutboundConfig::Snell { .. } => "snell".to_string(),
+        OutboundConfig::Hysteria { .. } => "hysteria".to_string(),
+        OutboundConfig::AnyTls { .. } => "anytls".to_string(),
+        OutboundConfig::ShadowTls { .. } => "shadowtls".to_string(),
+        OutboundConfig::WireGuard { .. } => "wireguard".to_string(),
+        OutboundConfig::Ssh { .. } => "ssh".to_string(),
+        OutboundConfig::Mieru { .. } => "mieru".to_string(),
+        OutboundConfig::Juicity { .. } => "juicity".to_string(),
+        OutboundConfig::Masque { .. } => "masque".to_string(),
+        OutboundConfig::OpenVpn { .. } => "openvpn".to_string(),
+        OutboundConfig::Unknown { protocol, .. } => format!("unknown:{protocol}"),
+        OutboundConfig::Group { kind, .. } => format!("group:{kind}"),
+    }
 }

@@ -60,15 +60,19 @@ use crate::{
 pub mod context;
 mod direct;
 pub mod error;
+mod factory;
 mod group;
 mod http_proxy;
 mod naive;
 mod pool;
 mod registry;
 mod reject;
+mod ssh;
+mod traits;
 mod transports;
 mod udp;
 mod unsupported;
+mod wireguard;
 
 use direct::DirectOutbound;
 use http_proxy::HttpOutbound;
@@ -76,6 +80,7 @@ use naive::NaiveOutbound;
 use pool::IdlePool;
 use registry::{attach_groups, insert_leaf};
 use reject::RejectOutbound;
+use ssh::SshOutbound;
 use transports::{
     connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
     perform_websocket_handshake, perform_websocket_handshake_with_headers, quic_client_config,
@@ -83,9 +88,16 @@ use transports::{
 };
 use udp::{resolve_udp_socket_addr, RoundRobinSessionPool};
 use unsupported::UnsupportedProtocolOutbound;
+use wireguard::WireGuardOutbound;
 
-use self::context::DialContext;
-use self::error::{OutboundError, OutboundErrorKind};
+pub use factory::build_outbounds;
+pub use traits::{BoxedStream, Outbound, OutboundCapability, OutboundMap, ProxyStream};
+
+#[cfg(test)]
+use self::{
+    context::DialContext,
+    error::{OutboundError, OutboundErrorKind},
+};
 
 #[cfg(test)]
 use group::GroupOutbound;
@@ -96,445 +108,7 @@ use transports::{
     write_websocket_binary_frame, write_websocket_frame,
 };
 
-pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {}
-impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
-
-pub type BoxedStream = Box<dyn ProxyStream>;
 const UDP_SESSION_POOL_SIZE: usize = 4;
-
-#[async_trait]
-pub trait Outbound: Send + Sync {
-    fn name(&self) -> &str;
-    fn kind(&self) -> &'static str;
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream>;
-
-    async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
-        tokio::select! {
-            _ = context.cancellation.cancelled() => {
-                Err(OutboundError::new(
-                    OutboundErrorKind::Cancelled,
-                    "connect",
-                    format!("dial {} was cancelled", context.destination.authority()),
-                )
-                .for_protocol(self.kind())
-                .into())
-            }
-            result = self.connect(&context.destination, context.timeout_ms()) => result,
-        }
-    }
-
-    async fn udp_exchange(
-        &self,
-        _destination: &Destination,
-        _payload: &[u8],
-        _timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        Err(OutboundError::new(
-            OutboundErrorKind::Unsupported,
-            "udp_exchange",
-            format!("outbound {} does not support udp", self.name()),
-        )
-        .for_protocol(self.kind())
-        .into())
-    }
-
-    async fn udp_exchange_context(
-        &self,
-        context: &DialContext,
-        payload: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        tokio::select! {
-            _ = context.cancellation.cancelled() => {
-                Err(OutboundError::new(
-                    OutboundErrorKind::Cancelled,
-                    "udp_exchange",
-                    format!("UDP exchange with {} was cancelled", context.destination.authority()),
-                )
-                .for_protocol(self.kind())
-                .into())
-            }
-            result = self.udp_exchange(&context.destination, payload, context.timeout_ms()) => result,
-        }
-    }
-}
-
-pub type OutboundMap = HashMap<String, Arc<dyn Outbound>>;
-
-pub fn build_outbounds(
-    configs: &[OutboundConfig],
-    telemetry: Option<Arc<Telemetry>>,
-) -> anyhow::Result<OutboundMap> {
-    let mut outbounds: OutboundMap = HashMap::new();
-    for config in configs {
-        if matches!(config, OutboundConfig::Group { .. }) {
-            continue;
-        }
-        let outbound = build_leaf_outbound(config)?;
-        insert_leaf(&mut outbounds, config.name(), outbound)?;
-    }
-
-    attach_groups(configs, &mut outbounds, telemetry)?;
-    Ok(outbounds)
-}
-
-fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbound>> {
-    let outbound: Arc<dyn Outbound> = match config {
-        OutboundConfig::Direct { name } => Arc::new(DirectOutbound::new(name.clone())),
-        OutboundConfig::Reject { name } => Arc::new(RejectOutbound::new(name.clone())),
-        OutboundConfig::Http {
-            name,
-            server,
-            port,
-            username,
-            password,
-        } => Arc::new(HttpOutbound::new(
-            name.clone(),
-            server.clone(),
-            *port,
-            username.clone(),
-            password.clone(),
-        )),
-        OutboundConfig::Socks5 {
-            name,
-            server,
-            port,
-            username,
-            password,
-        } => Arc::new(Socks5Outbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            username: username.clone(),
-            password: password.clone(),
-            udp_sessions: TokioMutex::new(Socks5UdpPool::default()),
-        }),
-        OutboundConfig::Shadowsocks {
-            name,
-            server,
-            port,
-            method,
-            password,
-            plugin,
-        } => Arc::new(ShadowsocksOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            method: method.clone(),
-            password: password.clone(),
-            plugin: plugin.clone(),
-            udp_sessions: TokioMutex::new(ShadowsocksUdpPool::default()),
-        }),
-        OutboundConfig::Trojan {
-            name,
-            server,
-            port,
-            password,
-            sni,
-            skip_cert_verify,
-            network,
-            ws_path,
-            ws_host,
-            grpc_service_name,
-            transport_headers,
-            alpn,
-        } => Arc::new(TrojanOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            password: password.clone(),
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            network: network.clone(),
-            ws_path: ws_path.clone(),
-            ws_host: ws_host.clone(),
-            grpc_service_name: grpc_service_name.clone(),
-            transport_headers: transport_headers.clone(),
-            alpn: alpn.clone(),
-            udp_sessions: TokioMutex::new(TrojanUdpPool::default()),
-        }),
-        OutboundConfig::Vmess {
-            name,
-            server,
-            port,
-            uuid,
-            cipher,
-            tls,
-            sni,
-            skip_cert_verify,
-            network,
-            ws_path,
-            ws_host,
-            grpc_service_name,
-        } => Arc::new(VmessOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            uuid: uuid.clone(),
-            cipher: cipher.clone(),
-            tls: *tls,
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            network: network.clone(),
-            ws_path: ws_path.clone(),
-            ws_host: ws_host.clone(),
-            grpc_service_name: grpc_service_name.clone(),
-            udp_sessions: TokioMutex::new(VmessUdpPool::default()),
-        }),
-        OutboundConfig::Vless {
-            name,
-            server,
-            port,
-            uuid,
-            flow,
-            security,
-            tls,
-            sni,
-            skip_cert_verify,
-            network,
-            ws_path,
-            ws_host,
-            grpc_service_name,
-            reality_public_key,
-            reality_short_id,
-            reality_fingerprint,
-            reality_spider_x,
-        } => Arc::new(VlessOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            uuid: uuid.clone(),
-            flow: flow.clone(),
-            security: security.clone(),
-            tls: *tls,
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            network: network.clone(),
-            ws_path: ws_path.clone(),
-            ws_host: ws_host.clone(),
-            grpc_service_name: grpc_service_name.clone(),
-            reality_public_key: reality_public_key.clone(),
-            reality_short_id: reality_short_id.clone(),
-            reality_fingerprint: reality_fingerprint.clone(),
-            reality_spider_x: reality_spider_x.clone(),
-            udp_sessions: TokioMutex::new(VlessUdpPool::default()),
-        }),
-        OutboundConfig::Hysteria2 {
-            name,
-            server,
-            port,
-            password,
-            sni,
-            skip_cert_verify,
-            obfs,
-            obfs_password,
-            alpn,
-        } => Arc::new(Hysteria2Outbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            password: password.clone(),
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            obfs: obfs.clone(),
-            obfs_password: obfs_password.clone(),
-            alpn: alpn.clone(),
-            udp_sessions: TokioMutex::new(Hysteria2UdpPool::default()),
-        }),
-        OutboundConfig::Tuic {
-            name,
-            server,
-            port,
-            uuid,
-            password,
-            sni,
-            skip_cert_verify,
-            congestion_control,
-            udp_relay_mode,
-            alpn,
-        } => Arc::new(TuicOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            uuid: uuid.clone(),
-            password: password.clone(),
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            congestion_control: congestion_control.clone(),
-            udp_relay_mode: udp_relay_mode.clone(),
-            alpn: alpn.clone(),
-            udp_sessions: TokioMutex::new(TuicUdpPool::default()),
-        }),
-        OutboundConfig::Naive {
-            name,
-            server,
-            port,
-            username,
-            password,
-            sni,
-            skip_cert_verify,
-            alpn,
-        } => Arc::new(NaiveOutbound::new(
-            name.clone(),
-            server.clone(),
-            *port,
-            username.clone(),
-            password.clone(),
-            sni.clone(),
-            *skip_cert_verify,
-            alpn.clone(),
-        )),
-        OutboundConfig::Ssr {
-            name,
-            server,
-            port,
-            method,
-            password,
-            protocol,
-            obfs,
-            protocol_param,
-            obfs_param,
-        } => Arc::new(SsrOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            method: method.clone(),
-            password: password.clone(),
-            protocol: protocol.clone(),
-            obfs: obfs.clone(),
-            protocol_param: protocol_param.clone(),
-            obfs_param: obfs_param.clone(),
-        }),
-        OutboundConfig::Snell {
-            name,
-            server,
-            port,
-            psk,
-            method,
-            version,
-            obfs,
-            obfs_host,
-            reuse,
-        } => Arc::new(SnellOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            psk: psk.clone(),
-            method: method.clone(),
-            version: *version,
-            obfs: obfs.clone(),
-            obfs_host: obfs_host.clone(),
-            reuse: *reuse,
-            v4_pool: Arc::new(TokioMutex::new(SnellV4ConnectionPool::default())),
-        }),
-        OutboundConfig::Hysteria { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
-            name.clone(),
-            "hysteria".to_string(),
-        )),
-        OutboundConfig::AnyTls {
-            name,
-            server,
-            port,
-            password,
-            sni,
-            skip_cert_verify,
-            alpn,
-        } => Arc::new(AnyTlsOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            password: password.clone(),
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            alpn: alpn.clone(),
-        }),
-        OutboundConfig::ShadowTls {
-            name,
-            server,
-            port,
-            password,
-            version,
-            sni,
-            skip_cert_verify,
-        } => Arc::new(ShadowTlsOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            password: password.clone(),
-            version: *version,
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-        }),
-        OutboundConfig::WireGuard {
-            name,
-            server,
-            port,
-            private_key,
-            public_key,
-            preshared_key,
-            ip,
-            ipv6,
-            allowed_ips,
-            reserved,
-            mtu,
-        } => Arc::new(WireGuardOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            private_key: private_key.clone(),
-            public_key: public_key.clone(),
-            preshared_key: preshared_key.clone(),
-            ip: ip.clone(),
-            ipv6: ipv6.clone(),
-            allowed_ips: allowed_ips.clone(),
-            reserved: reserved.clone(),
-            mtu: mtu.unwrap_or(1420),
-        }),
-        OutboundConfig::Ssh {
-            name,
-            server,
-            port,
-            username,
-            password,
-            private_key,
-            private_key_passphrase,
-        } => Arc::new(SshOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            username: username.clone(),
-            password: password.clone(),
-            private_key: private_key.clone(),
-            private_key_passphrase: private_key_passphrase.clone(),
-        }),
-        OutboundConfig::Mieru { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
-            name.clone(),
-            "mieru".to_string(),
-        )),
-        OutboundConfig::Juicity { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
-            name.clone(),
-            "juicity".to_string(),
-        )),
-        OutboundConfig::Masque { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
-            name.clone(),
-            "masque".to_string(),
-        )),
-        OutboundConfig::OpenVpn { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
-            name.clone(),
-            "openvpn".to_string(),
-        )),
-        OutboundConfig::Unknown { name, protocol, .. } => Arc::new(
-            UnsupportedProtocolOutbound::new(name.clone(), protocol.clone()),
-        ),
-        OutboundConfig::Group { name, .. } => {
-            return Err(anyhow!("group {name} must be built after leaf outbounds"));
-        }
-    };
-    Ok(outbound)
-}
 
 struct AnyTlsOutbound {
     name: String,
@@ -554,6 +128,10 @@ impl Outbound for AnyTlsOutbound {
 
     fn kind(&self) -> &'static str {
         "anytls"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::tcp_only("anytls udp is not supported")
     }
 
     async fn connect(
@@ -656,6 +234,14 @@ impl Outbound for ShadowTlsOutbound {
 
     fn kind(&self) -> &'static str {
         "shadowtls"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        if self.version.unwrap_or(3) == 3 {
+            OutboundCapability::tcp_only("shadowtls udp is not supported")
+        } else {
+            OutboundCapability::unsupported("only shadowtls v3 is supported")
+        }
     }
 
     async fn connect(
@@ -1251,6 +837,44 @@ impl Outbound for SsrOutbound {
 
     fn kind(&self) -> &'static str {
         "ssr"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        let mut limitations = Vec::new();
+        let method_supported = SsrCipher::from_method(&self.method).is_ok();
+        let protocol = ssr_protocol_kind(&self.protocol);
+        let protocol_supported = protocol.is_ok();
+        let obfs_supported = ssr_obfs_mode(&self.obfs).is_ok();
+        if !method_supported {
+            limitations.push(format!("unsupported ssr method {}", self.method));
+        }
+        if !protocol_supported {
+            limitations.push(format!("unsupported ssr protocol {}", self.protocol));
+        }
+        if !obfs_supported {
+            limitations.push(format!("unsupported ssr obfs {}", self.obfs));
+        }
+        let udp_supported = method_supported
+            && obfs_supported
+            && protocol
+                .as_ref()
+                .is_ok_and(|value| *value != SsrProtocolKind::AuthSha1V4);
+        if protocol
+            .as_ref()
+            .is_ok_and(|value| *value == SsrProtocolKind::AuthSha1V4)
+        {
+            limitations.push("ssr auth_sha1_v4 udp is not supported".to_string());
+        }
+        OutboundCapability {
+            tcp_supported: method_supported && protocol_supported && obfs_supported,
+            udp_supported,
+            udp_mode: Some(if udp_supported {
+                "ssr-datagram-stream-cipher".to_string()
+            } else {
+                "ssr-authenticated-tcp".to_string()
+            }),
+            limitations,
+        }
     }
 
     async fn connect(
@@ -2555,284 +2179,6 @@ fn ssr_hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
     outer.finalize().into()
 }
 
-struct WireGuardOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    private_key: String,
-    public_key: String,
-    preshared_key: Option<String>,
-    ip: Vec<String>,
-    ipv6: Vec<String>,
-    allowed_ips: Vec<String>,
-    reserved: Vec<u8>,
-    mtu: u16,
-}
-
-#[async_trait]
-impl Outbound for WireGuardOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "wireguard"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        if self.private_key.is_empty() {
-            return Err(anyhow!("wireguard private_key is empty"));
-        }
-        if self.public_key.is_empty() {
-            return Err(anyhow!("wireguard public_key is empty"));
-        }
-        if self.ip.is_empty() && self.ipv6.is_empty() {
-            return Err(anyhow!("wireguard ip/ipv6 address is required"));
-        }
-        if !self.reserved.is_empty() && self.reserved.len() != 3 {
-            return Err(anyhow!("wireguard reserved must be exactly 3 bytes"));
-        }
-        let mtu = self.mtu as usize;
-        if mtu == 0 {
-            return Err(anyhow!("wireguard mtu must be greater than zero"));
-        }
-        let mtu = mtu.min(65535);
-        let allowed_nets = self
-            .allowed_ips
-            .iter()
-            .map(|item| {
-                item.parse::<IpNet>()
-                    .map_err(|_| anyhow!("wireguard allowed_ips value '{item}' is invalid"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        if let Ok(destination_ip) = destination.host.parse::<std::net::IpAddr>() {
-            if !allowed_nets.is_empty()
-                && !allowed_nets
-                    .iter()
-                    .any(|item| item.contains(&destination_ip))
-            {
-                return Err(anyhow!(
-                    "wireguard destination {destination_ip} is not covered by allowed_ips"
-                ));
-            }
-        }
-        let source_ipv4 = self
-            .ip
-            .iter()
-            .find_map(|item| {
-                item.parse::<std::net::Ipv4Addr>().ok().or_else(|| {
-                    item.parse::<IpNet>().ok().and_then(|net| match net.addr() {
-                        std::net::IpAddr::V4(addr) => Some(addr),
-                        _ => None,
-                    })
-                })
-            })
-            .unwrap_or(std::net::Ipv4Addr::new(198, 18, 0, 1));
-        let destination_ipv4 = destination
-            .host
-            .parse::<std::net::Ipv4Addr>()
-            .ok()
-            .map(|address| address.octets())
-            .unwrap_or([0; 4]);
-
-        let private_key_bytes = base64_decode_key(&self.private_key)
-            .map_err(|_| anyhow!("invalid wireguard private_key"))?;
-        let public_key_bytes = base64_decode_key(&self.public_key)
-            .map_err(|_| anyhow!("invalid wireguard public_key"))?;
-
-        if private_key_bytes.len() != 32 {
-            return Err(anyhow!("wireguard private_key must be 32 bytes"));
-        }
-        if public_key_bytes.len() != 32 {
-            return Err(anyhow!("wireguard public_key must be 32 bytes"));
-        }
-
-        let mut private_key_arr = [0u8; 32];
-        private_key_arr.copy_from_slice(&private_key_bytes);
-        let static_private = boringtun::x25519::StaticSecret::from(private_key_arr);
-
-        let mut public_key_arr = [0u8; 32];
-        public_key_arr.copy_from_slice(&public_key_bytes);
-        let peer_public = boringtun::x25519::PublicKey::from(public_key_arr);
-
-        let psk = self.preshared_key.as_ref().and_then(|psk| {
-            base64_decode_key(psk).ok().and_then(|bytes| {
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    Some(arr)
-                } else {
-                    None
-                }
-            })
-        });
-
-        let mut tunnel =
-            boringtun::noise::Tunn::new(static_private, peer_public, psk, None, 0, None);
-
-        let addrs: Vec<std::net::SocketAddr> =
-            tokio::net::lookup_host(format!("{}:{}", self.server, self.port))
-                .await?
-                .collect();
-        let addr = addrs.into_iter().next().ok_or_else(|| {
-            anyhow!(
-                "wireguard server {}:{} did not resolve",
-                self.server,
-                self.port
-            )
-        })?;
-
-        let udp = Arc::new(
-            tokio::net::UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| anyhow!("wireguard UDP bind failed: {e}"))?,
-        );
-        udp.connect(addr)
-            .await
-            .map_err(|e| anyhow!("wireguard UDP connect failed: {e}"))?;
-
-        let mut init_buf = vec![0u8; 2048];
-        match tunnel.encapsulate(&[], &mut init_buf) {
-            boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                udp.send(data)
-                    .await
-                    .map_err(|e| anyhow!("wireguard init send failed: {e}"))?;
-            }
-            boringtun::noise::TunnResult::Done => {}
-            _ => {}
-        }
-
-        let mut resp_buf = vec![0u8; 2048];
-        let mut decap_buf = vec![0u8; 2048];
-        match tokio::time::timeout(Duration::from_millis(timeout_ms), udp.recv(&mut resp_buf)).await
-        {
-            Ok(Ok(len)) => match tunnel.decapsulate(None, &resp_buf[..len], &mut decap_buf) {
-                boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                    udp.send(data)
-                        .await
-                        .map_err(|e| anyhow!("wireguard response send failed: {e}"))?;
-                }
-                boringtun::noise::TunnResult::Done => {}
-                _ => {}
-            },
-            Ok(Err(e)) => return Err(anyhow!("wireguard recv failed: {e}")),
-            Err(_) => {
-                return Err(anyhow!(
-                    "wireguard handshake timed out after {}ms",
-                    timeout_ms
-                ))
-            }
-        }
-
-        let tunnel = Arc::new(tokio::sync::Mutex::new(tunnel));
-        let (tunnel_side, app_side) = tokio::io::duplex(64 * 1024);
-        let (mut app_read, mut app_write) = tokio::io::split(tunnel_side);
-        let mtu_payload = mtu.saturating_sub(40).max(1);
-        let mtu_capacity = mtu.saturating_add(64);
-
-        let udp_recv = udp.clone();
-        let tunnel_recv = tunnel.clone();
-        tokio::spawn(async move {
-            let mut recv_buf = vec![0u8; 2048];
-            let mut decap_buf = vec![0u8; mtu_capacity];
-            loop {
-                match tokio::time::timeout(Duration::from_secs(2), udp_recv.recv(&mut recv_buf))
-                    .await
-                {
-                    Ok(Ok(len)) => {
-                        let mut tunnel = tunnel_recv.lock().await;
-                        match tunnel.decapsulate(None, &recv_buf[..len], &mut decap_buf) {
-                            boringtun::noise::TunnResult::WriteToTunnelV4(data, _) => {
-                                if data.len() >= 20 {
-                                    let _ = app_write.write_all(&data[20..]).await;
-                                }
-                            }
-                            boringtun::noise::TunnResult::WriteToTunnelV6(data, _) => {
-                                if data.len() >= 40 {
-                                    let _ = app_write.write_all(&data[40..]).await;
-                                }
-                            }
-                            boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                                let _ = udp_recv.send(data).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        let mut empty = Vec::new();
-                        let mut tunnel = tunnel_recv.lock().await;
-                        match tunnel.decapsulate(None, &[], &mut empty) {
-                            boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                                let _ = udp_recv.send(data).await;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                }
-            }
-        });
-
-        let udp_send = udp.clone();
-        let tunnel_send = tunnel.clone();
-        let source_ipv4 = source_ipv4.octets();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; mtu_payload.max(1)];
-            loop {
-                match app_read.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut offset = 0usize;
-                        while offset < n {
-                            let chunk_len = (n - offset).min(mtu_payload);
-                            let mut pkt = vec![0u8; 20 + chunk_len];
-                            pkt[0] = 0x45;
-                            pkt[1] = 0;
-                            let total_len = (20 + chunk_len) as u16;
-                            pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
-                            pkt[8] = 64;
-                            pkt[9] = 6;
-                            pkt[12..16].copy_from_slice(&source_ipv4);
-                            pkt[16..20].copy_from_slice(&destination_ipv4);
-                            pkt[20..20 + chunk_len]
-                                .copy_from_slice(&buf[offset..offset + chunk_len]);
-                            let mut encap_buf = vec![0u8; mtu_capacity];
-                            let mut tunnel = tunnel_send.lock().await;
-                            match tunnel.encapsulate(&pkt, &mut encap_buf) {
-                                boringtun::noise::TunnResult::WriteToNetwork(data) => {
-                                    let _ = udp_send.send(data).await;
-                                }
-                                _ => {}
-                            }
-                            offset += chunk_len;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        Ok(Box::new(app_side))
-    }
-}
-
-fn base64_decode_key(value: &str) -> anyhow::Result<Vec<u8>> {
-    use base64::Engine;
-    let trimmed = value.trim();
-    if trimmed.len() == 44 || trimmed.len() == 43 {
-        base64::engine::general_purpose::STANDARD
-            .decode(trimmed)
-            .map_err(|e| anyhow!("base64 decode failed: {e}"))
-    } else {
-        Err(anyhow!("invalid key length {}", trimmed.len()))
-    }
-}
-
 struct SnellOutbound {
     name: String,
     server: String,
@@ -3065,6 +2411,92 @@ impl Outbound for SnellOutbound {
 
     fn kind(&self) -> &'static str {
         "snell"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        let mut limitations = Vec::new();
+        let version = self.version.unwrap_or(3);
+        let version_supported = matches!(version, 1..=5);
+        let method = self.method.as_deref().unwrap_or(if version == 1 {
+            "chacha20-ietf-poly1305"
+        } else {
+            "aes-128-gcm"
+        });
+        let method_supported = if version >= 4 {
+            method.eq_ignore_ascii_case("aes-128-gcm")
+        } else {
+            matches!(
+                method.to_ascii_lowercase().as_str(),
+                "aes-128-gcm" | "aes-256-gcm" | "chacha20-ietf-poly1305" | "chacha20-poly1305"
+            )
+        };
+        let obfs = self
+            .obfs
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+        let obfs_supported = obfs
+            .as_deref()
+            .map(|value| {
+                matches!(
+                    value,
+                    "none"
+                        | "off"
+                        | "http"
+                        | "http_simple"
+                        | "http-simple"
+                        | "tls"
+                        | "simple-obfs-tls"
+                        | "obfs-tls"
+                )
+            })
+            .unwrap_or(true);
+        if !version_supported {
+            limitations.push(format!("unsupported snell version {version}"));
+        }
+        if !method_supported {
+            limitations.push(format!("unsupported snell method {method}"));
+        }
+        if !obfs_supported {
+            limitations.push(format!(
+                "unsupported snell obfs {}",
+                obfs.as_deref().unwrap_or_default()
+            ));
+        }
+        let reuse_supported = !self.reuse || matches!(version, 4 | 5);
+        if !reuse_supported {
+            limitations.push("snell connection reuse requires version 4 or 5".to_string());
+        }
+        let udp_supported = version_supported
+            && method_supported
+            && matches!(version, 3..=5)
+            && obfs
+                .as_deref()
+                .map(|value| matches!(value, "none" | "off"))
+                .unwrap_or(true);
+        if version < 3 {
+            limitations.push("snell udp requires version 3, 4, or 5".to_string());
+        } else if !udp_supported && obfs_supported {
+            limitations.push("snell udp over simple-obfs is not supported".to_string());
+        }
+        OutboundCapability {
+            tcp_supported: version_supported
+                && method_supported
+                && obfs_supported
+                && reuse_supported,
+            udp_supported,
+            udp_mode: Some(if udp_supported {
+                if version >= 4 {
+                    "snell-v4-framed-udp-over-tcp".to_string()
+                } else {
+                    "snell-v3-udp-over-tcp".to_string()
+                }
+            } else {
+                "snell-aead-tcp".to_string()
+            }),
+            limitations,
+        }
     }
 
     async fn connect(
@@ -3708,170 +3140,6 @@ where
     Ok(payload)
 }
 
-struct SshOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    username: String,
-    password: Option<String>,
-    private_key: Option<String>,
-    private_key_passphrase: Option<String>,
-}
-
-struct AcceptAnySshServerKey;
-
-impl ssh_client::Handler for AcceptAnySshServerKey {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-}
-
-#[async_trait]
-impl Outbound for SshOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "ssh"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let config = Arc::new(ssh_client::Config {
-            nodelay: true,
-            ..Default::default()
-        });
-        let mut session = timeout(
-            Duration::from_millis(timeout_ms),
-            ssh_client::connect(
-                config,
-                (self.server.as_str(), self.port),
-                AcceptAnySshServerKey,
-            ),
-        )
-        .await
-        .context("ssh connect timed out")?
-        .context("ssh connect failed")?;
-
-        if let Some(private_key) = &self.private_key {
-            let key =
-                russh::keys::load_secret_key(private_key, self.private_key_passphrase.as_deref())
-                    .with_context(|| format!("failed to load ssh private key {private_key}"))?;
-            let hash = session
-                .best_supported_rsa_hash()
-                .await
-                .context("failed to query ssh rsa hash support")?
-                .flatten();
-            let auth = session
-                .authenticate_publickey(
-                    self.username.clone(),
-                    russh::keys::key::PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                )
-                .await
-                .context("ssh publickey authentication failed")?;
-            if !auth.success() {
-                return Err(anyhow!("ssh publickey authentication was rejected"));
-            }
-        } else {
-            let password = self.password.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "ssh outbound {} is missing password or private_key",
-                    self.name
-                )
-            })?;
-            let auth = session
-                .authenticate_password(self.username.clone(), password.to_string())
-                .await
-                .context("ssh password authentication failed")?;
-            if !auth.success() {
-                return Err(anyhow!("ssh password authentication was rejected"));
-            }
-        }
-
-        let channel = timeout(
-            Duration::from_millis(timeout_ms),
-            session.channel_open_direct_tcpip(
-                destination.host.clone(),
-                u32::from(destination.port),
-                "127.0.0.1".to_string(),
-                0u32,
-            ),
-        )
-        .await
-        .context("ssh direct-tcpip open timed out")?
-        .with_context(|| {
-            format!(
-                "ssh direct-tcpip open failed for {}",
-                destination.authority()
-            )
-        })?;
-
-        Ok(Box::new(spawn_ssh_channel_stream(session, channel)))
-    }
-}
-
-fn spawn_ssh_channel_stream(
-    session: ssh_client::Handle<AcceptAnySshServerKey>,
-    mut channel: russh::Channel<ssh_client::Msg>,
-) -> DuplexStream {
-    let (app_side, relay_side) = tokio::io::duplex(64 * 1024);
-    let (mut local_read, mut local_write) = tokio::io::split(relay_side);
-    tokio::spawn(async move {
-        let mut local_closed = false;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            tokio::select! {
-                read = local_read.read(&mut buf), if !local_closed => {
-                    match read {
-                        Ok(0) => {
-                            local_closed = true;
-                            let _ = channel.eof().await;
-                        }
-                        Ok(n) => {
-                            if channel.data(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                message = channel.wait() => {
-                    match message {
-                        Some(ChannelMsg::Data { ref data }) => {
-                            if local_write.write_all(data).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(ChannelMsg::Eof) | None => {
-                            let _ = local_write.shutdown().await;
-                            break;
-                        }
-                        Some(ChannelMsg::WindowAdjusted { .. }) => {}
-                        Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::ExitSignal { .. }) => {
-                            break;
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-        }
-        let _ = channel.close().await;
-        let _ = session
-            .disconnect(Disconnect::ByApplication, "", "English")
-            .await;
-    });
-    app_side
-}
-
 struct Socks5Outbound {
     name: String,
     server: String,
@@ -3897,6 +3165,10 @@ impl Outbound for Socks5Outbound {
 
     fn kind(&self) -> &'static str {
         "socks5"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::tcp_udp("socks5-udp-associate-session-pool")
     }
 
     async fn connect(
@@ -4334,6 +3606,10 @@ impl Outbound for VmessOutbound {
         "vmess"
     }
 
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::tcp_udp("vmess-command-udp-session-pool")
+    }
+
     async fn connect(
         &self,
         destination: &Destination,
@@ -4552,6 +3828,24 @@ impl Outbound for VlessOutbound {
 
     fn kind(&self) -> &'static str {
         "vless"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        if self
+            .security
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("reality"))
+            && self
+                .reality_public_key
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            OutboundCapability::unsupported("VLESS Reality public key is required")
+        } else {
+            OutboundCapability::tcp_udp("vless-command-udp-session-pool")
+        }
     }
 
     async fn connect(
@@ -4849,6 +4143,17 @@ impl Outbound for Hysteria2Outbound {
 
     fn kind(&self) -> &'static str {
         "hysteria2"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        match hysteria2_obfs_config(self.obfs.as_deref(), self.obfs_password.as_deref()) {
+            Ok(config) => OutboundCapability::tcp_udp(match config.map(|item| item.kind) {
+                Some(Hysteria2ObfsKind::Salamander) => "quic-datagram-salamander-session-pool",
+                Some(Hysteria2ObfsKind::Gecko) => "quic-datagram-gecko-session-pool",
+                None => "quic-datagram-session-pool",
+            }),
+            Err(error) => OutboundCapability::unsupported(error.to_string()),
+        }
     }
 
     async fn connect(
@@ -5763,6 +5068,13 @@ impl Outbound for TuicOutbound {
         "tuic"
     }
 
+    fn capability(&self) -> OutboundCapability {
+        OutboundCapability::tcp_udp(format!(
+            "{}-session-pool",
+            self.udp_relay_mode.as_deref().unwrap_or("native")
+        ))
+    }
+
     async fn connect(
         &self,
         destination: &Destination,
@@ -6299,6 +5611,19 @@ impl Outbound for TrojanOutbound {
         "trojan"
     }
 
+    fn capability(&self) -> OutboundCapability {
+        let network = self
+            .network
+            .as_deref()
+            .unwrap_or("tcp")
+            .trim()
+            .to_ascii_lowercase();
+        match trojan_alpn_protocols(&network, &self.alpn) {
+            Ok(_) => OutboundCapability::tcp_udp("trojan-udp-associate-stream-pool"),
+            Err(error) => OutboundCapability::unsupported(error.to_string()),
+        }
+    }
+
     async fn connect(
         &self,
         destination: &Destination,
@@ -6493,6 +5818,17 @@ impl Outbound for ShadowsocksOutbound {
 
     fn kind(&self) -> &'static str {
         "shadowsocks"
+    }
+
+    fn capability(&self) -> OutboundCapability {
+        if let Err(error) = SsCipher::from_method(&self.method) {
+            return OutboundCapability::unsupported(error.to_string());
+        }
+        if self.plugin.is_some() {
+            OutboundCapability::tcp_only("Shadowsocks plugin transports do not provide UDP relay")
+        } else {
+            OutboundCapability::tcp_udp("shadowsocks-aead-udp-session-pool")
+        }
     }
 
     async fn connect(
@@ -10720,6 +10056,10 @@ mod tests {
             "test"
         }
 
+        fn capability(&self) -> OutboundCapability {
+            OutboundCapability::tcp_only("test outbound")
+        }
+
         async fn connect(
             &self,
             _destination: &Destination,
@@ -10737,6 +10077,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "test"
+        }
+
+        fn capability(&self) -> OutboundCapability {
+            OutboundCapability::tcp_only("test outbound")
         }
 
         async fn connect(
