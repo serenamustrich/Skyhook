@@ -1,0 +1,32 @@
+.build/
+.swiftpm/
+.mavis/
+DerivedData/
+*.xcuserdata/
+*.xcuserstate
+.DS_Store
+
+# User data - NEVER commit these
+*.env
+*.key
+*.pem
+*.p12
+*.keystore
+*.keychain
+Application Support/
+supercore-subscriptions/
+supercore-runtime-*.yaml
+supercore-daemon-runtime.yaml
+supercore-smart-rules.json
+supercore-geo/
+proxy-snapshot.json
+
+# Rust build artifacts
+Supercore/target/
+
+# Generated docs
+dist/
+
+# Logs
+*.log
+/logs/
