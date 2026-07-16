@@ -96,36 +96,51 @@ where
     tokio::spawn(async move {
         let mut buf = [0u8; 16 * 1024];
         loop {
-            match local_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = write_websocket_close_frame(&mut remote_write).await;
-                    let _ = remote_write.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    if write_websocket_binary_frame(&mut remote_write, &buf[..n])
-                        .await
-                        .is_err()
-                    {
-                        break;
+            tokio::select! {
+                local = local_read.read(&mut buf) => {
+                    match local {
+                        Ok(0) => {
+                            let _ = write_websocket_close_frame(&mut remote_write, &[]).await;
+                            let _ = remote_write.shutdown().await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if write_websocket_binary_frame(&mut remote_write, &buf[..n])
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
                     }
                 }
-                Err(_) => break,
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        loop {
-            match read_websocket_frame(&mut remote_read).await {
-                Ok(Some(frame)) => {
-                    if local_write.write_all(&frame).await.is_err() {
-                        break;
+                remote = read_websocket_message(&mut remote_read) => {
+                    match remote {
+                        Ok(Some(WebSocketMessage::Data(frame))) => {
+                            if local_write.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Some(WebSocketMessage::Ping(payload))) => {
+                            if write_websocket_frame(&mut remote_write, 0xA, &payload)
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(Some(WebSocketMessage::Pong)) => {}
+                        Ok(Some(WebSocketMessage::Close(payload))) => {
+                            let _ = write_websocket_close_frame(&mut remote_write, &payload).await;
+                            let _ = local_write.shutdown().await;
+                            break;
+                        }
+                        Ok(None) | Err(_) => {
+                            let _ = local_write.shutdown().await;
+                            break;
+                        }
                     }
-                }
-                Ok(None) | Err(_) => {
-                    let _ = local_write.shutdown().await;
-                    break;
                 }
             }
         }
@@ -154,11 +169,11 @@ where
     write_websocket_frame(writer, 0x2, payload).await
 }
 
-async fn write_websocket_close_frame<W>(writer: &mut W) -> anyhow::Result<()>
+async fn write_websocket_close_frame<W>(writer: &mut W, payload: &[u8]) -> anyhow::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    write_websocket_frame(writer, 0x8, &[]).await
+    write_websocket_frame(writer, 0x8, payload).await
 }
 
 pub(crate) async fn write_websocket_frame<W>(
@@ -193,7 +208,28 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn read_websocket_frame<R>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_websocket_message(reader).await? {
+            Some(WebSocketMessage::Data(payload)) => return Ok(Some(payload)),
+            Some(WebSocketMessage::Close(_)) | None => return Ok(None),
+            Some(WebSocketMessage::Ping(_)) | Some(WebSocketMessage::Pong) => {}
+        }
+    }
+}
+
+enum WebSocketMessage {
+    Data(Vec<u8>),
+    Ping(Vec<u8>),
+    Pong,
+    Close(Vec<u8>),
+}
+
+async fn read_websocket_message<R>(reader: &mut R) -> anyhow::Result<Option<WebSocketMessage>>
 where
     R: AsyncRead + Unpin,
 {
@@ -228,9 +264,10 @@ where
         }
     }
     match opcode {
-        0x0..=0x2 => Ok(Some(payload)),
-        0x8 => Ok(None),
-        0x9 | 0xA => Ok(Some(Vec::new())),
+        0x0..=0x2 => Ok(Some(WebSocketMessage::Data(payload))),
+        0x8 => Ok(Some(WebSocketMessage::Close(payload))),
+        0x9 => Ok(Some(WebSocketMessage::Ping(payload))),
+        0xA => Ok(Some(WebSocketMessage::Pong)),
         other => Err(anyhow!("unsupported websocket opcode {other}")),
     }
 }

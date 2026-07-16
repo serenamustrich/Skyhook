@@ -33,7 +33,9 @@ use super::{
     transports::{
         connect_tcp, perform_websocket_handshake, spawn_websocket_stream, tls_client_config,
     },
-    udp::{resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    udp::{
+        create_bound_udp, resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    },
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -74,11 +76,7 @@ impl ShadowsocksOutbound {
         let mut pool = self.udp_sessions.lock().await;
         if pool.len() < UDP_SESSION_POOL_SIZE {
             let server = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
-            let bind_addr = match server {
-                SocketAddr::V4(_) => "0.0.0.0:0",
-                SocketAddr::V6(_) => "[::]:0",
-            };
-            let udp = UdpSocket::bind(bind_addr).await.with_context(|| {
+            let udp = create_bound_udp(server).with_context(|| {
                 format!(
                     "failed to bind udp socket for shadowsocks outbound {}",
                     self.name

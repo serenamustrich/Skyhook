@@ -30,6 +30,7 @@ h3-quinn = "0.0.10"
 hkdf = "0.12"
 http = "1"
 ipnet = { version = "2", features = ["serde"] }
+libc = "0.2"
 maxminddb = "0.28.1"
 md-5 = "0.10"
 quinn = "0.11.9"
@@ -43,6 +44,7 @@ serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

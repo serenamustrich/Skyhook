@@ -8,7 +8,10 @@ use tokio::{
     time::timeout,
 };
 
-use super::tls::NoCertificateVerification;
+use crate::outbound::context::active_dial_context;
+
+use super::{order_addresses, tls::NoCertificateVerification};
+use crate::outbound::udp::create_bound_std_udp;
 
 pub(crate) fn quic_client_config(
     skip_cert_verify: bool,
@@ -44,6 +47,9 @@ pub(crate) fn quic_client_config(
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+    if let Some(context) = active_dial_context() {
+        transport_config.keep_alive_interval(context.keepalive);
+    }
     client_config.transport_config(Arc::new(transport_config));
     Ok(client_config)
 }
@@ -53,21 +59,45 @@ pub(crate) async fn resolve_quic_remote(
     server: &str,
     port: u16,
 ) -> anyhow::Result<SocketAddr> {
-    lookup_host((server, port))
-        .await
-        .with_context(|| format!("failed to resolve {protocol} server {server}:{port}"))?
+    let active = active_dial_context();
+    let timeout_budget = active
+        .as_ref()
+        .map(|context| context.remaining_timeout())
+        .unwrap_or_else(|| Duration::from_secs(10));
+    if timeout_budget.is_zero() {
+        return Err(anyhow!("{protocol} resolve deadline expired"));
+    }
+    let cancellation = active
+        .as_ref()
+        .map(|context| context.cancellation.clone())
+        .unwrap_or_default();
+    let strategy = active
+        .as_ref()
+        .map(|context| context.ip_version)
+        .unwrap_or_default();
+    let resolved = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("{protocol} resolve cancelled")),
+        result = timeout(timeout_budget, lookup_host((server, port))) => {
+            result
+                .with_context(|| format!("{protocol} resolve timed out"))?
+                .with_context(|| format!("failed to resolve {protocol} server {server}:{port}"))?
+                .collect::<Vec<_>>()
+        }
+    };
+    order_addresses(resolved, strategy)
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("{protocol} server {server}:{port} did not resolve"))
 }
 
-pub(crate) fn quic_bind_addr(remote: SocketAddr) -> SocketAddr {
-    if remote.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    }
-    .parse()
-    .expect("valid QUIC bind address")
+pub(crate) fn create_quic_endpoint(remote: SocketAddr) -> anyhow::Result<quinn::Endpoint> {
+    quinn::Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        create_bound_std_udp(remote)?,
+        Arc::new(quinn::TokioRuntime),
+    )
+    .context("failed to create QUIC endpoint")
 }
 
 pub(crate) async fn connect_quic_endpoint(
@@ -79,13 +109,23 @@ pub(crate) async fn connect_quic_endpoint(
     protocol: &str,
 ) -> anyhow::Result<(quinn::Endpoint, quinn::Connection)> {
     endpoint.set_default_client_config(client_config);
-    let connection = timeout(
-        Duration::from_millis(timeout_ms),
-        endpoint.connect(remote, server_name)?,
-    )
-    .await
-    .with_context(|| format!("{protocol} quic connect timed out"))?
-    .with_context(|| format!("{protocol} quic connect failed"))?;
+    let active = active_dial_context();
+    let timeout_budget = active
+        .as_ref()
+        .map(|context| Duration::from_millis(timeout_ms).min(context.remaining_timeout()))
+        .unwrap_or_else(|| Duration::from_millis(timeout_ms));
+    let cancellation = active
+        .as_ref()
+        .map(|context| context.cancellation.clone())
+        .unwrap_or_default();
+    let connection = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("{protocol} quic connect cancelled")),
+        result = timeout(timeout_budget, endpoint.connect(remote, server_name)?) => {
+            result
+                .with_context(|| format!("{protocol} quic connect timed out"))?
+                .with_context(|| format!("{protocol} quic connect failed"))?
+        }
+    };
     Ok((endpoint, connection))
 }
 

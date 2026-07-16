@@ -1,6 +1,5 @@
 use std::{
     io::Cursor,
-    net::SocketAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,7 +13,6 @@ use md5::{Digest, Md5};
 use sha1::Sha1;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
-    net::UdpSocket,
     time::timeout,
 };
 
@@ -27,7 +25,7 @@ use super::{
     },
     target::{encode_socks5_destination, parse_socks5_destination_prefix},
     transports::connect_tcp,
-    udp::resolve_udp_socket_addr,
+    udp::{create_bound_udp, resolve_udp_socket_addr},
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -230,13 +228,7 @@ impl Outbound for SsrOutbound {
         packet.extend_from_slice(&plaintext);
 
         let server = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
-        let bind_addr = match server {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
-        };
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .context("failed to bind SSR UDP socket")?;
+        let socket = create_bound_udp(server).context("failed to bind SSR UDP socket")?;
         let exchange = async {
             socket
                 .send_to(&packet, server)

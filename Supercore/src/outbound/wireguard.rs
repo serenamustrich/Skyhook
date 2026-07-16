@@ -7,7 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::routing::Destination;
 
-use super::{BoxedStream, Outbound, OutboundCapability};
+use super::{
+    udp::{create_bound_udp, resolve_udp_socket_addr},
+    BoxedStream, Outbound, OutboundCapability,
+};
 
 pub(super) struct WireGuardOutbound {
     name: String,
@@ -168,20 +171,9 @@ impl Outbound for WireGuardOutbound {
 
         let mut tunnel =
             boringtun::noise::Tunn::new(static_private, peer_public, psk, None, 0, None);
-        let addrs: Vec<std::net::SocketAddr> =
-            tokio::net::lookup_host(format!("{}:{}", self.server, self.port))
-                .await?
-                .collect();
-        let addr = addrs.into_iter().next().ok_or_else(|| {
-            anyhow!(
-                "wireguard server {}:{} did not resolve",
-                self.server,
-                self.port
-            )
-        })?;
+        let addr = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
         let udp = Arc::new(
-            tokio::net::UdpSocket::bind("0.0.0.0:0")
-                .await
+            create_bound_udp(addr)
                 .map_err(|error| anyhow!("wireguard UDP bind failed: {error}"))?,
         );
         udp.connect(addr)

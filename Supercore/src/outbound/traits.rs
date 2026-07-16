@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::routing::Destination;
 
 use super::{
-    context::DialContext,
+    context::{scope_dial_context, DialContext},
     error::{contextualize_error, OutboundError, OutboundErrorKind},
 };
 
@@ -66,6 +66,23 @@ pub trait Outbound: Send + Sync {
     ) -> anyhow::Result<BoxedStream>;
 
     async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
+        let remaining = context.remaining_timeout();
+        if remaining.is_zero() {
+            return Err(OutboundError::new(
+                OutboundErrorKind::Timeout,
+                "connect",
+                format!(
+                    "dial {} exceeded its deadline",
+                    context.destination.authority()
+                ),
+            )
+            .for_protocol(self.kind())
+            .for_node(self.name())
+            .for_destination(context.destination.authority())
+            .with_trace_id(context.trace_id.clone())
+            .into());
+        }
+
         tokio::select! {
             _ = context.cancellation.cancelled() => {
                 Err(OutboundError::new(
@@ -79,17 +96,35 @@ pub trait Outbound: Send + Sync {
                 .with_trace_id(context.trace_id.clone())
                 .into())
             }
-            result = self.connect(&context.destination, context.timeout_ms()) => {
-                result.map_err(|error| {
-                    contextualize_error(
-                        error,
+            result = tokio::time::timeout(
+                remaining,
+                scope_dial_context(
+                    context,
+                    self.connect(&context.destination, duration_millis(remaining)),
+                ),
+            ) => {
+                match result {
+                    Ok(result) => result.map_err(|error| {
+                        contextualize_error(
+                            error,
+                            "connect",
+                            self.kind(),
+                            self.name(),
+                            &context.destination.authority(),
+                            &context.trace_id,
+                        )
+                    }),
+                    Err(_) => Err(OutboundError::new(
+                        OutboundErrorKind::Timeout,
                         "connect",
-                        self.kind(),
-                        self.name(),
-                        &context.destination.authority(),
-                        &context.trace_id,
+                        format!("dial {} exceeded its deadline", context.destination.authority()),
                     )
-                })
+                    .for_protocol(self.kind())
+                    .for_node(self.name())
+                    .for_destination(context.destination.authority())
+                    .with_trace_id(context.trace_id.clone())
+                    .into()),
+                }
             },
         }
     }
@@ -115,6 +150,23 @@ pub trait Outbound: Send + Sync {
         context: &DialContext,
         payload: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        let remaining = context.remaining_timeout();
+        if remaining.is_zero() {
+            return Err(OutboundError::new(
+                OutboundErrorKind::Timeout,
+                "udp_exchange",
+                format!(
+                    "UDP exchange with {} exceeded its deadline",
+                    context.destination.authority()
+                ),
+            )
+            .for_protocol(self.kind())
+            .for_node(self.name())
+            .for_destination(context.destination.authority())
+            .with_trace_id(context.trace_id.clone())
+            .into());
+        }
+
         tokio::select! {
             _ = context.cancellation.cancelled() => {
                 Err(OutboundError::new(
@@ -128,20 +180,42 @@ pub trait Outbound: Send + Sync {
                 .with_trace_id(context.trace_id.clone())
                 .into())
             }
-            result = self.udp_exchange(&context.destination, payload, context.timeout_ms()) => {
-                result.map_err(|error| {
-                    contextualize_error(
-                        error,
+            result = tokio::time::timeout(
+                remaining,
+                scope_dial_context(
+                    context,
+                    self.udp_exchange(&context.destination, payload, duration_millis(remaining)),
+                ),
+            ) => {
+                match result {
+                    Ok(result) => result.map_err(|error| {
+                        contextualize_error(
+                            error,
+                            "udp_exchange",
+                            self.kind(),
+                            self.name(),
+                            &context.destination.authority(),
+                            &context.trace_id,
+                        )
+                    }),
+                    Err(_) => Err(OutboundError::new(
+                        OutboundErrorKind::Timeout,
                         "udp_exchange",
-                        self.kind(),
-                        self.name(),
-                        &context.destination.authority(),
-                        &context.trace_id,
+                        format!("UDP exchange with {} exceeded its deadline", context.destination.authority()),
                     )
-                })
+                    .for_protocol(self.kind())
+                    .for_node(self.name())
+                    .for_destination(context.destination.authority())
+                    .with_trace_id(context.trace_id.clone())
+                    .into()),
+                }
             },
         }
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().clamp(1, u128::from(u64::MAX)) as u64
 }
 
 pub type OutboundMap = HashMap<String, Arc<dyn Outbound>>;

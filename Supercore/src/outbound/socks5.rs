@@ -14,7 +14,9 @@ use crate::routing::Destination;
 use super::{
     target::{encode_socks5_destination, parse_socks5_destination_prefix},
     transports::connect_tcp,
-    udp::{resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    udp::{
+        create_bound_udp, resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    },
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -90,12 +92,7 @@ impl Socks5Outbound {
             bound.host.as_str()
         };
         let relay = resolve_udp_socket_addr(relay_host, bound.port, timeout_ms).await?;
-        let bind_addr = if relay.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let udp = UdpSocket::bind(bind_addr).await?;
+        let udp = create_bound_udp(relay)?;
         Ok(Socks5UdpSession {
             _control: stream,
             udp,

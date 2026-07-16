@@ -2,11 +2,15 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::time::timeout;
 
 use crate::routing::Destination;
 
-use super::{transports::connect_tcp, BoxedStream, Outbound, OutboundCapability};
+use super::{
+    transports::connect_tcp,
+    udp::{create_bound_udp, resolve_udp_socket_addr},
+    BoxedStream, Outbound, OutboundCapability,
+};
 
 pub(crate) struct DirectOutbound {
     name: String,
@@ -48,18 +52,15 @@ impl Outbound for DirectOutbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        let bind_addr = if destination.host.parse::<std::net::Ipv6Addr>().is_ok() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = UdpSocket::bind(bind_addr).await.with_context(|| {
+        let target = resolve_udp_socket_addr(&destination.host, destination.port, timeout_ms)
+            .await
+            .with_context(|| format!("failed to resolve {}", destination.authority()))?;
+        let socket = create_bound_udp(target).with_context(|| {
             format!("failed to bind udp socket for {}", destination.authority())
         })?;
-        let target = destination_socket_addr(destination);
         timeout(
             Duration::from_millis(timeout_ms),
-            socket.send_to(payload, target.as_str()),
+            socket.send_to(payload, target),
         )
         .await
         .context("udp send timed out")?
@@ -79,13 +80,5 @@ impl Outbound for DirectOutbound {
         })?;
         buf.truncate(len);
         Ok(buf)
-    }
-}
-
-fn destination_socket_addr(destination: &Destination) -> String {
-    if destination.host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{}]:{}", destination.host, destination.port)
-    } else {
-        destination.authority()
     }
 }

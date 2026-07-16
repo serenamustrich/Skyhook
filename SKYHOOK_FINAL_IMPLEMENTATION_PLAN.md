@@ -8,7 +8,7 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.5（按 2026-07-17 `a7047a2` 基线及 `NEXT-007` 已验证工作区重新核对）
+> 计划版本：v1.6（按 2026-07-17 `f556713` 基线及 `NEXT-008A` 已验证工作区重新核对）
 >
 > 当前文档状态：`EXECUTING`。M1 正按本文档直接实施。
 >
@@ -148,6 +148,7 @@
 - `09ff4a6 Core: isolate Shadowsocks protocol families`
 - `94bd50a Core: isolate Trojan VMess and VLESS`
 - `a7047a2 Core: isolate QUIC protocol runtimes`
+- `f556713 Core: minimize outbound module root`
 
 已经完成的基础：
 
@@ -307,9 +308,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `a7047a2` 干净工作区上重新核对：
+2026-07-17 在 `f556713` 基线和当前 `NEXT-008A` 工作区上重新核对：
 
-- 当前分支为 `main`，工作区干净，已提交基线停在 `a7047a2`。
+- 当前分支为 `main`，已提交基线停在 `f556713`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -742,6 +743,23 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
    - cancellation/deadline 必须传播到 DNS、connect、TLS、协议握手和 relay。
    - 补齐 Happy Eyeballs、IP preference、interface bind、TFO/MPTCP 能力边界。
    - 完成 bounded UDP association、idle eviction、backpressure 和流量统计。
+   - [x] `NEXT-008A`：公共拨号上下文和 socket 基础。
+     - `connect_context` 和 `udp_exchange_context` 使用总 deadline，不再给每个阶段重新
+       分配完整 timeout。
+     - DNS、TCP、UDP 和 QUIC 共享 cancellation、IP version strategy、网卡绑定和本地
+       bind address。
+     - TCP 使用 250ms staggered Happy Eyeballs、地址去重、源族校验、keepalive 和
+       macOS TFO socket option。
+     - UDP/QUIC 使用同一 socket 绑定策略；UDP pool 具备容量上限和 idle eviction。
+     - WebSocket 正确处理 ping、pong、close，不再把控制帧交给业务流。
+     - TLS client session cache 已启用。
+     - 验证：`cargo check --all-targets` 无 warning；outbound lib 48 passed。
+   - [ ] `NEXT-008B`：完成 transport edge cases 和连接池。
+     - WebSocket early data/fragmentation、H2 RST/GOAWAY、gRPC cancellation/trailers、
+       HTTPUpgrade 超时，以及 QUIC endpoint/connection pool、MTU/zero-RTT policy。
+   - [ ] `NEXT-008C`：完成 common fields。
+     - IP version、interface-name、routing-mark 平台限制、UDP 开关、证书指纹、TFO、
+       MPTCP、dialer-proxy 和 smux 全部进入正式配置、capability 和拨号路径。
 9. [ ] `NEXT-009`：执行 M1 集中验收。
    - `cargo check --all-targets`。
    - Rust lib、协议定向 integration、config/runtime、plan behavior。

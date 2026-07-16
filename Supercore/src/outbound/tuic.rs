@@ -22,7 +22,8 @@ use crate::routing::Destination;
 
 use super::{
     transports::{
-        connect_quic_endpoint, quic_bind_addr, quic_client_config, random_u16, resolve_quic_remote,
+        connect_quic_endpoint, create_quic_endpoint, quic_client_config, random_u16,
+        resolve_quic_remote,
     },
     udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
@@ -355,8 +356,7 @@ async fn open_tuic_connection(
         return Err(anyhow!("tuic password is empty"));
     }
     let remote = resolve_quic_remote("tuic", server, port).await?;
-    let endpoint = quinn::Endpoint::client(quic_bind_addr(remote))
-        .context("failed to create quic endpoint")?;
+    let endpoint = create_quic_endpoint(remote)?;
     let server_name = sni.unwrap_or(server).to_string();
     let (endpoint, connection) = connect_quic_endpoint(
         endpoint,

@@ -24,10 +24,10 @@ use crate::routing::Destination;
 use super::{
     target::destination_socket_addr,
     transports::{
-        connect_quic_endpoint, encode_quic_varint, quic_bind_addr, quic_client_config, random_u16,
-        random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
+        connect_quic_endpoint, create_quic_endpoint, encode_quic_varint, quic_client_config,
+        random_u16, random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
     },
-    udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    udp::{create_bound_std_udp, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -666,13 +666,9 @@ async fn open_hysteria2_connection(
         return Err(anyhow!("hysteria2 password is empty"));
     }
     let remote = resolve_quic_remote("hysteria2", server, port).await?;
-    let bind = quic_bind_addr(remote);
     let endpoint = if let Some(obfs_config) = obfs_config {
-        let socket =
-            std::net::UdpSocket::bind(bind).context("failed to bind hysteria2 obfs udp socket")?;
-        socket
-            .set_nonblocking(true)
-            .context("failed to set hysteria2 obfs udp socket nonblocking")?;
+        let socket = create_bound_std_udp(remote)
+            .context("failed to bind hysteria2 obfs udp socket")?;
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let inner = runtime
             .wrap_udp_socket(socket)
@@ -690,7 +686,7 @@ async fn open_hysteria2_connection(
         )
         .context("failed to create hysteria2 obfs quic endpoint")?
     } else {
-        quinn::Endpoint::client(bind).context("failed to create quic endpoint")?
+        create_quic_endpoint(remote)?
     };
     let server_name = sni.unwrap_or(server).to_string();
     let (endpoint, connection) = connect_quic_endpoint(

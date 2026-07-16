@@ -1,12 +1,29 @@
 use std::{
+    future::Future,
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::routing::{AppIdentity, Destination};
+
+tokio::task_local! {
+    static ACTIVE_DIAL_CONTEXT: DialContext;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IpVersionStrategy {
+    #[default]
+    Dual,
+    Ipv4,
+    Ipv6,
+    PreferIpv4,
+    PreferIpv6,
+}
 
 #[derive(Debug, Clone)]
 pub struct DialContext {
@@ -14,6 +31,7 @@ pub struct DialContext {
     pub timeout: Duration,
     pub deadline: Instant,
     pub source: Option<SocketAddr>,
+    pub bind_address: Option<SocketAddr>,
     pub inbound_name: Option<String>,
     pub inbound_type: Option<String>,
     pub app_identity: Option<AppIdentity>,
@@ -22,8 +40,11 @@ pub struct DialContext {
     pub subscription_id: Option<String>,
     pub selected_group: Option<String>,
     pub selected_node: Option<String>,
-    pub network_preference: Option<String>,
+    pub ip_version: IpVersionStrategy,
     pub interface_name: Option<String>,
+    pub tcp_fast_open: bool,
+    pub multipath_tcp: bool,
+    pub keepalive: Option<Duration>,
     pub dns_policy: Option<String>,
     pub trace_id: String,
     pub cancellation: CancellationToken,
@@ -44,6 +65,7 @@ impl DialContext {
             timeout,
             deadline: Instant::now() + timeout,
             source: None,
+            bind_address: None,
             inbound_name: None,
             inbound_type: None,
             app_identity,
@@ -52,8 +74,11 @@ impl DialContext {
             subscription_id: None,
             selected_group: None,
             selected_node: None,
-            network_preference: None,
+            ip_version: IpVersionStrategy::Dual,
             interface_name: None,
+            tcp_fast_open: false,
+            multipath_tcp: false,
+            keepalive: Some(Duration::from_secs(30)),
             dns_policy: None,
             trace_id: Uuid::new_v4().to_string(),
             cancellation: CancellationToken::new(),
@@ -73,11 +98,22 @@ impl DialContext {
     }
 }
 
+pub(crate) async fn scope_dial_context<F>(context: &DialContext, future: F) -> F::Output
+where
+    F: Future,
+{
+    ACTIVE_DIAL_CONTEXT.scope(context.clone(), future).await
+}
+
+pub(crate) fn active_dial_context() -> Option<DialContext> {
+    ACTIVE_DIAL_CONTEXT.try_with(Clone::clone).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::routing::{AppIdentity, Destination};
 
-    use super::DialContext;
+    use super::{DialContext, IpVersionStrategy};
 
     #[test]
     fn creates_traceable_dial_context() {
@@ -101,14 +137,14 @@ mod tests {
         let mut context = DialContext::new(destination, 500);
         context.inbound_name = Some("mixed".to_string());
         context.inbound_type = Some("http-connect".to_string());
-        context.network_preference = Some("prefer-ipv6".to_string());
+        context.ip_version = IpVersionStrategy::PreferIpv6;
         context.interface_name = Some("en0".to_string());
         context.dns_policy = Some("proxy-server".to_string());
 
         assert_eq!(context.app_id.as_deref(), Some("example.browser"));
         assert_eq!(context.inbound_name.as_deref(), Some("mixed"));
         assert_eq!(context.inbound_type.as_deref(), Some("http-connect"));
-        assert_eq!(context.network_preference.as_deref(), Some("prefer-ipv6"));
+        assert_eq!(context.ip_version, IpVersionStrategy::PreferIpv6);
         assert_eq!(context.interface_name.as_deref(), Some("en0"));
         assert_eq!(context.dns_policy.as_deref(), Some("proxy-server"));
     }

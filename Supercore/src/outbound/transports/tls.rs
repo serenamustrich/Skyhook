@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    client::{
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        Resumption,
+    },
     crypto::aws_lc_rs,
     ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
@@ -69,6 +72,7 @@ pub(crate) fn tls_client_config(skip_cert_verify: bool) -> anyhow::Result<Client
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         builder.with_root_certificates(roots).with_no_client_auth()
     };
+    config.resumption = Resumption::in_memory_sessions(256);
     config.alpn_protocols.clear();
     Ok(config)
 }
