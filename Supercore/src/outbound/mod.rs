@@ -68,9 +68,12 @@ mod naive;
 mod pool;
 mod registry;
 mod reject;
+mod shadowsocks;
 mod shadowtls;
+mod snell;
 mod socks5;
 mod ssh;
+mod ssr;
 mod target;
 mod traits;
 mod transports;
@@ -85,9 +88,12 @@ use naive::NaiveOutbound;
 use pool::IdlePool;
 use registry::{attach_groups, insert_leaf};
 use reject::RejectOutbound;
+use shadowsocks::ShadowsocksOutbound;
 use shadowtls::ShadowTlsOutbound;
+use snell::SnellOutbound;
 use socks5::Socks5Outbound;
 use ssh::SshOutbound;
+use ssr::SsrOutbound;
 use target::{parse_socks5_destination_prefix, read_socks5_destination_after_atyp};
 use transports::{
     connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
@@ -118,18 +124,6 @@ use transports::{
 };
 
 const UDP_SESSION_POOL_SIZE: usize = 4;
-
-struct SsrOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    method: String,
-    password: String,
-    protocol: String,
-    obfs: String,
-    protocol_param: Option<String>,
-    obfs_param: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SsrObfsMode {
@@ -671,218 +665,6 @@ impl SsrProtocolDecoder {
             }
         }
         Ok(output)
-    }
-}
-
-#[async_trait]
-impl Outbound for SsrOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "ssr"
-    }
-
-    fn capability(&self) -> OutboundCapability {
-        let mut limitations = Vec::new();
-        let method_supported = SsrCipher::from_method(&self.method).is_ok();
-        let protocol = ssr_protocol_kind(&self.protocol);
-        let protocol_supported = protocol.is_ok();
-        let obfs_supported = ssr_obfs_mode(&self.obfs).is_ok();
-        if !method_supported {
-            limitations.push(format!("unsupported ssr method {}", self.method));
-        }
-        if !protocol_supported {
-            limitations.push(format!("unsupported ssr protocol {}", self.protocol));
-        }
-        if !obfs_supported {
-            limitations.push(format!("unsupported ssr obfs {}", self.obfs));
-        }
-        let udp_supported = method_supported
-            && obfs_supported
-            && protocol
-                .as_ref()
-                .is_ok_and(|value| *value != SsrProtocolKind::AuthSha1V4);
-        if protocol
-            .as_ref()
-            .is_ok_and(|value| *value == SsrProtocolKind::AuthSha1V4)
-        {
-            limitations.push("ssr auth_sha1_v4 udp is not supported".to_string());
-        }
-        OutboundCapability {
-            tcp_supported: method_supported && protocol_supported && obfs_supported,
-            udp_supported,
-            udp_mode: Some(if udp_supported {
-                "ssr-datagram-stream-cipher".to_string()
-            } else {
-                "ssr-authenticated-tcp".to_string()
-            }),
-            limitations,
-        }
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let protocol = ssr_protocol_kind(&self.protocol)?;
-        if protocol == SsrProtocolKind::Origin
-            && self
-                .protocol_param
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-        {
-            tracing::debug!(name = %self.name, "SSR origin ignores protocol_param");
-        }
-        let obfs = ssr_obfs_mode(&self.obfs)?;
-
-        let cipher = SsrCipher::from_method(&self.method)?;
-        let key = evp_bytes_to_key(self.password.as_bytes(), cipher.key_len());
-        let mut iv = vec![0u8; cipher.iv_len()];
-        getrandom::fill(&mut iv).map_err(|error| anyhow!("failed to generate ssr iv: {error}"))?;
-        let mut upload = cipher.encryptor(&key, &iv)?;
-        let mut destination_payload = Vec::new();
-        encode_socks5_destination(destination, &mut destination_payload)?;
-        let mut protocol_encoder =
-            SsrProtocolEncoder::new(protocol, &iv, &key, self.protocol_param.as_deref())?;
-        destination_payload = protocol_encoder.encode(&destination_payload)?;
-        let protocol_decoder = protocol_encoder.decoder()?;
-        upload.apply(&mut destination_payload);
-
-        let mut initial = iv;
-        initial.extend_from_slice(&destination_payload);
-        if matches!(obfs, SsrObfsMode::HttpSimple | SsrObfsMode::HttpPost) {
-            initial = build_ssr_http_obfs_request(
-                obfs,
-                self.obfs_param.as_deref().unwrap_or(&self.server),
-                self.port,
-                &initial,
-            )?;
-        }
-
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let mut stream: BoxedStream = Box::new(tcp);
-        if obfs == SsrObfsMode::Tls12TicketAuth {
-            let (client_hello, client_id) = build_ssr_tls12_ticket_client_hello(
-                self.obfs_param.as_deref().unwrap_or(&self.server),
-                &key,
-            )?;
-            stream.write_all(&client_hello).await?;
-            stream.flush().await?;
-            return Ok(Box::new(spawn_ssr_tls12_ticket_stream(
-                cipher,
-                key,
-                upload,
-                stream,
-                protocol_encoder,
-                protocol_decoder,
-                initial,
-                client_id,
-            )));
-        }
-        stream.write_all(&initial).await?;
-        stream.flush().await?;
-        Ok(Box::new(spawn_ssr_stream(
-            cipher,
-            key,
-            upload,
-            stream,
-            obfs,
-            protocol_encoder,
-            protocol_decoder,
-        )))
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let protocol = ssr_protocol_kind(&self.protocol)?;
-        if protocol == SsrProtocolKind::AuthSha1V4 {
-            return Err(anyhow!("ssr auth_sha1_v4 UDP is not supported"));
-        }
-        let cipher = SsrCipher::from_method(&self.method)?;
-        let key = evp_bytes_to_key(self.password.as_bytes(), cipher.key_len());
-        let mut iv = vec![0u8; cipher.iv_len()];
-        getrandom::fill(&mut iv)
-            .map_err(|error| anyhow!("failed to generate ssr UDP iv: {error}"))?;
-        let mut plaintext = Vec::with_capacity(payload.len() + destination.host.len() + 20);
-        encode_socks5_destination(destination, &mut plaintext)?;
-        plaintext.extend_from_slice(payload);
-        let chain_user_key = if ssr_is_auth_chain(protocol) {
-            let (uid, user_key) = ssr_chain_user_credentials(self.protocol_param.as_deref(), &key)?;
-            plaintext = ssr_auth_chain_udp_encode(&plaintext, &key, &user_key, uid)?;
-            Some(user_key)
-        } else {
-            None
-        };
-        let response_hash = if let Some(hash) = ssr_auth_hash(protocol) {
-            let (uid, user_key) = ssr_user_credentials(hash, self.protocol_param.as_deref(), &key)?;
-            plaintext.extend_from_slice(&uid);
-            let hmac = hash.hmac(&user_key, &plaintext);
-            plaintext.extend_from_slice(&hmac[..4]);
-            Some(hash)
-        } else {
-            None
-        };
-        cipher.encryptor(&key, &iv)?.apply(&mut plaintext);
-        let mut packet = iv;
-        packet.extend_from_slice(&plaintext);
-
-        let server = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
-        let bind_addr = match server {
-            SocketAddr::V4(_) => "0.0.0.0:0",
-            SocketAddr::V6(_) => "[::]:0",
-        };
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .context("failed to bind SSR UDP socket")?;
-        let exchange = async {
-            socket
-                .send_to(&packet, server)
-                .await
-                .context("failed to send SSR UDP packet")?;
-            let mut response = vec![0u8; 65_535];
-            let (length, source) = socket
-                .recv_from(&mut response)
-                .await
-                .context("failed to receive SSR UDP response")?;
-            if source != server {
-                return Err(anyhow!(
-                    "SSR UDP response came from unexpected source {source}"
-                ));
-            }
-            response.truncate(length);
-            if response.len() <= cipher.iv_len() {
-                return Err(anyhow!("SSR UDP response is too short"));
-            }
-            let response_iv = response[..cipher.iv_len()].to_vec();
-            let mut plaintext = response[cipher.iv_len()..].to_vec();
-            cipher.decryptor(&key, &response_iv)?.apply(&mut plaintext);
-            if let Some(user_key) = chain_user_key.as_deref() {
-                plaintext = ssr_auth_chain_udp_decode(&plaintext, &key, user_key)?;
-            }
-            if let Some(hash) = response_hash {
-                if plaintext.len() <= 4 {
-                    return Err(anyhow!("SSR authenticated UDP response is too short"));
-                }
-                let hmac_offset = plaintext.len() - 4;
-                let expected = hash.hmac(&key, &plaintext[..hmac_offset]);
-                if plaintext[hmac_offset..] != expected[..4] {
-                    return Err(anyhow!("SSR authenticated UDP response HMAC failed"));
-                }
-                plaintext.truncate(hmac_offset);
-            }
-            let (_source, payload_offset) = parse_socks5_destination_prefix(&plaintext)?;
-            Ok(plaintext[payload_offset..].to_vec())
-        };
-        timeout(Duration::from_millis(timeout_ms), exchange)
-            .await
-            .context("SSR UDP exchange timed out")?
     }
 }
 
@@ -2024,19 +1806,6 @@ fn ssr_hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
     outer.finalize().into()
 }
 
-struct SnellOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    psk: String,
-    method: Option<String>,
-    version: Option<u8>,
-    obfs: Option<String>,
-    obfs_host: Option<String>,
-    reuse: bool,
-    v4_pool: Arc<TokioMutex<SnellV4ConnectionPool>>,
-}
-
 const SNELL_V4_POOL_SIZE: usize = 10;
 const SNELL_V4_POOL_IDLE_AGE: Duration = Duration::from_secs(15);
 
@@ -2245,397 +2014,6 @@ impl SnellV4PooledWriter {
         self.remote.flush().await?;
         self.started = true;
         Ok(())
-    }
-}
-
-#[async_trait]
-impl Outbound for SnellOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "snell"
-    }
-
-    fn capability(&self) -> OutboundCapability {
-        let mut limitations = Vec::new();
-        let version = self.version.unwrap_or(3);
-        let version_supported = matches!(version, 1..=5);
-        let method = self.method.as_deref().unwrap_or(if version == 1 {
-            "chacha20-ietf-poly1305"
-        } else {
-            "aes-128-gcm"
-        });
-        let method_supported = if version >= 4 {
-            method.eq_ignore_ascii_case("aes-128-gcm")
-        } else {
-            matches!(
-                method.to_ascii_lowercase().as_str(),
-                "aes-128-gcm" | "aes-256-gcm" | "chacha20-ietf-poly1305" | "chacha20-poly1305"
-            )
-        };
-        let obfs = self
-            .obfs
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase());
-        let obfs_supported = obfs
-            .as_deref()
-            .map(|value| {
-                matches!(
-                    value,
-                    "none"
-                        | "off"
-                        | "http"
-                        | "http_simple"
-                        | "http-simple"
-                        | "tls"
-                        | "simple-obfs-tls"
-                        | "obfs-tls"
-                )
-            })
-            .unwrap_or(true);
-        if !version_supported {
-            limitations.push(format!("unsupported snell version {version}"));
-        }
-        if !method_supported {
-            limitations.push(format!("unsupported snell method {method}"));
-        }
-        if !obfs_supported {
-            limitations.push(format!(
-                "unsupported snell obfs {}",
-                obfs.as_deref().unwrap_or_default()
-            ));
-        }
-        let reuse_supported = !self.reuse || matches!(version, 4 | 5);
-        if !reuse_supported {
-            limitations.push("snell connection reuse requires version 4 or 5".to_string());
-        }
-        let udp_supported = version_supported
-            && method_supported
-            && matches!(version, 3..=5)
-            && obfs
-                .as_deref()
-                .map(|value| matches!(value, "none" | "off"))
-                .unwrap_or(true);
-        if version < 3 {
-            limitations.push("snell udp requires version 3, 4, or 5".to_string());
-        } else if !udp_supported && obfs_supported {
-            limitations.push("snell udp over simple-obfs is not supported".to_string());
-        }
-        OutboundCapability {
-            tcp_supported: version_supported
-                && method_supported
-                && obfs_supported
-                && reuse_supported,
-            udp_supported,
-            udp_mode: Some(if udp_supported {
-                if version >= 4 {
-                    "snell-v4-framed-udp-over-tcp".to_string()
-                } else {
-                    "snell-v3-udp-over-tcp".to_string()
-                }
-            } else {
-                "snell-aead-tcp".to_string()
-            }),
-            limitations,
-        }
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let version = validate_snell_version(self.version)?;
-        if self.reuse && version < 4 {
-            return Err(anyhow!(
-                "snell connection reuse requires version 4 or 5; configured version is {version}"
-            ));
-        }
-        if version >= 4 {
-            if self.reuse {
-                return self.connect_v4_reuse(destination, timeout_ms).await;
-            }
-            return self.connect_v4(destination, timeout_ms).await;
-        }
-        let cipher = snell_cipher(version, self.method.as_deref())?;
-        let plugin = snell_obfs_plugin(
-            self.obfs.as_deref(),
-            self.obfs_host.as_deref(),
-            &self.server,
-        )?;
-        let mut salt = vec![0u8; cipher.salt_len()];
-        getrandom::fill(&mut salt)
-            .map_err(|error| anyhow!("failed to generate snell salt: {error}"))?;
-        let subkey = derive_snell_subkey(cipher, self.psk.as_bytes(), &salt)?;
-
-        let mut upload_nonce = vec![0u8; cipher.nonce_len()];
-        let handshake = build_snell_tcp_handshake(destination, Some(version))?;
-        let mut initial = salt;
-        initial.extend_from_slice(&encode_ss_chunk(
-            cipher,
-            &subkey,
-            &mut upload_nonce,
-            &handshake,
-        )?);
-        if let Some(plugin) = plugin.as_ref() {
-            initial = apply_shadowsocks_plugin_request(plugin, &self.server, self.port, initial)?;
-        }
-
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let mut stream: BoxedStream = Box::new(tcp);
-        stream.write_all(&initial).await?;
-        stream.flush().await?;
-
-        Ok(Box::new(spawn_snell_stream(
-            cipher,
-            self.psk.as_bytes().to_vec(),
-            subkey,
-            upload_nonce,
-            stream,
-            plugin,
-        )))
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        if self
-            .obfs
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty() && !value.eq_ignore_ascii_case("none"))
-        {
-            return Err(anyhow!(
-                "snell UDP over simple-obfs is not supported; use plain Snell UDP"
-            ));
-        }
-
-        let version = validate_snell_version(self.version)?;
-        if version < 3 {
-            return Err(anyhow!(
-                "snell UDP requires version 3, 4, or 5; configured version is {version}"
-            ));
-        }
-        if version >= 4 {
-            return self.udp_exchange_v4(destination, payload, timeout_ms).await;
-        }
-        let cipher = snell_cipher(version, self.method.as_deref())?;
-        let exchange = async {
-            let mut stream =
-                connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-            let mut request_salt = vec![0u8; cipher.salt_len()];
-            getrandom::fill(&mut request_salt)
-                .map_err(|error| anyhow!("failed to generate snell UDP salt: {error}"))?;
-            let upload_key = derive_snell_subkey(cipher, self.psk.as_bytes(), &request_salt)?;
-            let mut upload_nonce = vec![0u8; cipher.nonce_len()];
-
-            let mut initial = request_salt;
-            initial.extend_from_slice(&encode_ss_chunk(
-                cipher,
-                &upload_key,
-                &mut upload_nonce,
-                &[1, SNELL_COMMAND_UDP, 0],
-            )?);
-            stream.write_all(&initial).await?;
-            stream.flush().await?;
-
-            let mut response_salt = vec![0u8; cipher.salt_len()];
-            stream
-                .read_exact(&mut response_salt)
-                .await
-                .context("failed to read snell UDP response salt")?;
-            let download_key = derive_snell_subkey(cipher, self.psk.as_bytes(), &response_salt)?;
-            let mut download_nonce = vec![0u8; cipher.nonce_len()];
-            let response = read_ss_chunk(cipher, &download_key, &mut download_nonce, &mut stream)
-                .await?
-                .ok_or_else(|| anyhow!("snell server closed before UDP ready response"))?;
-            validate_snell_response(&response, "UDP associate")?;
-
-            let packet = build_snell_udp_packet(destination, payload)?;
-            let encrypted = encode_ss_chunk(cipher, &upload_key, &mut upload_nonce, &packet)?;
-            stream.write_all(&encrypted).await?;
-            stream.flush().await?;
-
-            let response = read_ss_chunk(cipher, &download_key, &mut download_nonce, &mut stream)
-                .await?
-                .ok_or_else(|| anyhow!("snell server closed before UDP response"))?;
-            parse_snell_udp_response(&response)
-        };
-
-        timeout(Duration::from_millis(timeout_ms), exchange)
-            .await
-            .context("snell UDP exchange timed out")?
-    }
-}
-
-impl SnellOutbound {
-    async fn connect_v4_reuse(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        snell_cipher(4, self.method.as_deref())?;
-        let mut was_pooled = true;
-        let mut connection = if let Some(connection) = self.v4_pool.lock().await.take() {
-            connection
-        } else {
-            was_pooled = false;
-            self.new_v4_pooled_connection(timeout_ms).await?
-        };
-
-        loop {
-            let setup = timeout(Duration::from_millis(timeout_ms), async {
-                connection
-                    .writer
-                    .write_request(destination, self.version.unwrap_or(4))
-                    .await?;
-                connection.reader.read_frame().await
-            })
-            .await;
-            let reply = match setup {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(_error)) if was_pooled => {
-                    connection = self.new_v4_pooled_connection(timeout_ms).await?;
-                    was_pooled = false;
-                    continue;
-                }
-                Ok(Err(error)) => return Err(error).context("snell reuse handshake failed"),
-                Err(_) if was_pooled => {
-                    connection = self.new_v4_pooled_connection(timeout_ms).await?;
-                    was_pooled = false;
-                    continue;
-                }
-                Err(_) => return Err(anyhow!("snell reuse handshake timed out")),
-            };
-            validate_snell_response(&reply, "TCP connect")?;
-            let initial_payload = reply.get(1..).unwrap_or_default().to_vec();
-            return Ok(Box::new(spawn_snell_v4_reuse_stream(
-                connection,
-                Arc::clone(&self.v4_pool),
-                initial_payload,
-            )));
-        }
-    }
-
-    async fn new_v4_pooled_connection(
-        &self,
-        timeout_ms: u64,
-    ) -> anyhow::Result<SnellV4PooledConnection> {
-        let plugin = snell_obfs_plugin(
-            self.obfs.as_deref(),
-            self.obfs_host.as_deref(),
-            &self.server,
-        )?;
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        SnellV4PooledConnection::new(
-            Box::new(tcp),
-            self.psk.as_bytes(),
-            plugin,
-            self.server.clone(),
-            self.port,
-        )
-    }
-
-    async fn connect_v4(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        snell_cipher(4, self.method.as_deref())?;
-        let plugin = snell_obfs_plugin(
-            self.obfs.as_deref(),
-            self.obfs_host.as_deref(),
-            &self.server,
-        )?;
-        let mut salt = [0u8; SNELL_V4_SALT_LEN];
-        getrandom::fill(&mut salt)
-            .map_err(|error| anyhow!("failed to generate snell v4 salt: {error}"))?;
-        let key = derive_snell_subkey(SsCipher::Aes128Gcm, self.psk.as_bytes(), &salt)?;
-        let mut nonce = [0u8; SS_NONCE_LEN];
-        let handshake = build_snell_tcp_handshake(destination, Some(4))?;
-        let padding = snell_v4_initial_padding_len()?;
-        let mut initial = salt.to_vec();
-        initial.extend_from_slice(&encode_snell_v4_frame(
-            &key, &mut nonce, &handshake, padding,
-        )?);
-        if let Some(plugin) = plugin.as_ref() {
-            initial = apply_shadowsocks_plugin_request(plugin, &self.server, self.port, initial)?;
-        }
-
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let mut stream: BoxedStream = Box::new(tcp);
-        stream.write_all(&initial).await?;
-        stream.flush().await?;
-        Ok(Box::new(spawn_snell_v4_stream(
-            self.psk.as_bytes().to_vec(),
-            key,
-            nonce,
-            stream,
-            plugin,
-        )))
-    }
-
-    async fn udp_exchange_v4(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        snell_cipher(4, self.method.as_deref())?;
-        let exchange = async {
-            let mut stream =
-                connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-            let mut request_salt = [0u8; SNELL_V4_SALT_LEN];
-            getrandom::fill(&mut request_salt)
-                .map_err(|error| anyhow!("failed to generate snell v4 UDP salt: {error}"))?;
-            let upload_key =
-                derive_snell_subkey(SsCipher::Aes128Gcm, self.psk.as_bytes(), &request_salt)?;
-            let mut upload_nonce = [0u8; SS_NONCE_LEN];
-            let mut initial = request_salt.to_vec();
-            initial.extend_from_slice(&encode_snell_v4_frame(
-                &upload_key,
-                &mut upload_nonce,
-                &[1, SNELL_COMMAND_UDP, 0],
-                snell_v4_initial_padding_len()?,
-            )?);
-            stream.write_all(&initial).await?;
-            stream.flush().await?;
-
-            let mut response_salt = [0u8; SNELL_V4_SALT_LEN];
-            stream
-                .read_exact(&mut response_salt)
-                .await
-                .context("failed to read snell v4 UDP response salt")?;
-            let download_key =
-                derive_snell_subkey(SsCipher::Aes128Gcm, self.psk.as_bytes(), &response_salt)?;
-            let mut download_nonce = [0u8; SS_NONCE_LEN];
-            let response =
-                read_snell_v4_frame(&mut stream, &download_key, &mut download_nonce).await?;
-            validate_snell_response(&response, "UDP associate")?;
-
-            let packet = build_snell_udp_packet(destination, payload)?;
-            if packet.len() > SS_CHUNK_SIZE {
-                return Err(anyhow!("snell UDP payload is too large"));
-            }
-            let encrypted = encode_snell_v4_frame(&upload_key, &mut upload_nonce, &packet, 0)?;
-            stream.write_all(&encrypted).await?;
-            stream.flush().await?;
-
-            let response =
-                read_snell_v4_frame(&mut stream, &download_key, &mut download_nonce).await?;
-            parse_snell_udp_response(&response)
-        };
-
-        timeout(Duration::from_millis(timeout_ms), exchange)
-            .await
-            .context("snell v4 UDP exchange timed out")?
     }
 }
 
@@ -2983,16 +2361,6 @@ where
     let payload = SsCipher::Aes128Gcm.decrypt(key, nonce, payload_cipher)?;
     increment_nonce(nonce);
     Ok(payload)
-}
-
-struct ShadowsocksOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    method: String,
-    password: String,
-    plugin: Option<ShadowsocksPluginConfig>,
-    udp_sessions: TokioMutex<ShadowsocksUdpPool>,
 }
 
 type ShadowsocksUdpPool = RoundRobinSessionPool<ShadowsocksUdpSession>;
@@ -5491,222 +4859,6 @@ fn trojan_alpn_protocols(network: &str, configured: &[String]) -> anyhow::Result
         ));
     }
     Ok(protocols)
-}
-
-#[async_trait]
-impl Outbound for ShadowsocksOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "shadowsocks"
-    }
-
-    fn capability(&self) -> OutboundCapability {
-        if let Err(error) = SsCipher::from_method(&self.method) {
-            return OutboundCapability::unsupported(error.to_string());
-        }
-        if self.plugin.is_some() {
-            OutboundCapability::tcp_only("Shadowsocks plugin transports do not provide UDP relay")
-        } else {
-            OutboundCapability::tcp_udp("shadowsocks-aead-udp-session-pool")
-        }
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let cipher = SsCipher::from_method(&self.method)?;
-        let server = format!("{}:{}", self.server, self.port);
-        let tcp = connect_tcp(&server, timeout_ms).await?;
-        let psk_chain = cipher.psk_chain(self.password.as_bytes())?;
-        let master_key = psk_chain
-            .last()
-            .cloned()
-            .ok_or_else(|| anyhow!("shadowsocks key chain is empty"))?;
-        let mut salt = vec![0u8; cipher.salt_len()];
-        getrandom::fill(&mut salt)
-            .map_err(|error| anyhow!("failed to generate shadowsocks salt: {error}"))?;
-        let subkey = cipher.derive_subkey(&master_key, &salt)?;
-
-        let mut outbound_nonce = vec![0u8; cipher.nonce_len()];
-        let request_salt = salt.clone();
-        let mut initial = salt;
-        if cipher.is_blake3() {
-            initial.extend_from_slice(&build_ss2022_tcp_identity_headers(
-                cipher,
-                &psk_chain,
-                &request_salt,
-            )?);
-            initial.extend_from_slice(&build_ss2022_request_header(
-                cipher,
-                &subkey,
-                &mut outbound_nonce,
-                destination,
-            )?);
-        } else {
-            let mut destination_payload = Vec::new();
-            encode_socks5_destination(destination, &mut destination_payload)?;
-            initial.extend_from_slice(&encode_ss_chunk(
-                cipher,
-                &subkey,
-                &mut outbound_nonce,
-                &destination_payload,
-            )?);
-        }
-
-        let mut transport: BoxedStream = if self
-            .plugin
-            .as_ref()
-            .map(|plugin| plugin_is_v2ray_ws(Some(plugin)) && plugin.tls)
-            .unwrap_or(false)
-        {
-            let plugin = self.plugin.as_ref().expect("plugin checked");
-            let server_name = plugin.host.as_deref().unwrap_or(&self.server).to_string();
-            let tls_config = tls_client_config(plugin.skip_cert_verify)?;
-            let connector = TlsConnector::from(Arc::new(tls_config));
-            let tls_server_name = ServerName::try_from(server_name)
-                .map_err(|error| anyhow!("invalid shadowsocks plugin server name: {error}"))?;
-            let tls = timeout(
-                Duration::from_millis(timeout_ms),
-                connector.connect(tls_server_name, tcp),
-            )
-            .await
-            .context("shadowsocks plugin tls handshake timed out")?
-            .context("shadowsocks plugin tls handshake failed")?;
-            Box::new(tls)
-        } else {
-            Box::new(tcp)
-        };
-
-        if let Some(plugin) = &self.plugin {
-            if plugin_is_v2ray_ws(Some(plugin)) {
-                perform_websocket_handshake(
-                    &mut transport,
-                    plugin.host.as_deref().unwrap_or(&self.server),
-                    plugin.path.as_deref().unwrap_or("/"),
-                )
-                .await?;
-                transport = Box::new(spawn_websocket_stream(transport));
-            } else {
-                initial =
-                    apply_shadowsocks_plugin_request(plugin, &self.server, self.port, initial)?;
-            }
-        }
-        transport.write_all(&initial).await?;
-        transport.flush().await?;
-
-        let app_side = spawn_shadowsocks_stream(
-            cipher,
-            master_key,
-            request_salt,
-            subkey,
-            outbound_nonce,
-            transport,
-            self.plugin.clone(),
-        );
-        Ok(Box::new(app_side))
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        if self.plugin.is_some() {
-            return Err(anyhow!(
-                "shadowsocks udp with simple-obfs plugin is not supported"
-            ));
-        }
-
-        let cipher = SsCipher::from_method(&self.method)?;
-        let session_handle = self.shadowsocks_udp_session(timeout_ms).await?;
-        let mut session = session_handle.lock().await;
-        let packet = encode_shadowsocks_udp_packet(
-            cipher,
-            self.password.as_bytes(),
-            destination,
-            payload,
-            session.ss2022.as_mut(),
-        )?;
-        let server = session.server;
-        let exchange = async {
-            timeout(
-                Duration::from_millis(timeout_ms),
-                session.udp.send_to(&packet, server),
-            )
-            .await
-            .context("shadowsocks udp send timed out")?
-            .with_context(|| format!("failed to send shadowsocks udp packet to {}", server))?;
-
-            let mut buf = vec![0u8; 65_535];
-            let (len, _) = timeout(
-                Duration::from_millis(timeout_ms),
-                session.udp.recv_from(&mut buf),
-            )
-            .await
-            .context("shadowsocks udp receive timed out")?
-            .context("failed to receive shadowsocks udp response")?;
-            let (_response_destination, response) = decode_shadowsocks_udp_packet(
-                cipher,
-                self.password.as_bytes(),
-                &buf[..len],
-                session.ss2022.as_mut(),
-            )?;
-            Ok(response)
-        }
-        .await;
-        if exchange.is_err() {
-            drop(session);
-            self.remove_shadowsocks_udp_session(&session_handle).await;
-        }
-        exchange
-    }
-}
-
-impl ShadowsocksOutbound {
-    async fn shadowsocks_udp_session(
-        &self,
-        timeout_ms: u64,
-    ) -> anyhow::Result<Arc<TokioMutex<ShadowsocksUdpSession>>> {
-        let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
-            let server = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
-            let bind_addr = match server {
-                SocketAddr::V4(_) => "0.0.0.0:0",
-                SocketAddr::V6(_) => "[::]:0",
-            };
-            let udp = UdpSocket::bind(bind_addr).await.with_context(|| {
-                format!(
-                    "failed to bind udp socket for shadowsocks outbound {}",
-                    self.name
-                )
-            })?;
-            let cipher = SsCipher::from_method(&self.method)?;
-            let ss2022 = cipher.is_blake3().then(Ss2022UdpState::new).transpose()?;
-            let session = Arc::new(TokioMutex::new(ShadowsocksUdpSession {
-                udp,
-                server,
-                ss2022,
-            }));
-            pool.push(session.clone());
-            return Ok(session);
-        }
-        pool.next()
-            .ok_or_else(|| anyhow!("shadowsocks UDP session pool is unexpectedly empty"))
-    }
-
-    async fn remove_shadowsocks_udp_session(
-        &self,
-        target: &Arc<TokioMutex<ShadowsocksUdpSession>>,
-    ) {
-        let mut pool = self.udp_sessions.lock().await;
-        pool.remove(target);
-    }
 }
 
 fn destination_socket_addr(destination: &Destination) -> String {
@@ -9044,15 +8196,14 @@ mod tests {
             .unwrap();
         });
 
-        let outbound = ShadowsocksOutbound {
-            name: "ss-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            method: "aes-128-gcm".to_string(),
+        let outbound = ShadowsocksOutbound::new(
+            "ss-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "aes-128-gcm".to_string(),
             password,
-            plugin: None,
-            udp_sessions: TokioMutex::new(ShadowsocksUdpPool::default()),
-        };
+            None,
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut response = [0u8; 4];
@@ -9140,21 +8291,20 @@ mod tests {
             }
         });
 
-        let outbound = ShadowsocksOutbound {
-            name: "ss-obfs-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            method: "aes-128-gcm".to_string(),
+        let outbound = ShadowsocksOutbound::new(
+            "ss-obfs-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "aes-128-gcm".to_string(),
             password,
-            plugin: Some(ShadowsocksPluginConfig {
+            Some(ShadowsocksPluginConfig {
                 mode: "http_simple".to_string(),
                 host: Some("edge.example.com".to_string()),
                 path: None,
                 tls: false,
                 skip_cert_verify: false,
             }),
-            udp_sessions: TokioMutex::new(ShadowsocksUdpPool::default()),
-        };
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         let mut response = [0u8; 4];
         stream.read_exact(&mut response).await.unwrap();
@@ -9239,21 +8389,20 @@ mod tests {
             stream.write_all(&response).await.unwrap();
         });
 
-        let outbound = ShadowsocksOutbound {
-            name: "ss-obfs-tls-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            method: "aes-128-gcm".to_string(),
+        let outbound = ShadowsocksOutbound::new(
+            "ss-obfs-tls-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "aes-128-gcm".to_string(),
             password,
-            plugin: Some(ShadowsocksPluginConfig {
+            Some(ShadowsocksPluginConfig {
                 mode: "tls".to_string(),
                 host: Some("edge.example.com".to_string()),
                 path: None,
                 tls: false,
                 skip_cert_verify: false,
             }),
-            udp_sessions: TokioMutex::new(ShadowsocksUdpPool::default()),
-        };
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         let mut response = [0u8; 4];
@@ -9350,21 +8499,20 @@ mod tests {
                 .unwrap();
         });
 
-        let outbound = ShadowsocksOutbound {
-            name: "ss-v2ray-plugin-test".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: listen_addr.port(),
-            method: "aes-128-gcm".to_string(),
+        let outbound = ShadowsocksOutbound::new(
+            "ss-v2ray-plugin-test".to_string(),
+            "127.0.0.1".to_string(),
+            listen_addr.port(),
+            "aes-128-gcm".to_string(),
             password,
-            plugin: Some(ShadowsocksPluginConfig {
+            Some(ShadowsocksPluginConfig {
                 mode: "v2ray-plugin".to_string(),
                 host: Some("cdn.example.com".to_string()),
                 path: Some("/ss".to_string()),
                 tls: false,
                 skip_cert_verify: false,
             }),
-            udp_sessions: TokioMutex::new(ShadowsocksUdpPool::default()),
-        };
+        );
         let mut stream = outbound.connect(&destination, 1000).await.unwrap();
         stream.write_all(b"ping").await.unwrap();
         stream.flush().await.unwrap();

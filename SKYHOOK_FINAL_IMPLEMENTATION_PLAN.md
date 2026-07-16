@@ -199,7 +199,7 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 ### 5.3 当前结构债务
 
-- `Supercore/src/outbound/mod.rs`：当前约 10,646 行；公共 trait、factory、错误上下文、
+- `Supercore/src/outbound/mod.rs`：当前约 9,794 行；公共 trait、factory、错误上下文、
   target、SOCKS5、AnyTLS、ShadowTLS、SSH 和 WireGuard 已迁出，其余协议实现继续拆分。
 - `Supercore/src/core/mod.rs`：当前 16 行，只保留模块声明和公共导出；运行时职责已迁移
   到 `connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、`reload.rs`、
@@ -708,6 +708,8 @@ SSH/WireGuard 已迁为独立模块并提交为
    - 先建立协议私有 crypto/framing 子模块。
    - 共享代码必须有明确协议边界，不能继续依赖 `use super::*`。
    - 迁移后运行 SS、SSR、Snell 真实拨号定向回归。
+   - 当前进度：三个协议的 Outbound 生命周期、构造和拨号入口已迁入独立模块；
+     共享 cipher、framing、obfs、pool 和 relay helper 仍在父模块，本项不关闭。
 5. [ ] `NEXT-005`：迁移 Trojan、VMess 和 VLESS。
    - transport 组合只依赖公共 transport 接口。
    - Reality/Vision 保持独立状态机，不塞回公共 TLS 模块。
@@ -735,6 +737,14 @@ SSH/WireGuard 已迁为独立模块并提交为
 - `cargo test --test remaining_protocols`：29 passed。
 - `cargo test --test config_and_runtime`：20 passed。
 - `outbound/mod.rs`：11,790 行降至 10,646 行。
+
+`NEXT-004` 第一批验证记录：
+
+- `cargo check --all-targets`：通过且无 warning。
+- `ss_real_dial`：15 passed。
+- `ssr_real_dial`：41 passed。
+- `snell_real_dial`：18 passed。
+- `outbound/mod.rs`：10,646 行降至 9,794 行。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。
