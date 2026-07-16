@@ -176,6 +176,9 @@ for up to 24 hours with a default maximum of 512 records, without evicting activ
 traffic, log, and outbound-health events over SSE with event IDs and timestamps. Live connection
 updates and traffic samples are throttled to a 250ms interval, and the bounded event channel never
 blocks the proxy data plane on a slow consumer.
+The macOS client consumes this stream for live rates, incremental logs, and task progress. It falls
+back to one-second traffic and two-second log polling while SSE is unavailable, then refreshes full
+snapshots before returning to event-driven updates after reconnect.
 
 `POST /v1/probes` accepts an optional JSON body:
 

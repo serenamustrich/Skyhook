@@ -330,6 +330,47 @@ final class SupercoreAPIClientTests: XCTestCase {
         }
     }
 
+    func testSSEParserPreservesEventIDNameAndMultilineData() throws {
+        var parser = SupercoreSSEParser()
+        XCTAssertNil(parser.consume(line: ": keepalive"))
+        XCTAssertNil(parser.consume(line: "id: event-123"))
+        XCTAssertNil(parser.consume(line: "event: traffic_sample"))
+        XCTAssertNil(parser.consume(line: "data: {\"upload_total\":64,"))
+        XCTAssertNil(parser.consume(line: "data: \"download_total\":128}"))
+        let event = try XCTUnwrap(parser.consume(line: ""))
+
+        XCTAssertEqual(event.id, "event-123")
+        XCTAssertEqual(event.name, "traffic_sample")
+        XCTAssertEqual(
+            String(data: event.data, encoding: .utf8),
+            "{\"upload_total\":64,\n\"download_total\":128}"
+        )
+    }
+
+    func testEventStreamConnectsParsesEventAndSendsLastEventID() async throws {
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            id: event-456
+            event: log_appended
+            data: {"schema_version":1,"id":"event-456","event":"log_appended","timestamp":"2026-07-17T00:00:00Z","data":{"time":"2026-07-17T00:00:00Z","level":"info","message":"hello"}}
+
+            """.utf8
+        )
+
+        var iterator = client.eventStream(lastEventID: "event-previous").makeAsyncIterator()
+        let connected = try await iterator.next()
+        XCTAssertEqual(connected, .connected)
+        let event = try await iterator.next()
+        XCTAssertEqual(event?.id, "event-456")
+        XCTAssertEqual(event?.name, "log_appended")
+        XCTAssertEqual(
+            SupercoreProbeGroupCaptureProtocol.lastRequest?.value(forHTTPHeaderField: "Last-Event-ID"),
+            "event-previous"
+        )
+        XCTAssertEqual(SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path, "/v1/events")
+    }
+
     func testProbeGroupWithSlashInNamePreservesRawGroupInBody() async throws {
         let groupName = "A/B/香港"
         let baseURL = URL(string: "http://127.0.0.1:9197")!
@@ -436,9 +477,14 @@ final class SupercoreAPIClientTests: XCTestCase {
             "supercore API client should issue one request"
         )
         XCTAssertEqual(request.url?.path, "/v1/probes")
-        XCTAssertEqual(
-            request.timeoutInterval,
-            ProbeTimeoutCalculator.requestTimeout(timeoutMilliseconds: 500, concurrency: nil, names: nil)
+        XCTAssertEqual(request.timeoutInterval, 10)
+        XCTAssertGreaterThanOrEqual(
+            ProbeTimeoutCalculator.requestTimeout(
+                timeoutMilliseconds: 500,
+                concurrency: nil,
+                names: nil
+            ),
+            60
         )
     }
 

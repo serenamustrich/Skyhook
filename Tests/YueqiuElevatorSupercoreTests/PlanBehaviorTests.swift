@@ -272,6 +272,17 @@ final class PlanBehaviorTests: XCTestCase {
         )
     }
 
+    func testProbeRequestTimeoutUsesConservativeBudgetWhenNodeCountIsUnknown() {
+        XCTAssertGreaterThanOrEqual(
+            ProbeTimeoutCalculator.requestTimeout(
+                timeoutMilliseconds: 500,
+                concurrency: 50,
+                names: nil
+            ),
+            60
+        )
+    }
+
     func testProbeRequestTimeoutForSingleAndHundredNodesWithConcurrency50() {
         XCTAssertEqual(
             ProbeTimeoutCalculator.requestTimeout(

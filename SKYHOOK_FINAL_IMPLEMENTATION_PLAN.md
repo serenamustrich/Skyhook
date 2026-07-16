@@ -170,7 +170,10 @@
 - log。
 - outbound health。
 
-高频连接/流量事件按 250ms 节流，事件通道有界。Swift SSE 自动重连/快照恢复以及
+高频连接/流量事件按 250ms 节流，事件通道有界。Swift 已完成标准 SSE parser、
+`Last-Event-ID`、指数退避重连、完整快照恢复和轮询兜底，并使用核心 rate 事件直接
+更新实时速率。Swift full 当前为 96 passed。
+
 Provider、Geo、TUN、Doctor 长任务迁移仍未完成，因此 M0 继续保持 `IN_PROGRESS`。
 
 ### 5.3 当前结构债务

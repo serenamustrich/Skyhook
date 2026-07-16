@@ -139,6 +139,8 @@ final class AppState: ObservableObject {
     let proxyManager: SystemProxyManager
 
     private var settingsWindow: NSWindow?
+    private var eventStreamTask: Task<Void, Never>?
+    private var eventSnapshotRefreshTask: Task<Void, Never>?
     private var trafficPollingTask: Task<Void, Never>?
     private var logsTask: Task<Void, Never>?
     private var autoDelayTask: Task<Void, Never>?
@@ -150,6 +152,7 @@ final class AppState: ObservableObject {
     private var recentSmartRuleConnectionIDs: Set<String> = []
     private var pendingLogLines: [String] = []
     private var pendingLogEntries: [AppLogEntry] = []
+    private var seenSupercoreLogEvents: Set<String> = []
     private var logFlushTask: Task<Void, Never>?
     private var isStartingSupercoreProxy = false
     private var activeTrafficUsage = ProfileTrafficUsage.zero
@@ -187,6 +190,7 @@ final class AppState: ObservableObject {
                 self?.coreState = state
                 if !state.isRunning {
                     self?.runtimePurpose = .idle
+                    self?.stopStreams()
                 }
             }
         }
@@ -1377,6 +1381,159 @@ final class AppState: ObservableObject {
     }
 
     private func startSupercoreStreams() {
+        eventStreamTask?.cancel()
+        eventStreamTask = Task { [weak self] in
+            await self?.runSupercoreEventLoop()
+        }
+        scheduleEventSnapshotRefresh(includeRuntime: false)
+    }
+
+    private func runSupercoreEventLoop() async {
+        var lastEventID: String?
+        var retryCount = 0
+        while !Task.isCancelled {
+            do {
+                let events = supercoreAPIClient.eventStream(lastEventID: lastEventID)
+                for try await event in events {
+                    try Task.checkCancellation()
+                    if event.name == "__connected" {
+                        retryCount = 0
+                        stopPollingFallback()
+                        await refreshEventSnapshots(includeRuntime: true)
+                        continue
+                    }
+                    if let id = event.id, !id.isEmpty {
+                        lastEventID = id
+                    }
+                    do {
+                        try handleSupercoreEvent(event)
+                    } catch {
+                        appendLog("Supercore 事件解析失败（\(event.name)）：\(error.localizedDescription)")
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                if retryCount == 0 {
+                    appendLog("Supercore SSE 已断开，启用轮询兜底：\(error.localizedDescription)")
+                }
+                startPollingFallback()
+                retryCount = min(retryCount + 1, 6)
+                let delay = min(30.0, pow(2.0, Double(retryCount - 1)))
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+    }
+
+    private func handleSupercoreEvent(_ event: SupercoreControlEvent) throws {
+        switch event.name {
+        case "traffic_sample":
+            let envelope = try event.decode(
+                SupercoreTelemetryEnvelope<SupercoreTrafficEvent>.self
+            )
+            let snapshot = ConnectionTrafficSnapshot(
+                upTotal: Int(clamping: envelope.data.uploadTotal),
+                downTotal: Int(clamping: envelope.data.downloadTotal)
+            )
+            recordTrafficSnapshot(snapshot)
+            traffic = TrafficFrame(
+                up: Int(clamping: envelope.data.uploadRate),
+                down: Int(clamping: envelope.data.downloadRate)
+            )
+        case "log_appended":
+            let envelope = try event.decode(
+                SupercoreTelemetryEnvelope<SupercoreLogEvent>.self
+            )
+            appendSupercoreLog(envelope.data)
+        case "probe_progress":
+            let envelope = try event.decode(
+                SupercoreTelemetryEnvelope<SupercoreProbeProgressEvent>.self
+            )
+            if operation?.kind == .testingDelay {
+                updateOperation(
+                    "正在测速 \(envelope.data.completed)/\(envelope.data.total)：\(envelope.data.node)"
+                )
+            }
+        case "outbound_health_updated":
+            let envelope = try event.decode(
+                SupercoreTelemetryEnvelope<SupercoreOutboundHealthEvent>.self
+            )
+            if envelope.data.lastError == nil, let latency = envelope.data.lastLatencyMs {
+                delayResults[envelope.data.name] = Int(clamping: latency)
+                delayFailureKinds[envelope.data.name] = nil
+                rebuildCountryGroups()
+            }
+        case "task_updated":
+            let envelope = try event.decode(SupercoreTaskEventEnvelope.self)
+            applyTaskProgress(envelope.task)
+        case "status_changed", "subscription_updated":
+            scheduleEventSnapshotRefresh(includeRuntime: true)
+        default:
+            break
+        }
+    }
+
+    private func applyTaskProgress(_ task: SupercoreTaskProgress) {
+        guard task.status == "queued" || task.status == "running" else { return }
+        guard let total = task.total, total > 0 else { return }
+        let current = min(task.current, total)
+        switch (operation?.kind, task.kind) {
+        case (.testingDelay, "probe_outbounds"), (.testingDelay, "probe_group"):
+            updateOperation("正在测速 \(current)/\(total)...")
+        case (.importingSubscription, "subscription_import"):
+            updateOperation("正在导入订阅 \(current)/\(total)...")
+        case (.updatingSubscription, "subscription_update_all"):
+            updateOperation("正在更新订阅 \(current)/\(total)...")
+        default:
+            break
+        }
+    }
+
+    private func appendSupercoreLog(_ event: SupercoreLogEvent) {
+        let key = "\(event.time)\u{0}\(event.level)\u{0}\(event.message)"
+        guard seenSupercoreLogEvents.insert(key).inserted else { return }
+        if seenSupercoreLogEvents.count > 4_000 {
+            seenSupercoreLogEvents.removeAll(keepingCapacity: true)
+            seenSupercoreLogEvents.insert(key)
+        }
+        appendLog("[supercore:\(event.level)] \(event.message)")
+    }
+
+    private func scheduleEventSnapshotRefresh(includeRuntime: Bool) {
+        eventSnapshotRefreshTask?.cancel()
+        eventSnapshotRefreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.refreshEventSnapshots(includeRuntime: includeRuntime)
+        }
+    }
+
+    private func refreshEventSnapshots(includeRuntime: Bool) async {
+        if let status = try? await supercoreAPIClient.getStatus() {
+            let snapshot = ConnectionTrafficSnapshot(
+                upTotal: Int(clamping: status.traffic.uploadTotal),
+                downTotal: Int(clamping: status.traffic.downloadTotal)
+            )
+            recordTrafficSnapshot(snapshot)
+        }
+        if let events = try? await supercoreAPIClient.getLogEvents() {
+            for event in events.reversed() {
+                appendSupercoreLog(event)
+            }
+        }
+        if includeRuntime, coreState.isRunning {
+            do {
+                try await refreshRuntimeState()
+                mergeRuntimeNodesIntoProviderCatalog()
+            } catch {
+                appendLog("Supercore 事件重连快照刷新失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func startPollingFallback() {
+        guard trafficPollingTask == nil, logsTask == nil else { return }
         trafficPollingTask = Task { [weak self] in
             guard let self else { return }
             var previous: ConnectionTrafficSnapshot?
@@ -1415,14 +1572,12 @@ final class AppState: ObservableObject {
         }
         logsTask = Task { [weak self] in
             guard let self else { return }
-            var seen = Set<String>()
             while !Task.isCancelled {
                 do {
-                    let lines = try await self.supercoreAPIClient.getLogs()
+                    let events = try await self.supercoreAPIClient.getLogEvents()
                     await MainActor.run {
-                        for line in lines.reversed() where !seen.contains(line) {
-                            seen.insert(line)
-                            self.appendLog(line)
+                        for event in events.reversed() {
+                            self.appendSupercoreLog(event)
                         }
                     }
                 } catch {
@@ -1438,10 +1593,17 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func stopPollingFallback() {
+        trafficPollingTask?.cancel()
+        logsTask?.cancel()
+        trafficPollingTask = nil
+        logsTask = nil
+    }
+
     private func handleSupercoreStreamFailure(_ error: Error, source: String) {
         if isSupercoreConnectionFailure(error) {
             appendLog("Supercore \(source)轮询已暂停：控制端口暂不可用")
-            stopStreams()
+            stopPollingFallback()
             return
         }
         appendLog("Supercore \(source)轮询失败：\(error.localizedDescription)")
@@ -1971,12 +2133,13 @@ final class AppState: ObservableObject {
     }
 
     private func stopStreams() {
-        trafficPollingTask?.cancel()
-        logsTask?.cancel()
+        eventStreamTask?.cancel()
+        eventSnapshotRefreshTask?.cancel()
+        stopPollingFallback()
         smartRuleLearningTask?.cancel()
         smartRuleProbeTasks.values.forEach { $0.cancel() }
-        trafficPollingTask = nil
-        logsTask = nil
+        eventStreamTask = nil
+        eventSnapshotRefreshTask = nil
         smartRuleLearningTask = nil
         smartRuleProbeTasks = [:]
         saveSmartRulesForActiveProfile()
@@ -2764,7 +2927,7 @@ final class AppState: ObservableObject {
 
     private func ensureCoreRunningForDelayTesting() async throws {
         if coreState.isRunning {
-            if trafficPollingTask == nil || logsTask == nil {
+            if eventStreamTask == nil {
                 startStreams()
             }
             return

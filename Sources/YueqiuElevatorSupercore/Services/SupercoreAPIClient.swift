@@ -2,6 +2,8 @@ import Foundation
 
 enum ProbeTimeoutCalculator {
     private static let timeoutBufferSeconds: TimeInterval = 0.5
+    private static let unknownNodeMinimumSeconds: TimeInterval = 60
+    private static let unknownNodeBatchBudget = 80
 
     static func requestTimeout(
         timeoutMilliseconds: Int,
@@ -10,7 +12,13 @@ enum ProbeTimeoutCalculator {
     ) -> TimeInterval {
         let baseTimeoutSeconds = TimeInterval(max(1, timeoutMilliseconds)) / 1000.0
         let parallelism = max(1, concurrency ?? DelayPolicy.manualConcurrency)
-        let count = names?.filter { !$0.isEmpty }.count ?? 0
+        guard let names else {
+            return max(
+                unknownNodeMinimumSeconds,
+                baseTimeoutSeconds * TimeInterval(unknownNodeBatchBudget) + timeoutBufferSeconds
+            )
+        }
+        let count = names.filter { !$0.isEmpty }.count
         guard count > 0 else {
             return baseTimeoutSeconds + timeoutBufferSeconds
         }
@@ -129,7 +137,11 @@ final class SupercoreAPIClient: @unchecked Sendable {
         let response: SupercoreProbeGroupResponse = try await requestTask(
             path: "/v1/probes/group",
             method: "POST",
-            taskTimeout: TimeInterval(timeoutMilliseconds) / 1000.0 + 10,
+            taskTimeout: ProbeTimeoutCalculator.requestTimeout(
+                timeoutMilliseconds: timeoutMilliseconds,
+                concurrency: concurrency,
+                names: nil
+            ),
             body: body
         )
         guard response.ok else {
@@ -225,7 +237,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
         let response: SupercoreOKResponse = try await requestTask(
             path: "/v1/subscriptions/update-all",
             method: "POST",
-            taskTimeout: 60
+            taskTimeout: 300
         )
         try response.throwIfNeeded()
     }
@@ -275,8 +287,12 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getLogs() async throws -> [String] {
+        try await getLogEvents().map { "[supercore:\($0.level)] \($0.message)" }
+    }
+
+    func getLogEvents() async throws -> [SupercoreLogEvent] {
         let response: SupercoreLogsResponse = try await request(path: "/v1/logs")
-        return response.logs.map { "[supercore:\($0.level)] \($0.message)" }
+        return response.logs
     }
 
     func getSubscriptionTraffic() async throws -> [SupercoreSubscriptionTraffic] {
@@ -287,6 +303,59 @@ final class SupercoreAPIClient: @unchecked Sendable {
 
     func getSmartRules() async throws -> SupercoreSmartRulesSnapshot {
         try await request(path: "/v1/smart-rules")
+    }
+
+    func eventStream(lastEventID: String? = nil) -> AsyncThrowingStream<SupercoreControlEvent, Error> {
+        let (baseURL, controlToken) = baseURLLock.sync {
+            (self.baseURL, self.controlToken)
+        }
+        return AsyncThrowingStream { continuation in
+            let streamTask = Task {
+                do {
+                    var request = URLRequest(url: baseURL.appendingPathComponent("/v1/events"))
+                    request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+                    if let controlToken, !controlToken.isEmpty {
+                        request.setValue("Bearer \(controlToken)", forHTTPHeaderField: "Authorization")
+                    }
+                    if let lastEventID, !lastEventID.isEmpty {
+                        request.setValue(lastEventID, forHTTPHeaderField: "Last-Event-ID")
+                    }
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw AppError.unexpectedResponse
+                    }
+                    guard (200..<300).contains(http.statusCode) else {
+                        throw AppError.apiError(
+                            http.statusCode,
+                            HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+                        )
+                    }
+                    continuation.yield(.connected)
+                    var parser = SupercoreSSEParser()
+                    for try await line in bytes.lines {
+                        try Task.checkCancellation()
+                        if let event = parser.consume(line: line) {
+                            continuation.yield(event)
+                        }
+                    }
+                    if let event = parser.finish() {
+                        continuation.yield(event)
+                    }
+                    if !Task.isCancelled {
+                        throw URLError(.networkConnectionLost)
+                    }
+                    continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in
+                streamTask.cancel()
+            }
+        }
     }
 
     func applySmartRecommendation(target: String, value: String) async throws {
@@ -424,6 +493,162 @@ final class SupercoreAPIClient: @unchecked Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
+    }
+}
+
+struct SupercoreControlEvent: Sendable, Equatable {
+    let id: String?
+    let name: String
+    let data: Data
+
+    static let connected = SupercoreControlEvent(id: nil, name: "__connected", data: Data())
+
+    func decode<T: Decodable>(_ type: T.Type) throws -> T {
+        try JSONDecoder().decode(type, from: data)
+    }
+}
+
+struct SupercoreTelemetryEnvelope<Payload: Decodable>: Decodable {
+    let schemaVersion: Int
+    let id: String
+    let event: String
+    let timestamp: String
+    let data: Payload
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case id
+        case event
+        case timestamp
+        case data
+    }
+}
+
+struct SupercoreTaskEventEnvelope: Decodable {
+    let schemaVersion: Int
+    let id: String
+    let event: String
+    let timestamp: String
+    let task: SupercoreTaskProgress
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case id
+        case event
+        case timestamp
+        case task
+    }
+}
+
+struct SupercoreTaskProgress: Decodable {
+    let id: String
+    let kind: String
+    let status: String
+    let current: UInt64
+    let total: UInt64?
+    let message: String
+}
+
+struct SupercoreProbeProgressEvent: Decodable {
+    let taskID: String
+    let completed: UInt64
+    let total: UInt64
+    let node: String
+
+    enum CodingKeys: String, CodingKey {
+        case taskID = "task_id"
+        case completed
+        case total
+        case node
+    }
+}
+
+struct SupercoreTrafficEvent: Decodable {
+    let uploadTotal: UInt64
+    let downloadTotal: UInt64
+    let uploadRate: UInt64
+    let downloadRate: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case uploadTotal = "upload_total"
+        case downloadTotal = "download_total"
+        case uploadRate = "upload_rate"
+        case downloadRate = "download_rate"
+    }
+}
+
+struct SupercoreOutboundHealthEvent: Decodable {
+    let name: String
+    let attempts: UInt64
+    let successes: UInt64
+    let failures: UInt64
+    let lastLatencyMs: UInt64?
+    let lastError: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case attempts
+        case successes
+        case failures
+        case lastLatencyMs = "last_latency_ms"
+        case lastError = "last_error"
+    }
+}
+
+struct SupercoreSSEParser {
+    private var id: String?
+    private var eventName = "message"
+    private var dataLines: [String] = []
+
+    mutating func consume(line: String) -> SupercoreControlEvent? {
+        if line.isEmpty {
+            return flush()
+        }
+        if line.hasPrefix(":") {
+            return nil
+        }
+        let field: String
+        var value = ""
+        if let separator = line.firstIndex(of: ":") {
+            field = String(line[..<separator])
+            let valueStart = line.index(after: separator)
+            value = String(line[valueStart...])
+            if value.first == " " {
+                value.removeFirst()
+            }
+        } else {
+            field = line
+        }
+        switch field {
+        case "id":
+            if !value.contains("\0") {
+                id = value
+            }
+        case "event":
+            eventName = value.isEmpty ? "message" : value
+        case "data":
+            dataLines.append(value)
+        default:
+            break
+        }
+        return nil
+    }
+
+    mutating func finish() -> SupercoreControlEvent? {
+        flush()
+    }
+
+    private mutating func flush() -> SupercoreControlEvent? {
+        defer {
+            eventName = "message"
+            dataLines = []
+        }
+        guard !dataLines.isEmpty else { return nil }
+        return SupercoreControlEvent(
+            id: id,
+            name: eventName,
+            data: Data(dataLines.joined(separator: "\n").utf8)
+        )
     }
 }
 

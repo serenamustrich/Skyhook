@@ -36,8 +36,12 @@
 - 本批次回归：Rust lib 90 passed、Swift full 93 passed。统一 telemetry event bus
   已接入 task、测速进度、运行状态、订阅更新、连接、流量、日志和节点健康事件，
   高频连接/流量事件按 250ms 节流。
-- Swift 目前仍以 task polling 读取长任务结果，尚未接入 SSE 自动重连和快照恢复；
-  Provider、Geo、TUN 和深度 Doctor 等长任务也尚未全部迁移，因此 M0 继续保持
+- Swift 已接入标准 SSE parser、`Last-Event-ID`、指数退避重连和快照恢复；正常时
+  使用事件更新实时速率、增量日志、节点健康和 task 进度，断线时自动退回 1 秒流量/
+  2 秒日志轮询。
+- 未知节点规模的全量测速 task 等待预算已从约 1 秒修正为至少 60 秒，更新全部订阅
+  的 task 等待上限提高到 5 分钟。本批次 Swift full 96 passed。
+- Provider、Geo、TUN 和深度 Doctor 等长任务尚未全部迁移，因此 M0 继续保持
   `IN_PROGRESS`。
 
 ## 0. 开发总原则
