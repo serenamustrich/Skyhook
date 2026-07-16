@@ -302,6 +302,7 @@ fn snell_capability_supports_http_obfs_and_marks_udp_boundary() {
             version: Some(3),
             obfs: Some("http".to_string()),
             obfs_host: None,
+            reuse: false,
         },
     );
     let runtime = Runtime::new(config).expect("runtime");
@@ -327,6 +328,7 @@ async fn snell_outbound_with_unknown_obfs_returns_error() {
             version: Some(3),
             obfs: Some("xor".to_string()),
             obfs_host: None,
+            reuse: false,
         }],
         None,
     )
@@ -360,6 +362,7 @@ fn snell_outbound_capability_v3_tcp_supported() {
             version: Some(3),
             obfs: None,
             obfs_host: None,
+            reuse: false,
         },
     );
     let runtime = Runtime::new(config).expect("runtime");
@@ -384,6 +387,7 @@ fn snell_outbound_capability_v4_v5_tcp_udp_supported() {
                 version: Some(version),
                 obfs: None,
                 obfs_host: None,
+                reuse: true,
             },
         );
         let runtime = Runtime::new(config).expect("runtime");
@@ -410,6 +414,7 @@ fn snell_v4_capability_rejects_non_aes128_method() {
             version: Some(4),
             obfs: None,
             obfs_host: None,
+            reuse: false,
         },
     );
     let runtime = Runtime::new(config).expect("runtime");
@@ -420,6 +425,32 @@ fn snell_v4_capability_rejects_non_aes128_method() {
         .limitations
         .iter()
         .any(|item| item.contains("unsupported snell method aes-256-gcm")));
+}
+
+#[test]
+fn snell_v3_capability_rejects_connection_reuse() {
+    let config = config_with_default(
+        "snell-v3-reuse",
+        OutboundConfig::Snell {
+            name: "snell-v3-reuse".to_string(),
+            server: "snell.example.com".to_string(),
+            port: 4406,
+            psk: "psk".to_string(),
+            method: Some("aes-128-gcm".to_string()),
+            version: Some(3),
+            obfs: None,
+            obfs_host: None,
+            reuse: true,
+        },
+    );
+    let runtime = Runtime::new(config).expect("runtime");
+    let snapshot = find_snapshot(&runtime, "snell-v3-reuse");
+    assert!(!snapshot.tcp_supported);
+    assert!(snapshot.udp_supported);
+    assert!(snapshot
+        .limitations
+        .iter()
+        .any(|item| item.contains("snell connection reuse requires version 4 or 5")));
 }
 
 // ---------------------------------------------------------------------------
@@ -954,6 +985,7 @@ fn capability_report_covers_all_partial_protocols() {
             version: None,
             obfs: None,
             obfs_host: None,
+            reuse: false,
         },
         OutboundConfig::WireGuard {
             name: "wg".to_string(),

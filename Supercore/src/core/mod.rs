@@ -1378,6 +1378,7 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
             method,
             version,
             obfs,
+            reuse,
             ..
         } => {
             let version = version.unwrap_or(3);
@@ -1428,6 +1429,10 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                     obfs.as_deref().unwrap_or_default()
                 ));
             }
+            let reuse_supported = !reuse || matches!(version, 4 | 5);
+            if !reuse_supported {
+                limitations.push("snell connection reuse requires version 4 or 5".to_string());
+            }
             let udp_supported = version_supported
                 && method_supported
                 && matches!(version, 3..=5)
@@ -1441,7 +1446,7 @@ fn outbound_capability_snapshot(config: &OutboundConfig) -> OutboundCapabilitySn
                 limitations.push("snell udp over simple-obfs is not supported".to_string());
             }
             (
-                version_supported && method_supported && obfs_supported,
+                version_supported && method_supported && obfs_supported && reuse_supported,
                 udp_supported,
                 Some(if udp_supported {
                     if version >= 4 {

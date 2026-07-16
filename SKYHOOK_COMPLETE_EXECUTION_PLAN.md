@@ -109,30 +109,29 @@ Skyhook 已有或计划额外支持：
 ### 2.1 已确认状态
 
 - 2026-07-17 当前 `cargo check` 通过。
-- 完整 Rust 回归为 `256 passed, 0 failed, 1 ignored`；ignored 项仅为需要外部订阅 URL 环境变量的兼容测试。
+- 完整 Rust 回归为 `263 passed, 0 failed, 1 ignored`；ignored 项仅为需要外部订阅 URL 环境变量的兼容测试。
 - VMess TCP、WebSocket、gRPC、HTTP/2、UDP 曾完成真实拨号验证。
 - Trojan TCP、UDP、WebSocket、gRPC、HTTP/2、HTTPUpgrade 曾完成真实拨号验证。
 - Shadowsocks 旧 AEAD、2022、SIP022、SIP023、simple-obfs 和 v2ray-plugin WebSocket 已有真实拨号路径。
-- Snell v1-v5 TCP、HTTP/TLS obfs 和 v3-v5 UDP-over-TCP 已有真实拨号路径，定向测试 13 个通过。
+- Snell v1-v5 TCP、HTTP/TLS obfs、v3-v5 UDP-over-TCP 和 v4/v5 connection reuse 已有真实拨号路径，定向测试 18 个通过。
 - SSR origin、旧 verify/auth 系列、auth_aes128_md5/sha1、auth_chain_a-f 与 tls1.2_ticket_auth 已写入实现，定向测试 41 个通过。
 - Swift 完整回归为 `89 passed, 0 failed`。
-- Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s。
+- M0 Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s，M4 后按统一门策略未重复执行完整 LTO。
 
-### 2.2 当前正在工作区中的未收口内容
+### 2.2 当前阶段状态
 
-- SSR 全部目标协议的实现、capability 和定向真实拨号测试已经对齐。
-- Snell v4/v5 的 TCP、UDP、HTTP/TLS obfs 与 capability 已实现。
-- Snell v4/v5 connection reuse 尚未实现。
-- SSR/Snell 扩展后的 Rust/Swift 全量回归和 release build 已通过。
-- 当前状态仍为 `CODE_IN_PROGRESS`，不能标记 M4 完成。
+- M0 已通过 Rust 263/0/1、Swift 89/0、双 release build 和 Git 基线验收。
+- M4 的 Shadowsocks、SSR 与 Snell 计划内实现、capability 和真实拨号测试已经对齐。
+- Snell v4/v5 connection reuse 已覆盖 v4/v5、HTTP/TLS obfs、零帧半关闭、连接池和陈旧连接自动重拨。
+- 下一阶段进入 M1，拆分公共 transport、UDP、连接池和错误层。
 
 ### 2.3 明确的结构问题
 
-- `Supercore/src/outbound/mod.rs` 约 12,453 行，协议、transport、加密、UDP 和测试辅助逻辑高度集中。
-- `Supercore/src/core/mod.rs` 约 2,058 行。
+- `Supercore/src/outbound/mod.rs` 约 13,759 行，协议、transport、加密、UDP 和测试辅助逻辑高度集中。
+- `Supercore/src/core/mod.rs` 约 2,098 行。
 - `AppState.swift` 约 2,855 行。
 - `SettingsWindow.swift` 约 1,614 行。
-- 项目目录当前不是 Git 工作区，无法可靠审计变更、提交和回滚。
+- 项目目录已经建立本地 Git 基线，但尚未与现有 Rust-only GitHub 仓库完成产品级远端布局迁移。
 - `Cargo.toml` 仍声明 `license = "Proprietary"`，与公开仓库目标不一致。
 - 当前 API 同时存在 `/proxies` 等兼容入口和 `/supercore/*`，最终需要收敛成 Skyhook 自己的版本化 API。
 
@@ -160,11 +159,11 @@ Skyhook 已有或计划额外支持：
 
 | 里程碑 | 内容 | 当前状态 | 依赖 |
 |---|---|---|---|
-| M0 | 冻结基线、恢复 Git、收口当前半成品 | IN_PROGRESS | 无 |
+| M0 | 冻结基线、恢复 Git、收口当前半成品 | VERIFIED | 无 |
 | M1 | 公共 transport、UDP、错误和 API 架构 | NOT_STARTED | M0 |
 | M2 | VMess 再验收 | PREVIOUSLY_VERIFIED | M0、M1 |
 | M3 | Trojan 再验收 | PREVIOUSLY_VERIFIED | M0、M1 |
-| M4 | Shadowsocks、SSR、Snell 完成 | IN_PROGRESS | M0，随后接 M1 |
+| M4 | Shadowsocks、SSR、Snell 完成 | VERIFIED | M0，随后接 M1 |
 | M5 | VLESS、Reality、Vision | PARTIAL | M1 |
 | M6 | QUIC、Hysteria、Hysteria2、TUIC | PARTIAL | M1 |
 | M7 | WireGuard、AnyTLS、ShadowTLS、Naive、HTTP、SOCKS5、SSH | PARTIAL | M1 |
@@ -1524,12 +1523,8 @@ swift build -c release
 
 下一次开始开发时严格执行：
 
-1. 恢复 Git 工作区并保护当前改动。
-2. 将当前通过 256/89 回归和双 release build 的状态提交成可回滚基线。
-3. 实现 Snell v4/v5 connection reuse 并增加单连接双请求 E2E。
-4. 拆分 outbound 公共 transport、UDP、连接池和错误层。
-5. 按 M5、M6、M7、M8 顺序补齐协议。
-6. 再进入测速、TUN、订阅、智能规则和 App。
-7. 最后统一做性能、安全、DMG 和 Release。
-
-在 M0 完成前，不继续扩大新协议范围。
+1. 提交 M4 的 Snell connection reuse 变更和 263/89 回归证据。
+2. 拆分 outbound 公共 transport、UDP、连接池和错误层。
+3. 按 M5、M6、M7、M8 顺序补齐协议。
+4. 再进入测速、TUN、订阅、智能规则和 App。
+5. 最后统一做性能、安全、DMG 和 Release。

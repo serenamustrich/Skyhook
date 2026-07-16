@@ -41,7 +41,10 @@ use sha3::{
     Shake128,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf},
+    io::{
+        AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf,
+        WriteHalf,
+    },
     net::{lookup_host, TcpStream, UdpSocket},
     sync::Mutex as TokioMutex,
     task::JoinHandle,
@@ -376,6 +379,7 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             version,
             obfs,
             obfs_host,
+            reuse,
         } => Arc::new(SnellOutbound {
             name: name.clone(),
             server: server.clone(),
@@ -385,6 +389,8 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             version: *version,
             obfs: obfs.clone(),
             obfs_host: obfs_host.clone(),
+            reuse: *reuse,
+            v4_pool: Arc::new(TokioMutex::new(SnellV4ConnectionPool::default())),
         }),
         OutboundConfig::Hysteria { name, .. } => Arc::new(UnsupportedProtocolOutbound {
             name: name.clone(),
@@ -3172,6 +3178,226 @@ struct SnellOutbound {
     version: Option<u8>,
     obfs: Option<String>,
     obfs_host: Option<String>,
+    reuse: bool,
+    v4_pool: Arc<TokioMutex<SnellV4ConnectionPool>>,
+}
+
+const SNELL_V4_POOL_SIZE: usize = 10;
+const SNELL_V4_POOL_IDLE_AGE: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
+struct SnellV4ConnectionPool {
+    idle: Vec<SnellV4IdleConnection>,
+}
+
+struct SnellV4IdleConnection {
+    connection: SnellV4PooledConnection,
+    idle_since: Instant,
+}
+
+impl SnellV4ConnectionPool {
+    fn take(&mut self) -> Option<SnellV4PooledConnection> {
+        let now = Instant::now();
+        self.idle
+            .retain(|entry| now.duration_since(entry.idle_since) <= SNELL_V4_POOL_IDLE_AGE);
+        self.idle.pop().map(|entry| entry.connection)
+    }
+
+    fn put(&mut self, connection: SnellV4PooledConnection) {
+        if self.idle.len() >= SNELL_V4_POOL_SIZE {
+            self.idle.remove(0);
+        }
+        self.idle.push(SnellV4IdleConnection {
+            connection,
+            idle_since: Instant::now(),
+        });
+    }
+}
+
+struct SnellV4PooledConnection {
+    reader: SnellV4PooledReader,
+    writer: SnellV4PooledWriter,
+}
+
+impl SnellV4PooledConnection {
+    fn new(
+        stream: BoxedStream,
+        psk: &[u8],
+        plugin: Option<ShadowsocksPluginConfig>,
+        server: String,
+        port: u16,
+    ) -> anyhow::Result<Self> {
+        let mut salt = [0u8; SNELL_V4_SALT_LEN];
+        getrandom::fill(&mut salt)
+            .map_err(|error| anyhow!("failed to generate snell v4 reuse salt: {error}"))?;
+        let upload_key = derive_snell_subkey(SsCipher::Aes128Gcm, psk, &salt)?;
+        let (remote_read, remote_write) = tokio::io::split(stream);
+        Ok(Self {
+            reader: SnellV4PooledReader {
+                remote: remote_read,
+                plugin: plugin.clone(),
+                psk: psk.to_vec(),
+                download_key: None,
+                download_nonce: [0u8; SS_NONCE_LEN],
+                http_initialized: false,
+                http_leftover: BytesMut::new(),
+                tls_decoder: SimpleObfsTlsDecoder::new(),
+            },
+            writer: SnellV4PooledWriter {
+                remote: remote_write,
+                plugin,
+                server,
+                port,
+                upload_key,
+                upload_nonce: [0u8; SS_NONCE_LEN],
+                salt,
+                started: false,
+            },
+        })
+    }
+}
+
+struct SnellV4PooledReader {
+    remote: ReadHalf<BoxedStream>,
+    plugin: Option<ShadowsocksPluginConfig>,
+    psk: Vec<u8>,
+    download_key: Option<Vec<u8>>,
+    download_nonce: [u8; SS_NONCE_LEN],
+    http_initialized: bool,
+    http_leftover: BytesMut,
+    tls_decoder: SimpleObfsTlsDecoder,
+}
+
+impl SnellV4PooledReader {
+    async fn read_transport_exact(&mut self, length: usize) -> anyhow::Result<Vec<u8>> {
+        if plugin_is_tls_obfs(self.plugin.as_ref()) {
+            return self
+                .tls_decoder
+                .read_exact_or_eof(&mut self.remote, length)
+                .await?
+                .ok_or_else(|| anyhow!("snell v4 reuse TLS-obfs stream ended unexpectedly"));
+        }
+
+        if plugin_is_http_obfs(self.plugin.as_ref()) && !self.http_initialized {
+            let leftover = read_http_obfs_response(&mut self.remote).await?;
+            self.http_leftover.extend_from_slice(&leftover);
+            self.http_initialized = true;
+        }
+
+        let mut output = vec![0u8; length];
+        let buffered = length.min(self.http_leftover.len());
+        if buffered > 0 {
+            let chunk = self.http_leftover.split_to(buffered);
+            output[..buffered].copy_from_slice(&chunk);
+        }
+        if buffered < length {
+            self.remote
+                .read_exact(&mut output[buffered..])
+                .await
+                .context("snell v4 reuse stream ended unexpectedly")?;
+        }
+        Ok(output)
+    }
+
+    async fn read_frame(&mut self) -> anyhow::Result<Vec<u8>> {
+        if self.download_key.is_none() {
+            let salt = self.read_transport_exact(SNELL_V4_SALT_LEN).await?;
+            self.download_key = Some(derive_snell_subkey(SsCipher::Aes128Gcm, &self.psk, &salt)?);
+        }
+        let key = self
+            .download_key
+            .as_ref()
+            .expect("snell v4 download key initialized")
+            .clone();
+        let header_cipher = self
+            .read_transport_exact(SNELL_V4_HEADER_CIPHER_LEN)
+            .await?;
+        let header = SsCipher::Aes128Gcm.decrypt(&key, &self.download_nonce, &header_cipher)?;
+        increment_nonce(&mut self.download_nonce);
+        if header.len() != SNELL_V4_HEADER_PLAIN_LEN || header[0] != 4 {
+            return Err(anyhow!("invalid snell v4 reuse frame header"));
+        }
+        let padding_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        let payload_len = u16::from_be_bytes([header[5], header[6]]) as usize;
+        if payload_len == 0 {
+            if padding_len != 0 {
+                return Err(anyhow!("snell v4 reuse zero chunk cannot contain padding"));
+            }
+            return Ok(Vec::new());
+        }
+        if payload_len > SS_CHUNK_SIZE || padding_len > SS_CHUNK_SIZE {
+            return Err(anyhow!("snell v4 reuse frame is too large"));
+        }
+        let mut frame = self
+            .read_transport_exact(padding_len + payload_len + SS_TAG_LEN)
+            .await?;
+        let (padding, payload_cipher) = frame.split_at_mut(padding_len);
+        swap_snell_v4_padding(padding, payload_cipher);
+        let payload = SsCipher::Aes128Gcm.decrypt(&key, &self.download_nonce, payload_cipher)?;
+        increment_nonce(&mut self.download_nonce);
+        Ok(payload)
+    }
+}
+
+struct SnellV4PooledWriter {
+    remote: WriteHalf<BoxedStream>,
+    plugin: Option<ShadowsocksPluginConfig>,
+    server: String,
+    port: u16,
+    upload_key: Vec<u8>,
+    upload_nonce: [u8; SS_NONCE_LEN],
+    salt: [u8; SNELL_V4_SALT_LEN],
+    started: bool,
+}
+
+impl SnellV4PooledWriter {
+    async fn write_request(
+        &mut self,
+        destination: &Destination,
+        version: u8,
+    ) -> anyhow::Result<()> {
+        let request = build_snell_tcp_handshake_with_reuse(destination, Some(version), true)?;
+        let padding = if self.started {
+            0
+        } else {
+            snell_v4_initial_padding_len()?
+        };
+        self.write_frame(&request, padding).await
+    }
+
+    async fn write_payload(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        for chunk in payload.chunks(SS_CHUNK_SIZE) {
+            self.write_frame(chunk, 0).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_zero(&mut self) -> anyhow::Result<()> {
+        self.write_frame(&[], 0).await
+    }
+
+    async fn write_frame(&mut self, payload: &[u8], padding: usize) -> anyhow::Result<()> {
+        let first_frame = !self.started;
+        let encrypted =
+            encode_snell_v4_frame(&self.upload_key, &mut self.upload_nonce, payload, padding)?;
+        let wire = if first_frame {
+            let mut initial = self.salt.to_vec();
+            initial.extend_from_slice(&encrypted);
+            if let Some(plugin) = self.plugin.as_ref() {
+                apply_shadowsocks_plugin_request(plugin, &self.server, self.port, initial)?
+            } else {
+                initial
+            }
+        } else if plugin_is_tls_obfs(self.plugin.as_ref()) {
+            wrap_simple_obfs_tls_app_data(&encrypted)
+        } else {
+            encrypted
+        };
+        self.remote.write_all(&wire).await?;
+        self.remote.flush().await?;
+        self.started = true;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -3190,7 +3416,15 @@ impl Outbound for SnellOutbound {
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
         let version = validate_snell_version(self.version)?;
+        if self.reuse && version < 4 {
+            return Err(anyhow!(
+                "snell connection reuse requires version 4 or 5; configured version is {version}"
+            ));
+        }
         if version >= 4 {
+            if self.reuse {
+                return self.connect_v4_reuse(destination, timeout_ms).await;
+            }
             return self.connect_v4(destination, timeout_ms).await;
         }
         let cipher = snell_cipher(version, self.method.as_deref())?;
@@ -3308,6 +3542,73 @@ impl Outbound for SnellOutbound {
 }
 
 impl SnellOutbound {
+    async fn connect_v4_reuse(
+        &self,
+        destination: &Destination,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BoxedStream> {
+        snell_cipher(4, self.method.as_deref())?;
+        let mut was_pooled = true;
+        let mut connection = if let Some(connection) = self.v4_pool.lock().await.take() {
+            connection
+        } else {
+            was_pooled = false;
+            self.new_v4_pooled_connection(timeout_ms).await?
+        };
+
+        loop {
+            let setup = timeout(Duration::from_millis(timeout_ms), async {
+                connection
+                    .writer
+                    .write_request(destination, self.version.unwrap_or(4))
+                    .await?;
+                connection.reader.read_frame().await
+            })
+            .await;
+            let reply = match setup {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(_error)) if was_pooled => {
+                    connection = self.new_v4_pooled_connection(timeout_ms).await?;
+                    was_pooled = false;
+                    continue;
+                }
+                Ok(Err(error)) => return Err(error).context("snell reuse handshake failed"),
+                Err(_) if was_pooled => {
+                    connection = self.new_v4_pooled_connection(timeout_ms).await?;
+                    was_pooled = false;
+                    continue;
+                }
+                Err(_) => return Err(anyhow!("snell reuse handshake timed out")),
+            };
+            validate_snell_response(&reply, "TCP connect")?;
+            let initial_payload = reply.get(1..).unwrap_or_default().to_vec();
+            return Ok(Box::new(spawn_snell_v4_reuse_stream(
+                connection,
+                Arc::clone(&self.v4_pool),
+                initial_payload,
+            )));
+        }
+    }
+
+    async fn new_v4_pooled_connection(
+        &self,
+        timeout_ms: u64,
+    ) -> anyhow::Result<SnellV4PooledConnection> {
+        let plugin = snell_obfs_plugin(
+            self.obfs.as_deref(),
+            self.obfs_host.as_deref(),
+            &self.server,
+        )?;
+        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
+        SnellV4PooledConnection::new(
+            Box::new(tcp),
+            self.psk.as_bytes(),
+            plugin,
+            self.server.clone(),
+            self.port,
+        )
+    }
+
     async fn connect_v4(
         &self,
         destination: &Destination,
@@ -3404,6 +3705,8 @@ impl SnellOutbound {
     }
 }
 
+const SNELL_COMMAND_CONNECT: u8 = 1;
+const SNELL_COMMAND_CONNECT_REUSE: u8 = 5;
 const SNELL_COMMAND_UDP: u8 = 6;
 const SNELL_COMMAND_UDP_FORWARD: u8 = 1;
 const SNELL_V4_SALT_LEN: usize = 16;
@@ -3493,12 +3796,21 @@ fn build_snell_tcp_handshake(
     destination: &Destination,
     snell_version: Option<u8>,
 ) -> anyhow::Result<Vec<u8>> {
+    build_snell_tcp_handshake_with_reuse(destination, snell_version, false)
+}
+
+fn build_snell_tcp_handshake_with_reuse(
+    destination: &Destination,
+    snell_version: Option<u8>,
+    reuse: bool,
+) -> anyhow::Result<Vec<u8>> {
     if destination.host.len() > 255 {
         return Err(anyhow!("snell destination host is too long"));
     }
     let command = match snell_version.unwrap_or(3) {
-        1 | 3 | 4 | 5 => 1,
-        2 => 5,
+        2 => SNELL_COMMAND_CONNECT_REUSE,
+        4 | 5 if reuse => SNELL_COMMAND_CONNECT_REUSE,
+        1 | 3 | 4 | 5 => SNELL_COMMAND_CONNECT,
         version => {
             return Err(anyhow!(
                 "unsupported snell version {version}; supported: 1, 2, 3, 4, 5"
@@ -10676,6 +10988,79 @@ fn spawn_shadowsocks_stream(
             )
             .await;
         }
+    });
+
+    app_side
+}
+
+fn spawn_snell_v4_reuse_stream(
+    connection: SnellV4PooledConnection,
+    pool: Arc<TokioMutex<SnellV4ConnectionPool>>,
+    initial_payload: Vec<u8>,
+) -> DuplexStream {
+    let (app_side, relay_side) = tokio::io::duplex(64 * 1024);
+    let (mut local_read, mut local_write) = tokio::io::split(relay_side);
+    let SnellV4PooledConnection {
+        mut reader,
+        mut writer,
+    } = connection;
+
+    tokio::spawn(async move {
+        let mut clean = true;
+        let mut upload_closed = false;
+        let mut peer_closed = false;
+        if !initial_payload.is_empty() && local_write.write_all(&initial_payload).await.is_err() {
+            clean = false;
+        }
+
+        let mut buffer = vec![0u8; SS_CHUNK_SIZE];
+        while clean && !peer_closed {
+            tokio::select! {
+                local_result = local_read.read(&mut buffer), if !upload_closed => {
+                    match local_result {
+                        Ok(0) => {
+                            if writer.write_zero().await.is_err() {
+                                clean = false;
+                            }
+                            upload_closed = true;
+                        }
+                        Ok(length) => {
+                            if writer.write_payload(&buffer[..length]).await.is_err() {
+                                clean = false;
+                            }
+                        }
+                        Err(_) => clean = false,
+                    }
+                }
+                remote_result = reader.read_frame() => {
+                    match remote_result {
+                        Ok(payload) if payload.is_empty() => {
+                            peer_closed = true;
+                        }
+                        Ok(payload) => {
+                            if local_write.write_all(&payload).await.is_err() {
+                                clean = false;
+                            }
+                        }
+                        Err(_) => clean = false,
+                    }
+                }
+            }
+        }
+
+        if clean && peer_closed && !upload_closed {
+            if writer.write_zero().await.is_err() {
+                clean = false;
+            }
+            upload_closed = true;
+        }
+
+        if clean && upload_closed && peer_closed {
+            pool.lock()
+                .await
+                .put(SnellV4PooledConnection { reader, writer });
+        }
+        let _ = local_write.shutdown().await;
     });
 
     app_side

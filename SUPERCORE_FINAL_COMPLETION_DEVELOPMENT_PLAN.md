@@ -6,7 +6,7 @@
 
 ## 当前执行进度（2026-07-17）
 
-- 本轮完整 Rust 回归：256 passed、0 failed、1 ignored；ignored 项仅为需要外部订阅 URL 环境变量的兼容测试。
+- 本轮完整 Rust 回归：263 passed、0 failed、1 ignored；ignored 项仅为需要外部订阅 URL 环境变量的兼容测试。
 - VMess gRPC、H2、UDP 的 3 个 ignored 真实拨号测试已经修复并取消 ignore。
 - VMess TCP、WS、gRPC、H2、UDP 真实拨号测试全部通过。
 - Trojan 已新增 `network`、path、host、gRPC service 配置。
@@ -15,10 +15,10 @@
 - Shadowsocks 旧 AEAD 与 2022-blake3 三种方法的 TCP/UDP 双向真实拨号已经完成，simple-obfs HTTP/TLS 与 v2ray-plugin WebSocket 已实拨。
 - Shadowsocks SIP023 TCP/UDP 多用户 EIH 已完成真实拨号。
 - ShadowsocksR 的 origin、旧 verify/auth 系列、auth_aes128_md5/sha1、auth_chain_a-f、6 种 stream cipher、TCP/UDP、多用户参数、HTTP simple/post 与 tls1.2_ticket_auth 已完成真实拨号；定向测试 41 个通过。
-- Snell v1-v5 TCP、独立响应 salt、HTTP/TLS obfs 与 v3-v5 UDP-over-TCP 已完成真实拨号；定向测试 13 个通过。
-- Snell v4/v5 connection reuse 仍待实现。
+- Snell v1-v5 TCP、独立响应 salt、HTTP/TLS obfs、v3-v5 UDP-over-TCP 与 v4/v5 connection reuse 已完成真实拨号；定向测试 18 个通过。
+- Snell reuse 支持 10 条连接池、15 秒空闲淘汰、零帧半关闭、HTTP/TLS 混淆状态延续和陈旧连接自动重拨。
 - Swift 全量测试：89 passed、0 failed。
-- Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s。
+- M0 的 Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s。M4 reuse 改动后的 release 重验按统一门策略留到下一协议门。
 
 ## 0. 开发总原则
 
@@ -54,10 +54,10 @@
 
 ### 1.2 最近一次验证结果
 
-- Rust 测试 256 个通过。
+- Rust 测试 263 个通过。
 - Rust 仅有 1 个 ignored test，为需要环境变量输入的外部真实订阅兼容测试。
 - Swift 全量验证 89 个通过。
-- Rust/Swift release build 均通过。
+- M0 Rust/Swift release build 均通过；M4 后未重复执行 15 分钟完整 LTO。
 - `cargo clippy --all-targets --all-features -- -D warnings` 仍未收口。
 - 没有完整的 Supercore 性能基准套件。
 

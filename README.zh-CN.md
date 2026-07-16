@@ -14,7 +14,7 @@
 - Trojan 已完成 TLS+TCP、UDP、WebSocket、gRPC、HTTP/2、HTTPUpgrade、自定义请求头、显式 ALPN、UDP over WS/gRPC 真实拨号；VMess 已完成 alterId=0 的 TCP、UDP、WebSocket、gRPC、HTTP/2 真实拨号。两者仍因更广泛的服务端兼容边界保守标记为 partial。
 - Shadowsocks 已完成旧 AEAD 与 Shadowsocks 2022 三种方法的 TCP/UDP 双向真实拨号，支持 SIP023 多用户 EIH、simple-obfs HTTP/TLS 和 v2ray-plugin WebSocket；plugin UDP 仍明确不支持。
 - ShadowsocksR 已完成 origin、verify_simple、auth_simple、auth_sha1、auth_sha1_v2、auth_sha1_v4、auth_aes128_md5/sha1 和 auth_chain_a-f，覆盖 6 种 stream cipher、TCP/UDP、多用户 `uid:key`、HTTP simple/post 与 tls1.2_ticket_auth 混淆；auth_sha1_v4 按协议边界仅支持 TCP。
-- Snell 已完成 v1-v5 TCP、独立响应 salt、HTTP/TLS 混淆和 v3-v5 UDP-over-TCP；v5 使用公开的 v4 兼容 wire format，v1/v2 UDP 和 v4/v5 connection reuse 仍是明确边界。
+- Snell 已完成 v1-v5 TCP、独立响应 salt、HTTP/TLS 混淆和 v3-v5 UDP-over-TCP；v5 使用公开的 v4 兼容 wire format，v4/v5 支持 `reuse: true`、10 条连接池、15 秒空闲淘汰、零帧半关闭和陈旧连接自动重拨；v1/v2 UDP 是协议本身的明确边界。
 - parse-only：Hysteria v1、Mieru、Juicity、MASQUE、OpenVPN。
 - 订阅能力：支持多订阅导入、切换、更新、缓存、生命周期计量。
 - 规则能力：支持主要规则目标与 RULE-SET 规则源。

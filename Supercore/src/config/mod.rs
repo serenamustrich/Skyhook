@@ -421,6 +421,8 @@ pub enum OutboundConfig {
         obfs: Option<String>,
         #[serde(default)]
         obfs_host: Option<String>,
+        #[serde(default)]
+        reuse: bool,
     },
     Hysteria {
         name: String,

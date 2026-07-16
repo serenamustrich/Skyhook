@@ -151,6 +151,12 @@ async fn decode_v4_frame(
     }
     let padding_len = u16::from_be_bytes(header[3..5].try_into()?) as usize;
     let payload_len = u16::from_be_bytes(header[5..7].try_into()?) as usize;
+    if payload_len == 0 {
+        if padding_len != 0 {
+            return Err(anyhow!("Snell v4 zero frame contains padding"));
+        }
+        return Ok(Vec::new());
+    }
     let mut frame = take_exact(stream, prefetched, padding_len + payload_len + TAG_LEN).await?;
     let (padding, payload_cipher) = frame.split_at_mut(padding_len);
     swap_v4_padding(padding, payload_cipher);
@@ -426,6 +432,7 @@ async fn run_snell_tcp(
                 TestObfs::Tls => Some("tls".to_string()),
             },
             obfs_host: Some("obfs.example".to_string()),
+            reuse: false,
         }],
         None,
     )?;
@@ -506,6 +513,7 @@ async fn run_snell_v4_tcp(version: u8, obfs: TestObfs) -> anyhow::Result<()> {
                 TestObfs::Tls => Some("tls".to_string()),
             },
             obfs_host: Some("obfs.example".to_string()),
+            reuse: false,
         }],
         None,
     )?;
@@ -521,6 +529,267 @@ async fn run_snell_v4_tcp(version: u8, obfs: TestObfs) -> anyhow::Result<()> {
         .await
         .context("Snell v4 TCP response timed out")??;
     assert_eq!(&response, b"pong");
+    server.await??;
+    Ok(())
+}
+
+async fn send_reused_v4_server_frame(
+    stream: &mut TcpStream,
+    obfs: TestObfs,
+    frame: &[u8],
+) -> anyhow::Result<()> {
+    if matches!(obfs, TestObfs::Tls) {
+        stream.write_all(&tls_record(0x17, frame)).await?;
+    } else {
+        stream.write_all(frame).await?;
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn run_snell_v4_reuse(version: u8, obfs: TestObfs) -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let psk = b"snell-v4-reuse-test-psk".to_vec();
+    let server_psk = psk.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut prefetched = read_initial_payload(&mut stream, obfs).await?;
+        let request_salt = take_exact(&mut stream, &mut prefetched, V4_SALT_LEN).await?;
+        let request_key = derive_snell_key(TestCipher::Aes128Gcm, &server_psk, &request_salt)?;
+        let mut request_nonce = [0u8; 12];
+
+        let response_salt = [0xb0 + version; V4_SALT_LEN];
+        let response_key = derive_snell_key(TestCipher::Aes128Gcm, &server_psk, &response_salt)?;
+        let mut response_nonce = [0u8; 12];
+
+        let requests = [
+            ("first.example", 443u16, b"first-request".as_slice()),
+            ("second.example", 8443u16, b"second-request".as_slice()),
+        ];
+        for (index, (host, port, payload)) in requests.into_iter().enumerate() {
+            let handshake = if index == 0 {
+                decode_v4_frame(
+                    &mut stream,
+                    &mut prefetched,
+                    &request_key,
+                    &mut request_nonce,
+                )
+                .await?
+            } else {
+                read_next_v4_payload(
+                    &mut stream,
+                    &mut prefetched,
+                    obfs,
+                    &request_key,
+                    &mut request_nonce,
+                )
+                .await?
+            };
+            assert_eq!(handshake[0], 1);
+            assert_eq!(handshake[1], 5);
+            assert_eq!(handshake[2], 0);
+            let host_len = handshake[3] as usize;
+            assert_eq!(&handshake[4..4 + host_len], host.as_bytes());
+            assert_eq!(
+                u16::from_be_bytes(handshake[4 + host_len..6 + host_len].try_into()?),
+                port
+            );
+
+            let status = encode_v4_frame(&response_key, &mut response_nonce, &[0], 0)?;
+            if index == 0 {
+                let mut first = response_salt.to_vec();
+                first.extend_from_slice(&status);
+                send_server_bytes(&mut stream, obfs, &first, &[]).await?;
+            } else {
+                send_reused_v4_server_frame(&mut stream, obfs, &status).await?;
+            }
+
+            let upload = read_next_v4_payload(
+                &mut stream,
+                &mut prefetched,
+                obfs,
+                &request_key,
+                &mut request_nonce,
+            )
+            .await?;
+            assert_eq!(upload, payload);
+            let echo = encode_v4_frame(&response_key, &mut response_nonce, payload, 0)?;
+            send_reused_v4_server_frame(&mut stream, obfs, &echo).await?;
+
+            let client_zero = read_next_v4_payload(
+                &mut stream,
+                &mut prefetched,
+                obfs,
+                &request_key,
+                &mut request_nonce,
+            )
+            .await?;
+            assert!(client_zero.is_empty());
+            let server_zero = encode_v4_frame(&response_key, &mut response_nonce, &[], 0)?;
+            send_reused_v4_server_frame(&mut stream, obfs, &server_zero).await?;
+        }
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-v4-reuse".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            psk: String::from_utf8(psk)?,
+            method: Some("aes-128-gcm".to_string()),
+            version: Some(version),
+            obfs: match obfs {
+                TestObfs::Plain => None,
+                TestObfs::Http => Some("http".to_string()),
+                TestObfs::Tls => Some("tls".to_string()),
+            },
+            obfs_host: Some("obfs.example".to_string()),
+            reuse: true,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("snell-v4-reuse")
+        .context("missing Snell v4 reuse outbound")?;
+
+    for (host, port, payload) in [
+        ("first.example", 443u16, b"first-request".as_slice()),
+        ("second.example", 8443u16, b"second-request".as_slice()),
+    ] {
+        let mut tunnel = outbound
+            .connect(&Destination::new(host, port), 3000)
+            .await?;
+        tunnel.write_all(payload).await?;
+        tunnel.shutdown().await?;
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), tunnel.read_to_end(&mut response))
+            .await
+            .context("Snell v4 reuse response timed out")??;
+        assert_eq!(response, payload);
+    }
+
+    server.await??;
+    Ok(())
+}
+
+async fn serve_one_plain_v4_reuse_request(
+    mut stream: TcpStream,
+    psk: &[u8],
+    expected_host: &str,
+    expected_payload: &[u8],
+    response_salt: [u8; V4_SALT_LEN],
+) -> anyhow::Result<()> {
+    let mut prefetched = Vec::new();
+    let request_salt = take_exact(&mut stream, &mut prefetched, V4_SALT_LEN).await?;
+    let request_key = derive_snell_key(TestCipher::Aes128Gcm, psk, &request_salt)?;
+    let mut request_nonce = [0u8; 12];
+    let handshake = decode_v4_frame(
+        &mut stream,
+        &mut prefetched,
+        &request_key,
+        &mut request_nonce,
+    )
+    .await?;
+    assert_eq!(handshake[1], 5);
+    let host_len = handshake[3] as usize;
+    assert_eq!(&handshake[4..4 + host_len], expected_host.as_bytes());
+
+    let response_key = derive_snell_key(TestCipher::Aes128Gcm, psk, &response_salt)?;
+    let mut response_nonce = [0u8; 12];
+    let status = encode_v4_frame(&response_key, &mut response_nonce, &[0], 0)?;
+    stream.write_all(&response_salt).await?;
+    stream.write_all(&status).await?;
+    stream.flush().await?;
+
+    let upload = decode_v4_frame(
+        &mut stream,
+        &mut prefetched,
+        &request_key,
+        &mut request_nonce,
+    )
+    .await?;
+    assert_eq!(upload, expected_payload);
+    let echo = encode_v4_frame(&response_key, &mut response_nonce, expected_payload, 0)?;
+    stream.write_all(&echo).await?;
+
+    let zero = decode_v4_frame(
+        &mut stream,
+        &mut prefetched,
+        &request_key,
+        &mut request_nonce,
+    )
+    .await?;
+    assert!(zero.is_empty());
+    let zero = encode_v4_frame(&response_key, &mut response_nonce, &[], 0)?;
+    stream.write_all(&zero).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snell_v4_reuse_retries_stale_pooled_connection() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let psk = b"snell-v4-stale-pool-psk".to_vec();
+    let server_psk = psk.clone();
+
+    let server = tokio::spawn(async move {
+        let (first, _) = listener.accept().await?;
+        serve_one_plain_v4_reuse_request(
+            first,
+            &server_psk,
+            "first.example",
+            b"first",
+            [0xc1; V4_SALT_LEN],
+        )
+        .await?;
+        let (second, _) = listener.accept().await?;
+        serve_one_plain_v4_reuse_request(
+            second,
+            &server_psk,
+            "second.example",
+            b"second",
+            [0xc2; V4_SALT_LEN],
+        )
+        .await?;
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-v4-stale".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            psk: String::from_utf8(psk)?,
+            method: Some("aes-128-gcm".to_string()),
+            version: Some(4),
+            obfs: None,
+            obfs_host: None,
+            reuse: true,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("snell-v4-stale")
+        .context("missing stale-pool Snell outbound")?;
+
+    for (host, payload) in [
+        ("first.example", b"first".as_slice()),
+        ("second.example", b"second".as_slice()),
+    ] {
+        let mut tunnel = outbound.connect(&Destination::new(host, 443), 3000).await?;
+        tunnel.write_all(payload).await?;
+        tunnel.shutdown().await?;
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), tunnel.read_to_end(&mut response))
+            .await
+            .context("Snell stale-pool response timed out")??;
+        assert_eq!(response, payload);
+    }
+
     server.await??;
     Ok(())
 }
@@ -574,6 +843,26 @@ async fn snell_v4_http_obfs_real_dial() -> anyhow::Result<()> {
 #[tokio::test]
 async fn snell_v4_tls_obfs_real_dial() -> anyhow::Result<()> {
     run_snell_v4_tcp(4, TestObfs::Tls).await
+}
+
+#[tokio::test]
+async fn snell_v4_connection_reuse_real_dial() -> anyhow::Result<()> {
+    run_snell_v4_reuse(4, TestObfs::Plain).await
+}
+
+#[tokio::test]
+async fn snell_v5_connection_reuse_real_dial() -> anyhow::Result<()> {
+    run_snell_v4_reuse(5, TestObfs::Plain).await
+}
+
+#[tokio::test]
+async fn snell_v4_http_obfs_connection_reuse_real_dial() -> anyhow::Result<()> {
+    run_snell_v4_reuse(4, TestObfs::Http).await
+}
+
+#[tokio::test]
+async fn snell_v4_tls_obfs_connection_reuse_real_dial() -> anyhow::Result<()> {
+    run_snell_v4_reuse(4, TestObfs::Tls).await
 }
 
 #[tokio::test]
@@ -654,6 +943,7 @@ async fn snell_v3_udp_over_tcp_real_dial() -> anyhow::Result<()> {
             version: Some(3),
             obfs: None,
             obfs_host: None,
+            reuse: false,
         }],
         None,
     )?;
@@ -732,6 +1022,7 @@ async fn run_snell_v4_udp(version: u8) -> anyhow::Result<()> {
             version: Some(version),
             obfs: None,
             obfs_host: None,
+            reuse: false,
         }],
         None,
     )?;
@@ -767,6 +1058,7 @@ async fn snell_v2_udp_is_rejected_before_dial() -> anyhow::Result<()> {
             version: Some(2),
             obfs: None,
             obfs_host: None,
+            reuse: false,
         }],
         None,
     )?;

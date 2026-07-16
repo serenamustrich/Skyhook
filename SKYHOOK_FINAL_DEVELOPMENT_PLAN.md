@@ -8,12 +8,12 @@
 
 ## 当前执行进度（2026-07-17）
 
-- M0：`IN_PROGRESS`
-  - 本轮 Rust 全量测试通过：256 passed、0 failed、1 个需要外部订阅环境变量的测试 ignored。
+- M0：`VERIFIED`
+  - 本轮 Rust 全量测试通过：263 passed、0 failed、1 个需要外部订阅环境变量的测试 ignored。
   - Swift 全量测试通过：89 passed、0 failed。
-  - Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s。
+  - M0 Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s，M4 后未重复执行完整 LTO。
   - 测速 runtime、Fake-IP filter、系统 DNS resolver、TUN 配置校验和 SSR/Snell 扩展均已进入统一回归。
-  - 当前目录尚未恢复为可审计 Git 工作区，因此 M0 仍保持 IN_PROGRESS。
+  - 当前目录已建立独立 Git 工作区，可回滚基线提交为 `a8a55e0`。
 - M1：`IN_PROGRESS`
   - WS、gRPC、H2、HTTPUpgrade 已形成可复用传输函数。
   - `outbound/mod.rs` 尚未完成模块拆分。
@@ -24,14 +24,14 @@
   - Trojan TLS+TCP、UDP、WS、gRPC、H2、HTTPUpgrade 的真实拨号测试全部通过。
   - 订阅 YAML/URI 已能保存并生成 Trojan transport 配置。
   - 自定义 transport headers、显式 ALPN、UDP over WS/gRPC、TLS/HTTP/gRPC trailer/timeout 错误路径已验证。
-- M4：`IN_PROGRESS`
+- M4：`VERIFIED`
   - Shadowsocks 旧 AEAD 与 2022-blake3 三种方法的 TCP/UDP 双向真实拨号已完成。
   - 下载方向独立 response salt、SIP022 请求/响应头、UDP session、packet ID 和重放窗口已完成。
   - SIP023 TCP/UDP 多用户 EIH、simple-obfs HTTP/TLS 与 v2ray-plugin WebSocket 已完成真实拨号。
   - SSR origin、旧 verify/auth 系列、auth_aes128_md5/sha1、auth_chain_a-f、6 种 stream cipher、TCP/UDP、多用户参数、HTTP simple/post 与 tls1.2_ticket_auth 已完成真实拨号。
   - Snell v1-v5 TCP、独立响应 salt、HTTP/TLS obfs 与 v3-v5 UDP-over-TCP 已完成真实拨号。
-  - Snell v4/v5 connection reuse 仍未完成。
-- 下一步：恢复 Git 基线并完成 Snell connection reuse，收口 M0/M4 后推进 M1 模块化。
+  - Snell v4/v5 connection reuse 已完成，覆盖 v4/v5、HTTP/TLS obfs、同一物理连接双目标、零帧半关闭和陈旧连接自动重拨。
+- 下一步：推进 M1 模块化，拆分公共 transport、UDP、连接池和错误层。
 
 ## 1. 最终目标
 

@@ -30,8 +30,9 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   Supported combinations include TCP/UDP, multi-user `uid:key` parameters, HTTP simple/post,
   and TLS ticket obfuscation; protocol-specific UDP boundaries remain explicit in the matrix.
 - Snell v1-v5 TCP with independent response salts, HTTP/TLS obfuscation, and v3-v5
-  UDP-over-TCP. v5 follows the public v4-compatible wire format. v1/v2 UDP and v4/v5 connection
-  reuse remain explicit matrix limitations.
+  UDP-over-TCP. v5 follows the public v4-compatible wire format. v4/v5 support opt-in
+  `reuse: true` with a bounded 10-connection pool, 15-second idle eviction, protocol zero-frame
+  half-close, and stale pooled-connection retry. v1/v2 UDP remains an explicit protocol boundary.
 - Trojan TCP and pooled UDP outbound over TLS, WebSocket, gRPC, HTTP/2, and HTTPUpgrade, with SNI
   and optional certificate verification bypass. Custom transport headers, explicit ALPN, gRPC
   trailer errors, and UDP over WebSocket/gRPC are covered; wider server compatibility remains

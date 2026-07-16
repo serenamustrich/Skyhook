@@ -21,7 +21,7 @@
 | Hysteria v1 | parse-only | parse-only | none | none | quic | parse-only | `outbound` 走 `UnsupportedProtocolOutbound`（见 `src/outbound/mod.rs:377-380`），native 拨号当前未实现；doctor `classify_outbound_with_capability` 在 `core/mod.rs:1300-1301` 返回 ParseOnly（`tcp_supported=false`, `udp_supported=false`, `limitations` 包含 `hysteria is recognized in config/subscriptions but native dialing is not implemented yet`）。测试断言：`tests/remaining_protocols.rs::hysteria_v1_dial_returns_unsupported_error` + `hysteria_v1_capability_marks_unsupported` + `hysteria_v1_routes_through_runtime_to_unsupported`。 |
 | Hysteria2 | full | full | partial | partial | quic | partial | wire-format、fragmentation、config 已覆盖；仍缺完整 QUIC/H3 mock server 端到端验证 |
 | TUIC | full | full | partial | partial | quic | partial | v5 wire-format、config、UDP mode 已覆盖；仍缺完整 QUIC mock server 端到端验证 |
-| Snell | full | full | full | partial | tcp/http/tls | partial | v1-v5 TCP、v3-v5 UDP-over-TCP、独立响应 salt 与 HTTP/TLS obfs 均有真实拨号测试；v5 使用公开的 v4 兼容 wire format；v1/v2 UDP 会在拨号前拒绝；v4/v5 connection reuse 尚未实现 |
+| Snell | full | full | full | partial | tcp/http/tls | partial | v1-v5 TCP、v3-v5 UDP-over-TCP、独立响应 salt 与 HTTP/TLS obfs 均有真实拨号测试；v5 使用公开的 v4 兼容 wire format；v4/v5 支持 `reuse: true`、10 条连接池、15 秒空闲淘汰、零帧半关闭和陈旧连接自动重拨；v1/v2 UDP 按协议边界在拨号前拒绝 |
 | WireGuard | full | full | full | partial | udp | partial | required: private/public key/ip；缺失字段会进入 parse-only/unsupported 分支；仅用户态隧道能力 |
 | AnyTLS | full | full | partial | none | tcp | partial | anytls over UDP 尚未实现 |
 | ShadowTLS | full | full | partial | none | tcp | partial | v3 支持；udp 与独立隧道行为保留限制 |
@@ -51,7 +51,7 @@
 
 1. **WireGuard**: 用户态 userspace 版本已到位，但字段校验缺失时会走 parse-only/unsupported 限制
 2. **Hysteria v1**: Mihomo 完整支持，Supercore 仍为 `parse-only`
-3. **Snell**: v1-v5 TCP、v3-v5 UDP 和 HTTP/TLS obfs 已完成；仍缺 v4/v5 connection reuse
+3. **Snell**: 计划内 v1-v5 TCP、v3-v5 UDP、HTTP/TLS obfs 和 v4/v5 connection reuse 已完成；继续扩大公开服务端、长连接与协议指纹互操作覆盖
 4. **SSR**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍需扩大公开服务端组合互操作覆盖
 5. **Reality/Vision**: Mihomo 完整支持，Supercore 部分支持
 6. **Trojan compatibility edges**: WS/gRPC/H2/HTTPUpgrade、自定义 headers、ALPN、UDP over WS/gRPC 已实拨，更多服务端差异组合仍需兼容验证

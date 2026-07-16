@@ -192,6 +192,7 @@ impl SubscriptionNode {
                     .and_then(|value| value.parse().ok()),
                 obfs: first_param(&self.params, &["obfs"]),
                 obfs_host: first_param(&self.params, &["obfs-host", "obfs_host", "host"]),
+                reuse: bool_param(&self.params, "reuse"),
             }),
             NodeProtocol::Trojan => {
                 let password = self
@@ -1668,6 +1669,36 @@ proxies:
                 assert_eq!(method, "aes-128-gcm");
                 assert_eq!(password, "secret");
                 assert!(plugin.is_none());
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converts_snell_reuse_yaml_to_outbound_config() {
+        let text = r#"
+proxies:
+  - name: SNELL-REUSE
+    type: snell
+    server: snell.example.com
+    port: 4406
+    psk: test-psk
+    version: 5
+    reuse: true
+"#;
+
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Snell {
+                name,
+                version,
+                reuse,
+                ..
+            } => {
+                assert_eq!(name, "SNELL-REUSE");
+                assert_eq!(version, Some(5));
+                assert!(reuse);
             }
             other => panic!("unexpected outbound {other:?}"),
         }
