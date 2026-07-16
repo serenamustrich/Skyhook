@@ -1,50 +1,45 @@
+mod auth;
 mod diagnostics;
+mod error;
+mod events;
+mod routes;
+mod schema;
 mod tasks;
 
-use std::{
-    collections::HashMap, collections::HashSet, convert::Infallible, path::PathBuf, sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use axum::{
-    extract::{FromRef, Path as AxumPath, Request, State},
-    http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode},
-    middleware::{self, Next},
-    response::{
-        sse::{Event, KeepAlive},
-        IntoResponse, Response, Sse,
-    },
+    extract::{FromRef, Path as AxumPath, State},
+    http::StatusCode,
+    middleware,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
 use tokio::{sync::Semaphore, task::JoinSet};
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::trace::TraceLayer;
 
 use crate::{
-    config::{OutboundConfig, RuleTarget, SmartRouteRule, SuperConfig},
-    core::{ProbeOptions, ProbeProgress, Runtime},
+    config::SuperConfig,
+    core::Runtime,
     geo::{self, GeoUpdateProgress},
     outbound::error::{classify_message, OutboundErrorKind},
     routing::Destination,
-    smart::SmartRecommendationAction,
     subscription_store::{SubscriptionMeta, SubscriptionStore, SubscriptionUpdateProgress},
 };
 
+use auth::*;
 use diagnostics::{build_doctor_report, export_diagnostic_report};
-use tasks::{TaskFailure, TaskManager, TaskRecord};
+use error::*;
+use events::*;
+use routes::build_router_with_tasks;
+#[cfg(test)]
+use routes::collect_group_probe_members;
+use schema::*;
+use tasks::TaskManager;
 
-const CONTROL_TOKEN_ENV: &str = "SKYHOOK_CONTROL_TOKEN";
-const CONTROL_TOKEN_FILE_ENV: &str = "SKYHOOK_CONTROL_TOKEN_FILE";
-const MIN_CONTROL_TOKEN_BYTES: usize = 32;
 const MAX_SUBSCRIPTION_BODY_BYTES: usize = 32 * 1024 * 1024;
-
-#[derive(Clone)]
-struct ControlAuthState {
-    token: Option<Arc<str>>,
-}
 
 #[derive(Clone)]
 struct ApiState {
@@ -62,138 +57,6 @@ impl FromRef<ApiState> for TaskManager {
     fn from_ref(state: &ApiState) -> Self {
         state.tasks.clone()
     }
-}
-
-#[derive(Debug, Serialize)]
-struct VersionResponse {
-    name: &'static str,
-    version: &'static str,
-    engine: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ApiErrorResponse {
-    code: &'static str,
-    kind: &'static str,
-    message: String,
-    retryable: bool,
-    trace_id: String,
-    details: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusResponse {
-    mixed_listen: String,
-    control_listen: String,
-    outbounds: usize,
-    rules: usize,
-    smart_rules_enabled: bool,
-    traffic: crate::telemetry::TrafficSnapshot,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProbeRequest {
-    url: Option<String>,
-    timeout_ms: Option<u64>,
-    concurrency: Option<usize>,
-    names: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProbeGroupRequest {
-    group: String,
-    url: Option<String>,
-    timeout_ms: Option<u64>,
-    concurrency: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SmartRuleRequest {
-    target: RuleTarget,
-    value: String,
-    outbound: String,
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-    #[serde(default)]
-    note: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplySmartRecommendationsRequest {
-    action: Option<SmartRecommendationAction>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApplySmartRecommendationRequest {
-    target: RuleTarget,
-    value: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SmartRuleEnabledRequest {
-    target: RuleTarget,
-    value: String,
-    enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct SmartRuleDeleteRequest {
-    target: RuleTarget,
-    value: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SubscriptionImportRequest {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    switch: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct SubscriptionUseRequest {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SubscriptionUpdateRequest {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CountryUseRequest {
-    code: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OutboundUseRequest {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ActiveSubscriptionConfigRequest {
-    #[serde(default)]
-    use_first_node: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProviderUpdateRequest {
-    #[serde(default)]
-    subscription_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigReloadRequest {
-    #[serde(default)]
-    path: Option<PathBuf>,
-    #[serde(default)]
-    yaml: Option<String>,
 }
 
 pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
@@ -219,267 +82,6 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
 #[cfg(test)]
 fn build_router(runtime: Arc<Runtime>, auth: ControlAuthState) -> Router {
     build_router_with_tasks(runtime, auth, TaskManager::default())
-}
-
-fn build_router_with_tasks(
-    runtime: Arc<Runtime>,
-    auth: ControlAuthState,
-    tasks: TaskManager,
-) -> Router {
-    let state = ApiState { runtime, tasks };
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/version", get(version))
-        .route("/v1/status", get(status))
-        .route("/v1/outbounds", get(outbounds))
-        .route("/v1/outbounds/use", post(use_outbound))
-        .route("/v1/groups", get(groups))
-        .route("/v1/countries", get(countries))
-        .route("/v1/countries/use", post(use_country))
-        .route("/v1/probes", post(probe_outbounds))
-        .route("/v1/probes/group", post(probe_group_body))
-        .route("/v1/route/decision", post(route_decision))
-        .route("/v1/subscriptions", get(subscriptions))
-        .route("/v1/subscriptions/import", post(import_subscription))
-        .route("/v1/subscriptions/use", post(use_subscription))
-        .route(
-            "/v1/subscriptions/reload-active",
-            post(reload_active_subscription),
-        )
-        .route(
-            "/v1/subscriptions/update-all",
-            post(update_all_subscriptions),
-        )
-        .route("/v1/subscriptions/update", post(update_subscription))
-        .route(
-            "/v1/subscriptions/active-config",
-            post(active_subscription_config),
-        )
-        .route("/v1/providers/proxies", get(proxy_providers))
-        .route("/v1/providers/rules", get(rule_providers))
-        .route("/v1/providers/update", post(update_providers))
-        .route("/v1/providers/update-all", post(update_all_providers))
-        .route("/v1/rules", get(rules_snapshot))
-        .route("/v1/smart-rules", get(smart_rules).post(upsert_smart_rule))
-        .route("/v1/smart-rules/enabled", post(set_smart_rule_enabled))
-        .route("/v1/smart-rules/delete", post(delete_smart_rule))
-        .route(
-            "/v1/smart-rules/apply-recommendations",
-            post(apply_smart_recommendations),
-        )
-        .route(
-            "/v1/smart-rules/apply-recommendation",
-            post(apply_smart_recommendation),
-        )
-        .route("/v1/traffic", get(traffic))
-        .route("/v1/traffic/subscriptions", get(subscription_traffic))
-        .route("/v1/connections", get(connections))
-        .route("/v1/logs", get(logs))
-        .route("/v1/config", get(config))
-        .route("/v1/config/reload", post(reload_config))
-        .route("/v1/tun", get(tun_status))
-        .route("/v1/doctor", get(doctor))
-        .route("/v1/doctor/run", post(run_doctor))
-        .route("/v1/diagnostics/export", post(export_diagnostics))
-        .route("/v1/geo/update", post(update_geo))
-        .route("/v1/tasks", get(task_list))
-        .route("/v1/tasks/:id", get(task_status))
-        .route("/v1/tasks/:id/cancel", post(cancel_task))
-        .route("/v1/events", get(task_events))
-        .layer(middleware::from_fn_with_state(auth, authorize_writes))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
-}
-
-fn validate_control_listen(control_listen: std::net::SocketAddr) -> anyhow::Result<()> {
-    if control_listen.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "control API must listen on loopback; configured address is {control_listen}"
-        ))
-    }
-}
-
-fn load_control_token() -> anyhow::Result<Option<Arc<str>>> {
-    if let Some(token) = normalized_control_token(std::env::var(CONTROL_TOKEN_ENV).ok())? {
-        return Ok(Some(token));
-    }
-    let Some(path) = std::env::var_os(CONTROL_TOKEN_FILE_ENV) else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(path);
-    let token = std::fs::read_to_string(&path).map_err(|error| {
-        anyhow!(
-            "failed to read control token file '{}': {error}",
-            path.display()
-        )
-    })?;
-    normalized_control_token(Some(token))
-}
-
-fn normalized_control_token(token: Option<String>) -> anyhow::Result<Option<Arc<str>>> {
-    let Some(token) = token else {
-        return Ok(None);
-    };
-    let token = token.trim();
-    if token.is_empty() {
-        return Ok(None);
-    }
-    if token.as_bytes().len() < MIN_CONTROL_TOKEN_BYTES {
-        return Err(anyhow!(
-            "control token must contain at least {MIN_CONTROL_TOKEN_BYTES} bytes"
-        ));
-    }
-    Ok(Some(Arc::from(token)))
-}
-
-async fn authorize_writes(
-    State(auth): State<ControlAuthState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if !is_write_method(request.method()) {
-        return next.run(request).await;
-    }
-    if request_has_valid_token(request.headers(), auth.token.as_deref()) {
-        return next.run(request).await;
-    }
-
-    let trace_id = request
-        .headers()
-        .get("x-skyhook-trace-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let (code, message) = if auth.token.is_some() {
-        (
-            "control_auth_invalid",
-            "a valid bearer token is required for this control operation",
-        )
-    } else {
-        (
-            "control_auth_unconfigured",
-            "control API write operations are disabled until a control token is configured",
-        )
-    };
-    let body = ApiErrorResponse {
-        code,
-        kind: "authentication",
-        message: message.to_string(),
-        retryable: false,
-        trace_id,
-        details: serde_json::json!({}),
-    };
-    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
-}
-
-fn is_write_method(method: &Method) -> bool {
-    method != Method::GET && method != Method::HEAD && method != Method::OPTIONS
-}
-
-fn request_has_valid_token(headers: &HeaderMap, expected: Option<&str>) -> bool {
-    let Some(expected) = expected else {
-        return false;
-    };
-    let Some(provided) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    constant_time_eq(provided.as_bytes(), expected.as_bytes())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
-}
-
-fn json_response(value: serde_json::Value) -> Response {
-    Json(value).into_response()
-}
-
-fn api_error_response(
-    status: StatusCode,
-    code: &'static str,
-    kind: OutboundErrorKind,
-    message: impl Into<String>,
-    details: serde_json::Value,
-) -> Response {
-    let body = ApiErrorResponse {
-        code,
-        kind: kind.as_str(),
-        message: message.into(),
-        retryable: kind.retryable(),
-        trace_id: uuid::Uuid::new_v4().to_string(),
-        details,
-    };
-    (status, Json(body)).into_response()
-}
-
-fn classified_api_error(code: &'static str, error: impl std::fmt::Display) -> Response {
-    let message = error.to_string();
-    let kind = classify_message(&message);
-    let status = match kind {
-        OutboundErrorKind::Authentication => StatusCode::UNAUTHORIZED,
-        OutboundErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        OutboundErrorKind::Dns
-        | OutboundErrorKind::Tcp
-        | OutboundErrorKind::Tls
-        | OutboundErrorKind::HttpStatus
-        | OutboundErrorKind::EmptyResponse => StatusCode::BAD_GATEWAY,
-        OutboundErrorKind::Cancelled => StatusCode::CONFLICT,
-        OutboundErrorKind::Protocol | OutboundErrorKind::Unsupported => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
-        OutboundErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    api_error_response(status, code, kind, message, serde_json::json!({}))
-}
-
-fn invalid_request(code: &'static str, message: impl Into<String>) -> Response {
-    api_error_response(
-        StatusCode::BAD_REQUEST,
-        code,
-        OutboundErrorKind::Protocol,
-        message,
-        serde_json::json!({}),
-    )
-}
-
-fn task_accepted(record: &TaskRecord) -> Response {
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "task_id": record.id,
-            "trace_id": record.trace_id,
-            "kind": record.kind,
-            "status": record.status,
-        })),
-    )
-        .into_response()
-}
-
-fn task_failure(code: &'static str, error: impl std::fmt::Display) -> TaskFailure {
-    let message = error.to_string();
-    let kind = classify_message(&message);
-    TaskFailure {
-        code: code.to_string(),
-        kind: kind.as_str().to_string(),
-        message,
-        retryable: kind.retryable(),
-        trace_id: uuid::Uuid::new_v4().to_string(),
-    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -517,89 +119,6 @@ async fn cancel_task(State(tasks): State<TaskManager>, AxumPath(id): AxumPath<St
             serde_json::json!({ "task_id": id }),
         ),
     }
-}
-
-async fn task_events(
-    State(state): State<ApiState>,
-) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let task_stream = BroadcastStream::new(state.tasks.subscribe()).map(|item| match item {
-        Ok(event) => {
-            let id = event.id.clone();
-            let name = event.event;
-            serde_json::to_string(&event)
-                .ok()
-                .map(|data| Event::default().id(id).event(name).data(data))
-                .map(Ok)
-                .unwrap_or_else(|| serialization_error_event("task_updated"))
-        }
-        Err(error) => lagged_event("tasks", error),
-    });
-    let telemetry_stream =
-        BroadcastStream::new(state.runtime.telemetry().subscribe_events()).map(|item| match item {
-            Ok(event) => {
-                let id = event.id.clone();
-                let name = event.event.clone();
-                serde_json::to_string(&event)
-                    .ok()
-                    .map(|data| Event::default().id(id).event(name).data(data))
-                    .map(Ok)
-                    .unwrap_or_else(|| serialization_error_event("telemetry"))
-            }
-            Err(error) => lagged_event("telemetry", error),
-        });
-    let stream = task_stream.merge(telemetry_stream);
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keepalive"),
-    )
-}
-
-fn lagged_event(source: &str, error: impl std::fmt::Display) -> Result<Event, Infallible> {
-    let id = uuid::Uuid::new_v4().to_string();
-    Ok(Event::default().id(id).event("lagged").data(
-        serde_json::json!({
-            "schema_version": 1,
-            "timestamp": chrono::Utc::now(),
-            "source": source,
-            "message": error.to_string(),
-        })
-        .to_string(),
-    ))
-}
-
-fn serialization_error_event(source: &str) -> Result<Event, Infallible> {
-    let id = uuid::Uuid::new_v4().to_string();
-    Ok(Event::default().id(id).event("serialization_error").data(
-        serde_json::json!({
-            "schema_version": 1,
-            "timestamp": chrono::Utc::now(),
-            "source": source,
-        })
-        .to_string(),
-    ))
-}
-
-fn publish_probe_progress_event(runtime: &Runtime, task_id: &str, progress: &ProbeProgress) {
-    runtime.telemetry().publish_event(
-        "probe_progress",
-        serde_json::json!({
-            "task_id": task_id,
-            "completed": progress.completed,
-            "total": progress.total,
-            "node": progress.name,
-        }),
-    );
-}
-
-fn publish_subscription_event(runtime: &Runtime, kind: &str, data: serde_json::Value) {
-    runtime.telemetry().publish_event(
-        "subscription_updated",
-        serde_json::json!({
-            "kind": kind,
-            "data": data,
-        }),
-    );
 }
 
 async fn version() -> Json<VersionResponse> {
@@ -1204,208 +723,6 @@ async fn use_country(
     }
 }
 
-async fn probe_outbounds(
-    State(state): State<ApiState>,
-    request: Option<Json<ProbeRequest>>,
-) -> Response {
-    let options = request
-        .map(|Json(request)| ProbeOptions {
-            url: request.url,
-            timeout_ms: request.timeout_ms,
-            concurrency: request.concurrency,
-            names: request.names,
-        })
-        .unwrap_or_default();
-    let total = state.runtime.probe_target_count(&options);
-    let (record, cancellation) = state.tasks.create("probe_outbounds", Some(total)).await;
-    let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
-    tokio::spawn(async move {
-        tasks
-            .mark_running(&task_id, format!("probing {total} outbounds"))
-            .await;
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ProbeProgress>();
-        let progress_tasks = tasks.clone();
-        let progress_task_id = task_id.clone();
-        let progress_runtime = runtime.clone();
-        let progress_handle = tokio::spawn(async move {
-            while let Some(progress) = progress_rx.recv().await {
-                publish_probe_progress_event(&progress_runtime, &progress_task_id, &progress);
-                progress_tasks
-                    .progress(
-                        &progress_task_id,
-                        progress.completed,
-                        Some(progress.total),
-                        format!("tested {}", progress.name),
-                    )
-                    .await;
-            }
-        });
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                tasks.mark_cancelled(&task_id).await;
-            }
-            results = runtime.probe_all_outbounds_with_progress(options, Some(progress_tx)) => {
-                let failure_summary = build_probe_failure_summary(&results);
-                tasks.progress(
-                    &task_id,
-                    results.len() as u64,
-                    Some(total),
-                    "finalizing probe results",
-                ).await;
-                tasks.succeed(&task_id, serde_json::json!({
-                    "results": results,
-                    "failure_summary": failure_summary,
-                })).await;
-            }
-        }
-        let _ = progress_handle.await;
-    });
-    task_accepted(&record)
-}
-
-async fn probe_group_body(
-    State(state): State<ApiState>,
-    Json(request): Json<ProbeGroupRequest>,
-) -> Response {
-    let config = state.runtime.config();
-    let member_names = collect_group_probe_members(&config, &request.group);
-    if member_names.is_empty() {
-        return invalid_request(
-            "probe_group_empty",
-            format!("group '{}' has no probeable members", request.group),
-        );
-    }
-    let total = member_names.len() as u64;
-    let group = request.group;
-    let options = ProbeOptions {
-        url: request.url,
-        timeout_ms: request.timeout_ms,
-        concurrency: request.concurrency,
-        names: Some(member_names),
-    };
-    let (record, cancellation) = state.tasks.create("probe_group", Some(total)).await;
-    let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
-    tokio::spawn(async move {
-        tasks
-            .mark_running(&task_id, format!("probing group {group}"))
-            .await;
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ProbeProgress>();
-        let progress_tasks = tasks.clone();
-        let progress_task_id = task_id.clone();
-        let progress_runtime = runtime.clone();
-        let progress_handle = tokio::spawn(async move {
-            while let Some(progress) = progress_rx.recv().await {
-                publish_probe_progress_event(&progress_runtime, &progress_task_id, &progress);
-                progress_tasks
-                    .progress(
-                        &progress_task_id,
-                        progress.completed,
-                        Some(progress.total),
-                        format!("tested {}", progress.name),
-                    )
-                    .await;
-            }
-        });
-        tokio::select! {
-            _ = cancellation.cancelled() => {
-                tasks.mark_cancelled(&task_id).await;
-            }
-            results = runtime.probe_all_outbounds_with_progress(options, Some(progress_tx)) => {
-                let failure_summary = build_probe_failure_summary(&results);
-                tasks.progress(
-                    &task_id,
-                    results.len() as u64,
-                    Some(total),
-                    "finalizing group probe results",
-                ).await;
-                tasks.succeed(&task_id, serde_json::json!({
-                    "ok": true,
-                    "group": group,
-                    "results": results,
-                    "failure_summary": failure_summary,
-                })).await;
-            }
-        }
-        let _ = progress_handle.await;
-    });
-    task_accepted(&record)
-}
-
-fn build_probe_failure_summary(results: &[crate::core::ProbeResult]) -> HashMap<String, usize> {
-    let mut summary: HashMap<String, usize> = HashMap::new();
-    for result in results.iter().filter(|result| !result.success) {
-        let kind = result
-            .failure_kind
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        *summary.entry(kind).or_insert(0) += 1;
-    }
-    summary
-}
-
-fn collect_group_probe_members(config: &SuperConfig, group_name: &str) -> Vec<String> {
-    let outbound_map: HashMap<&str, &OutboundConfig> = config
-        .outbounds
-        .iter()
-        .map(|outbound| (outbound.name(), outbound))
-        .collect();
-    let Some(OutboundConfig::Group {
-        members: root_members,
-        ..
-    }) = outbound_map.get(group_name)
-    else {
-        return Vec::new();
-    };
-
-    let mut visited = HashSet::new();
-    let mut members = Vec::new();
-    collect_group_members(
-        root_members.as_slice(),
-        &outbound_map,
-        &mut visited,
-        &mut members,
-    );
-    members
-}
-
-fn collect_group_members(
-    members: &[String],
-    outbound_map: &HashMap<&str, &OutboundConfig>,
-    visited: &mut HashSet<String>,
-    output: &mut Vec<String>,
-) {
-    for name in members {
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !visited.insert(trimmed.to_string()) {
-            continue;
-        }
-
-        if trimmed.eq_ignore_ascii_case("direct") || trimmed.eq_ignore_ascii_case("reject") {
-            continue;
-        }
-
-        let Some(outbound) = outbound_map.get(trimmed) else {
-            output.push(trimmed.to_string());
-            continue;
-        };
-
-        if let OutboundConfig::Group { members, .. } = outbound {
-            collect_group_members(members, outbound_map, visited, output);
-        } else {
-            output.push(trimmed.to_string());
-        }
-    }
-}
-
 async fn route_decision(
     State(runtime): State<Arc<Runtime>>,
     Json(destination): Json<Destination>,
@@ -1789,13 +1106,7 @@ async fn upsert_smart_rule(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SmartRuleRequest>,
 ) -> Response {
-    let result = runtime.upsert_smart_rule(SmartRouteRule {
-        target: request.target,
-        value: request.value,
-        outbound: request.outbound,
-        enabled: request.enabled,
-        note: request.note,
-    });
+    let result = runtime.upsert_smart_rule(smart_route_rule(request));
     match result {
         Ok(rules) => json_response(serde_json::json!({
             "ok": true,
@@ -1907,10 +1218,6 @@ async fn reload_config(
     }
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
 fn subscription_store(runtime: &Runtime) -> SubscriptionStore {
     SubscriptionStore::new(runtime.config().subscriptions.store_path.clone())
 }
@@ -2013,12 +1320,17 @@ async fn fetch_subscription_url(
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, time::Duration};
+
     use super::*;
     use axum::{
         body::{to_bytes, Body},
-        http::{HeaderValue, Request},
+        http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method, Request},
     };
+    use tokio_stream::StreamExt;
     use tower::ServiceExt;
+
+    use crate::config::OutboundConfig;
 
     #[test]
     fn control_api_accepts_loopback_only() {

@@ -189,7 +189,8 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 - `Supercore/src/outbound/mod.rs`：约 12,446 行。
 - `Supercore/src/core/mod.rs`：约 2,234 行。
-- `Supercore/src/api/mod.rs`：约 1,768 行。
+- `Supercore/src/api/mod.rs`：约 1,938 行；鉴权、错误、schema、SSE、路由表和测速
+  handler 已迁出，订阅、Provider、系统和规则 handler 仍待拆分。
 - `AppState.swift`：约 3,046 行。
 - `SettingsWindow.swift`：约 1,614 行。
 - 协议实现仍大量集中在 `outbound/mod.rs`。
@@ -214,6 +215,16 @@ M0 最终确认基线：
 
 task/SSE/progress/telemetry 和现有长任务迁移已经完成，M0 关闭。当前直接执行点进入
 M1：API、Core、Outbound 模块化和统一网络基础设施。
+
+M1 第一批已完成：
+
+- `api/auth.rs`：控制地址、Token 读取、写接口鉴权和常量时间比较。
+- `api/error.rs`：统一错误 envelope、状态码分类和 task 接受/失败响应。
+- `api/schema.rs`：控制 API 请求/响应模型。
+- `api/events.rs`：SSE 合流、keepalive、lagged 和进度事件。
+- `api/routes/mod.rs`：集中路由注册。
+- `api/routes/probes.rs`：全部/代理组测速 handler、组展开和失败汇总。
+- Rust lib 92 passed、0 failed；M1 继续保持 `IN_PROGRESS`。
 
 ### 5.5 当前直接执行队列
 
@@ -479,6 +490,9 @@ M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 状态：`IN_PROGRESS`
 
 ### 10.1 API 拆分
+
+当前进度：auth、error、schema、events、路由表和 probes 路由已拆出；下一批迁移
+subscriptions、providers、system、rules 和 telemetry handler。
 
 - 从 `api/mod.rs` 拆出：
   - auth

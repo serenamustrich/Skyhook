@@ -48,6 +48,9 @@
 - 诊断导出默认脱敏，文件权限为 `0600` 且有界保留；控制服务退出会取消所有活跃
   task。M0 最终回归：Rust lib 92 passed、订阅 13 passed、Geo 3 passed、Swift full
   97 passed，全部 0 failed，因此 M0 状态为 `VERIFIED`。
+- M1 API 模块化第一批已完成：鉴权、错误、schema、SSE、路由表和测速 handler 已从
+  `api/mod.rs` 拆到独立模块；Rust lib 92 passed、0 failed。订阅、Provider、系统、
+  规则和 telemetry handler 仍待迁移，因此 M1 保持 `IN_PROGRESS`。
 
 ## 0. 开发总原则
 

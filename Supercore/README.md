@@ -51,6 +51,8 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   session pool and UDP fragmentation.
 - Structured YAML config.
 - Native versioned control API under `/v1/*`.
+- Control-plane modules isolate authentication, structured errors, schemas, SSE events, route
+  registration, and probe handlers instead of concentrating those responsibilities in one file.
 - Shared transport modules for TCP, TLS, HTTP CONNECT, WebSocket, HTTP/2, gRPC, HTTPUpgrade, and
   QUIC client configuration.
 - Traceable, cancellable dial contexts propagated through concrete outbounds and proxy groups.
