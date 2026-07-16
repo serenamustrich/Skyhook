@@ -140,10 +140,13 @@ is passed.
 - `POST /v1/subscriptions/import`
 - `POST /v1/subscriptions/use`
 - `POST /v1/subscriptions/reload-active`
+- `POST /v1/subscriptions/update`
 - `POST /v1/subscriptions/update-all`
 - `POST /v1/subscriptions/active-config`
 - `GET /v1/providers/proxies`
 - `GET /v1/providers/rules`
+- `POST /v1/providers/update`
+- `POST /v1/providers/update-all`
 - `GET /v1/rules`
 - `GET /v1/traffic`
 - `GET /v1/traffic/subscriptions`
@@ -158,6 +161,9 @@ is passed.
 - `POST /v1/config/reload`
 - `GET /v1/tun`
 - `GET /v1/doctor`
+- `POST /v1/doctor/run`
+- `POST /v1/diagnostics/export`
+- `POST /v1/geo/update`
 - `GET /v1/tasks`
 - `GET /v1/tasks/{id}`
 - `POST /v1/tasks/{id}/cancel`
@@ -168,10 +174,12 @@ read-only operations. Every write request must send `Authorization: Bearer <toke
 generates a fresh 256-bit token for each user-mode core process. The TUN LaunchDaemon reads its
 token from a root-owned `0600` file; the token is never embedded in the launchd plist.
 
-Full and group probes, subscription imports, and update-all requests return HTTP `202` with a
-`task_id`. Clients read `/v1/tasks/{id}` for bounded progress, structured failures, and results, or
-cancel the underlying operation through `/v1/tasks/{id}/cancel`. Terminal task records are retained
-for up to 24 hours with a default maximum of 512 records, without evicting active work.
+Full and group probes, subscription imports, single/all subscription updates, provider updates,
+Geo updates, deep Doctor runs, and diagnostic exports return HTTP `202` with a `task_id` and
+`trace_id`. Clients read `/v1/tasks/{id}` for bounded progress, structured failures, and results,
+or cancel the underlying operation through `/v1/tasks/{id}/cancel`. Cancellation propagates into
+HTTP downloads and provider resolution. Terminal task records are retained for up to 24 hours with
+a default maximum of 512 records, without evicting active work.
 `/v1/events` streams versioned task, probe progress, runtime status, subscription, connection,
 traffic, log, and outbound-health events over SSE with event IDs and timestamps. Live connection
 updates and traffic samples are throttled to a 250ms interval, and the bounded event channel never
@@ -179,6 +187,12 @@ blocks the proxy data plane on a slow consumer.
 The macOS client consumes this stream for live rates, incremental logs, and task progress. It falls
 back to one-second traffic and two-second log polling while SSE is unavailable, then refreshes full
 snapshots before returning to event-driven updates after reconnect.
+
+Subscription, proxy-provider, rule-provider, and Geo downloads use direct `no_proxy` HTTP clients,
+enforce response size limits, and expose only a scheme/host source label in task results. Provider
+refresh failures retain the last usable cache or normalized provider payload. Diagnostic exports
+are redacted JSON artifacts stored under the subscription data directory with `0600` permissions,
+bounded retention, and no subscription URLs, node credentials, raw logs, or connection targets.
 
 `POST /v1/probes` accepts an optional JSON body:
 

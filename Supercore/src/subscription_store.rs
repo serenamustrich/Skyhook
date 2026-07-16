@@ -9,7 +9,8 @@ use std::{
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Semaphore, task::JoinSet, time::sleep};
+use tokio::{fs as async_fs, sync::Semaphore, task::JoinSet, time::sleep};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -23,6 +24,8 @@ use crate::{
 };
 
 pub const DEFAULT_STORE_DIR: &str = "supercore-subscriptions";
+const MAX_PROVIDER_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SUBSCRIPTION_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriptionIndex {
@@ -68,6 +71,38 @@ pub struct SubscriptionUpdateSummary {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SubscriptionUpdateProgress {
+    pub completed: u64,
+    pub total: u64,
+    pub id: String,
+    pub name: String,
+    pub updated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRefreshIssue {
+    pub provider_type: String,
+    pub name: String,
+    pub message: String,
+    pub used_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderRefreshSummary {
+    pub id: String,
+    pub name: String,
+    pub committed: bool,
+    pub updated: bool,
+    pub provider_count: usize,
+    pub refreshed_count: usize,
+    pub fallback_count: usize,
+    pub node_count: usize,
+    pub rule_count: usize,
+    #[serde(default)]
+    pub issues: Vec<ProviderRefreshIssue>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionUpdateOptions {
     pub timeout_secs: u64,
@@ -78,6 +113,14 @@ pub struct SubscriptionUpdateOptions {
 #[derive(Debug, Clone)]
 pub struct SubscriptionStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct ProviderRefreshStats {
+    provider_count: usize,
+    refreshed_count: usize,
+    fallback_count: usize,
+    issues: Vec<ProviderRefreshIssue>,
 }
 
 impl Default for SubscriptionIndex {
@@ -178,33 +221,154 @@ impl SubscriptionStore {
         })
     }
 
-    pub fn replace_text(&self, id: &str, text: &str) -> anyhow::Result<SubscriptionMeta> {
-        let mut index = self.load_index()?;
-        let position = index
-            .subscriptions
-            .iter()
-            .position(|item| item.id == id)
-            .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
-        let previous = index.subscriptions[position].clone();
+    pub async fn import_text_with_id_async(
+        &self,
+        id: Option<String>,
+        name: Option<String>,
+        url: Option<String>,
+        text: &str,
+        switch: bool,
+        timeout_secs: u64,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<SubscriptionImportResult> {
+        let id = id
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+        let previous_document = self.document(&id).ok();
         let mut document = parse_subscription(text)?;
-        self.resolve_proxy_providers(&previous.id, &mut document)?;
-        let mut meta = meta_from_document(
-            previous.id,
-            previous.name,
-            previous.url,
-            &document,
-            previous.created_at,
-            Utc::now(),
-            None,
-        );
-        meta.traffic_upload_total = previous.traffic_upload_total;
-        meta.traffic_download_total = previous.traffic_download_total;
+        let client = provider_http_client(timeout_secs)?;
+        let mut stats = ProviderRefreshStats::default();
+        self.resolve_proxy_providers_async(
+            &id,
+            &mut document,
+            previous_document.as_ref(),
+            &client,
+            cancellation,
+            &mut stats,
+        )
+        .await?;
+        self.resolve_rule_providers_async(
+            &id,
+            &mut document,
+            previous_document.as_ref(),
+            &client,
+            cancellation,
+            &mut stats,
+        )
+        .await?;
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("subscription import cancelled"));
+        }
+        self.commit_import_document(id, name, url, text, document, switch)
+    }
 
-        self.resolve_rule_providers(&meta.id, &mut document)?;
-        self.write_subscription_files(&meta, text, &document)?;
-        index.subscriptions[position] = meta.clone();
-        self.save_index(&index)?;
-        Ok(meta)
+    pub fn replace_text(&self, id: &str, text: &str) -> anyhow::Result<SubscriptionMeta> {
+        let mut document = parse_subscription(text)?;
+        self.resolve_proxy_providers(id, &mut document)?;
+        self.resolve_rule_providers(id, &mut document)?;
+        self.replace_document(id, text, document)
+    }
+
+    pub async fn replace_text_async(
+        &self,
+        id: &str,
+        text: &str,
+        timeout_secs: u64,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<SubscriptionMeta> {
+        let previous_document = self.document(id)?;
+        let mut document = parse_subscription(text)?;
+        let client = provider_http_client(timeout_secs)?;
+        let mut stats = ProviderRefreshStats::default();
+        self.resolve_proxy_providers_async(
+            id,
+            &mut document,
+            Some(&previous_document),
+            &client,
+            cancellation,
+            &mut stats,
+        )
+        .await?;
+        self.resolve_rule_providers_async(
+            id,
+            &mut document,
+            Some(&previous_document),
+            &client,
+            cancellation,
+            &mut stats,
+        )
+        .await?;
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("subscription update cancelled"));
+        }
+        self.replace_document(id, text, document)
+    }
+
+    pub async fn refresh_providers(
+        &self,
+        id: &str,
+        timeout_secs: u64,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<ProviderRefreshSummary> {
+        let previous_meta = self
+            .index()?
+            .subscriptions
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
+        let previous_document = self.document(id)?;
+        let source_path = self.subscription_dir(id).join("source.txt");
+        let source = tokio::select! {
+            _ = cancellation.cancelled() => return Err(anyhow!("provider refresh cancelled")),
+            source = async_fs::read_to_string(&source_path) => {
+                source.with_context(|| {
+                    format!("failed to read subscription source {}", source_path.display())
+                })?
+            }
+        };
+        let mut document = parse_subscription(&source)?;
+        let client = provider_http_client(timeout_secs)?;
+        let mut stats = ProviderRefreshStats::default();
+
+        self.resolve_proxy_providers_async(
+            id,
+            &mut document,
+            Some(&previous_document),
+            &client,
+            cancellation,
+            &mut stats,
+        )
+        .await?;
+        self.resolve_rule_providers_async(
+            id,
+            &mut document,
+            Some(&previous_document),
+            &client,
+            cancellation,
+            &mut stats,
+        )
+        .await?;
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("provider refresh cancelled"));
+        }
+
+        let meta = self.replace_document(id, &source, document.clone())?;
+        Ok(ProviderRefreshSummary {
+            id: meta.id,
+            name: previous_meta.name,
+            committed: true,
+            updated: stats.refreshed_count > 0,
+            provider_count: stats.provider_count,
+            refreshed_count: stats.refreshed_count,
+            fallback_count: stats.fallback_count,
+            node_count: document.nodes.len(),
+            rule_count: document
+                .rule_providers
+                .iter()
+                .map(|provider| provider.rules.len())
+                .sum(),
+            issues: stats.issues,
+        })
     }
 
     pub fn mark_update_error(&self, id: &str, error: impl Into<String>) -> anyhow::Result<()> {
@@ -299,11 +463,72 @@ impl SubscriptionStore {
             .await
     }
 
+    pub async fn update_from_url_with(
+        &self,
+        id: &str,
+        options: SubscriptionUpdateOptions,
+        cancellation: &CancellationToken,
+    ) -> anyhow::Result<SubscriptionUpdateSummary> {
+        let meta = self
+            .index()?
+            .subscriptions
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
+        let Some(url) = meta.url.clone() else {
+            return Ok(SubscriptionUpdateSummary {
+                id: meta.id,
+                name: meta.name,
+                updated: false,
+                error: Some("subscription has no url".to_string()),
+            });
+        };
+        let result: anyhow::Result<()> = async {
+            let text = fetch_subscription_url_with_options(&url, options, cancellation).await?;
+            self.replace_text_async(&meta.id, &text, options.timeout_secs, cancellation)
+                .await?;
+            Ok(())
+        }
+        .await;
+        Ok(match result {
+            Ok(()) => SubscriptionUpdateSummary {
+                id: meta.id,
+                name: meta.name,
+                updated: true,
+                error: None,
+            },
+            Err(_error) if cancellation.is_cancelled() => {
+                return Err(anyhow!("subscription update cancelled"));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self.mark_update_error(&meta.id, message.clone());
+                SubscriptionUpdateSummary {
+                    id: meta.id,
+                    name: meta.name,
+                    updated: false,
+                    error: Some(message),
+                }
+            }
+        })
+    }
+
     pub async fn update_all_from_urls_with(
         &self,
         options: SubscriptionUpdateOptions,
     ) -> anyhow::Result<Vec<SubscriptionUpdateSummary>> {
+        self.update_all_from_urls_with_progress(options, CancellationToken::new(), None)
+            .await
+    }
+
+    pub async fn update_all_from_urls_with_progress(
+        &self,
+        options: SubscriptionUpdateOptions,
+        cancellation: CancellationToken,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<SubscriptionUpdateProgress>>,
+    ) -> anyhow::Result<Vec<SubscriptionUpdateSummary>> {
         let index = self.index()?;
+        let total = index.subscriptions.len() as u64;
         let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
         let mut jobs = JoinSet::new();
 
@@ -321,11 +546,36 @@ impl SubscriptionStore {
 
             let store = self.clone();
             let semaphore = semaphore.clone();
+            let cancellation = cancellation.clone();
             jobs.spawn(async move {
-                let _permit = semaphore.acquire_owned().await.expect("semaphore open");
+                let permit = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return SubscriptionUpdateSummary {
+                            id: meta.id,
+                            name: meta.name,
+                            updated: false,
+                            error: Some("subscription update cancelled".to_string()),
+                        };
+                    }
+                    permit = semaphore.acquire_owned() => permit,
+                };
+                let _permit = match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        return SubscriptionUpdateSummary {
+                            id: meta.id,
+                            name: meta.name,
+                            updated: false,
+                            error: Some(format!("subscription update scheduler closed: {error}")),
+                        };
+                    }
+                };
                 let result: anyhow::Result<()> = async {
-                    let text = fetch_subscription_url_with_options(&url, options).await?;
-                    store.replace_text(&meta.id, &text)?;
+                    let text =
+                        fetch_subscription_url_with_options(&url, options, &cancellation).await?;
+                    store
+                        .replace_text_async(&meta.id, &text, options.timeout_secs, &cancellation)
+                        .await?;
                     Ok(())
                 }
                 .await;
@@ -352,15 +602,40 @@ impl SubscriptionStore {
         }
 
         let mut summaries = Vec::new();
-        while let Some(result) = jobs.join_next().await {
-            match result {
-                Ok(summary) => summaries.push(summary),
-                Err(error) => summaries.push(SubscriptionUpdateSummary {
-                    id: "unknown".to_string(),
-                    name: "unknown".to_string(),
-                    updated: false,
-                    error: Some(format!("subscription update task failed: {error}")),
-                }),
+        let mut completed = 0_u64;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    jobs.abort_all();
+                    while jobs.join_next().await.is_some() {}
+                    return Err(anyhow!("subscription update cancelled"));
+                }
+                result = jobs.join_next() => {
+                    let Some(result) = result else {
+                        break;
+                    };
+                    let summary = match result {
+                        Ok(summary) => summary,
+                        Err(error) => SubscriptionUpdateSummary {
+                            id: "unknown".to_string(),
+                            name: "unknown".to_string(),
+                            updated: false,
+                            error: Some(format!("subscription update task failed: {error}")),
+                        },
+                    };
+                    completed = completed.saturating_add(1);
+                    if let Some(progress) = progress.as_ref() {
+                        let _ = progress.send(SubscriptionUpdateProgress {
+                            completed,
+                            total,
+                            id: summary.id.clone(),
+                            name: summary.name.clone(),
+                            updated: summary.updated,
+                        });
+                    }
+                    summaries.push(summary);
+                }
             }
         }
         summaries.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name).then_with(|| lhs.id.cmp(&rhs.id)));
@@ -400,6 +675,91 @@ impl SubscriptionStore {
         write_json_atomic(&dir.join("meta.json"), meta)?;
         write_json_atomic(&dir.join("document.json"), document)?;
         Ok(())
+    }
+
+    fn replace_document(
+        &self,
+        id: &str,
+        source: &str,
+        document: SubscriptionDocument,
+    ) -> anyhow::Result<SubscriptionMeta> {
+        let mut index = self.load_index()?;
+        let position = index
+            .subscriptions
+            .iter()
+            .position(|item| item.id == id)
+            .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
+        let previous = index.subscriptions[position].clone();
+        let mut meta = meta_from_document(
+            previous.id,
+            previous.name,
+            previous.url,
+            &document,
+            previous.created_at,
+            Utc::now(),
+            None,
+        );
+        meta.traffic_upload_total = previous.traffic_upload_total;
+        meta.traffic_download_total = previous.traffic_download_total;
+        self.write_subscription_files(&meta, source, &document)?;
+        index.subscriptions[position] = meta.clone();
+        self.save_index(&index)?;
+        Ok(meta)
+    }
+
+    fn commit_import_document(
+        &self,
+        id: String,
+        name: Option<String>,
+        url: Option<String>,
+        source: &str,
+        document: SubscriptionDocument,
+        switch: bool,
+    ) -> anyhow::Result<SubscriptionImportResult> {
+        let now = Utc::now();
+        let mut index = self.load_index()?;
+        if let Some(position) = index.subscriptions.iter().position(|item| item.id == id) {
+            let previous = index.subscriptions[position].clone();
+            let mut meta = meta_from_document(
+                previous.id,
+                name.filter(|item| !item.trim().is_empty())
+                    .unwrap_or(previous.name),
+                url.or(previous.url),
+                &document,
+                previous.created_at,
+                now,
+                None,
+            );
+            meta.traffic_upload_total = previous.traffic_upload_total;
+            meta.traffic_download_total = previous.traffic_download_total;
+            self.write_subscription_files(&meta, source, &document)?;
+            let active_changed = index.active_id.is_none() || switch;
+            if active_changed {
+                index.active_id = Some(meta.id.clone());
+            }
+            index.subscriptions[position] = meta.clone();
+            self.save_index(&index)?;
+            return Ok(SubscriptionImportResult {
+                meta,
+                active_changed,
+            });
+        }
+
+        let name = name
+            .filter(|item| !item.trim().is_empty())
+            .unwrap_or_else(|| inferred_name(url.as_deref(), &document, &id));
+        let meta = meta_from_document(id, name, url, &document, now, now, None);
+        self.write_subscription_files(&meta, source, &document)?;
+        let active_changed = index.active_id.is_none() || switch;
+        if active_changed {
+            index.active_id = Some(meta.id.clone());
+        }
+        index.subscriptions.push(meta.clone());
+        self.save_index(&index)?;
+        Ok(SubscriptionImportResult {
+            meta,
+            active_changed,
+        })
     }
 
     fn resolve_proxy_providers(
@@ -455,8 +815,10 @@ impl SubscriptionStore {
                                 if let Ok(cached_nodes) = parse_proxy_provider_nodes(&cached_text) {
                                     if !cached_nodes.is_empty() {
                                         provider.nodes = cached_nodes;
-                                        provider.cache_path = Some(cache_path.display().to_string());
-                                        provider.last_error = Some(format!("fetch failed, using cache: {}", error));
+                                        provider.cache_path =
+                                            Some(cache_path.display().to_string());
+                                        provider.last_error =
+                                            Some(format!("fetch failed, using cache: {}", error));
                                         continue;
                                     }
                                 }
@@ -519,7 +881,8 @@ impl SubscriptionStore {
                                 if !cached_rules.is_empty() {
                                     provider.rules = cached_rules;
                                     provider.cache_path = Some(cache_path.display().to_string());
-                                    provider.last_error = Some(format!("fetch failed, using cache: {}", error));
+                                    provider.last_error =
+                                        Some(format!("fetch failed, using cache: {}", error));
                                     continue;
                                 }
                             }
@@ -534,6 +897,207 @@ impl SubscriptionStore {
                         cache_path.display()
                     )
                 })?;
+                provider.cache_path = Some(cache_path.display().to_string());
+                provider.last_error = None;
+            }
+        }
+        Ok(())
+    }
+
+    async fn resolve_proxy_providers_async(
+        &self,
+        id: &str,
+        document: &mut SubscriptionDocument,
+        previous_document: Option<&SubscriptionDocument>,
+        client: &reqwest::Client,
+        cancellation: &CancellationToken,
+        stats: &mut ProviderRefreshStats,
+    ) -> anyhow::Result<()> {
+        if document.proxy_providers.is_empty() {
+            return Ok(());
+        }
+        let provider_dir = self.subscription_dir(id).join("proxy-providers");
+        async_fs::create_dir_all(&provider_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create proxy provider cache dir {}",
+                    provider_dir.display()
+                )
+            })?;
+        let mut seen_names = document
+            .nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<HashSet<_>>();
+        let mut resolved_nodes = Vec::<SubscriptionNode>::new();
+
+        for provider in &mut document.proxy_providers {
+            if cancellation.is_cancelled() {
+                return Err(anyhow!("provider refresh cancelled"));
+            }
+            stats.provider_count += 1;
+            let cache_path = provider_dir.join(format!("{}.txt", safe_file_name(&provider.name)));
+            if provider.nodes.is_empty() {
+                let loaded = load_provider_text_async(
+                    "proxy provider",
+                    self.root(),
+                    provider.path.as_deref(),
+                    provider.url.as_deref(),
+                    client,
+                    cancellation,
+                )
+                .await
+                .and_then(|text| {
+                    let nodes = parse_proxy_provider_nodes(&text)?;
+                    if nodes.is_empty() {
+                        return Err(anyhow!("proxy provider payload contains no nodes"));
+                    }
+                    Ok((text, nodes))
+                });
+                match loaded {
+                    Ok((text, nodes)) => {
+                        write_text_atomic_async(&cache_path, &text).await?;
+                        provider.nodes = nodes;
+                        provider.cache_path = Some(cache_path.display().to_string());
+                        provider.last_error = None;
+                        stats.refreshed_count += 1;
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let fallback =
+                            cached_proxy_provider_nodes(&cache_path).await.or_else(|| {
+                                previous_document
+                                    .into_iter()
+                                    .flat_map(|document| document.proxy_providers.iter())
+                                    .find(|item| item.name == provider.name)
+                                    .filter(|item| !item.nodes.is_empty())
+                                    .map(|item| item.nodes.clone())
+                            });
+                        if let Some(nodes) = fallback {
+                            provider.nodes = nodes;
+                            provider.cache_path = Some(cache_path.display().to_string());
+                            provider.last_error =
+                                Some(format!("refresh failed, using previous cache: {message}"));
+                            stats.fallback_count += 1;
+                            stats.issues.push(ProviderRefreshIssue {
+                                provider_type: "proxy".to_string(),
+                                name: provider.name.clone(),
+                                message,
+                                used_fallback: true,
+                            });
+                        } else {
+                            provider.last_error = Some(message.clone());
+                            stats.issues.push(ProviderRefreshIssue {
+                                provider_type: "proxy".to_string(),
+                                name: provider.name.clone(),
+                                message,
+                                used_fallback: false,
+                            });
+                        }
+                    }
+                }
+            }
+
+            for node in &provider.nodes {
+                if seen_names.insert(node.name.clone()) {
+                    resolved_nodes.push(node.clone());
+                }
+            }
+        }
+        document.nodes.extend(resolved_nodes);
+        Ok(())
+    }
+
+    async fn resolve_rule_providers_async(
+        &self,
+        id: &str,
+        document: &mut SubscriptionDocument,
+        previous_document: Option<&SubscriptionDocument>,
+        client: &reqwest::Client,
+        cancellation: &CancellationToken,
+        stats: &mut ProviderRefreshStats,
+    ) -> anyhow::Result<()> {
+        if document.rule_providers.is_empty() {
+            return Ok(());
+        }
+        let provider_dir = self.subscription_dir(id).join("rule-providers");
+        async_fs::create_dir_all(&provider_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create rule provider cache dir {}",
+                    provider_dir.display()
+                )
+            })?;
+
+        for provider in &mut document.rule_providers {
+            if cancellation.is_cancelled() {
+                return Err(anyhow!("provider refresh cancelled"));
+            }
+            stats.provider_count += 1;
+            let cache_path = provider_dir.join(format!("{}.txt", safe_file_name(&provider.name)));
+            if provider.rules.is_empty() {
+                let loaded = load_provider_text_async(
+                    "rule provider",
+                    self.root(),
+                    provider.path.as_deref(),
+                    provider.url.as_deref(),
+                    client,
+                    cancellation,
+                )
+                .await
+                .and_then(|text| {
+                    let rules = parse_rule_provider_rules(&text);
+                    if rules.is_empty() {
+                        return Err(anyhow!("rule provider payload contains no rules"));
+                    }
+                    Ok((text, rules))
+                });
+                match loaded {
+                    Ok((text, rules)) => {
+                        write_text_atomic_async(&cache_path, &text).await?;
+                        provider.rules = rules;
+                        provider.cache_path = Some(cache_path.display().to_string());
+                        provider.last_error = None;
+                        stats.refreshed_count += 1;
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let fallback =
+                            cached_rule_provider_rules(&cache_path).await.or_else(|| {
+                                previous_document
+                                    .into_iter()
+                                    .flat_map(|document| document.rule_providers.iter())
+                                    .find(|item| item.name == provider.name)
+                                    .filter(|item| !item.rules.is_empty())
+                                    .map(|item| item.rules.clone())
+                            });
+                        if let Some(rules) = fallback {
+                            provider.rules = rules;
+                            provider.cache_path = Some(cache_path.display().to_string());
+                            provider.last_error =
+                                Some(format!("refresh failed, using previous cache: {message}"));
+                            stats.fallback_count += 1;
+                            stats.issues.push(ProviderRefreshIssue {
+                                provider_type: "rule".to_string(),
+                                name: provider.name.clone(),
+                                message,
+                                used_fallback: true,
+                            });
+                        } else {
+                            provider.last_error = Some(message.clone());
+                            stats.issues.push(ProviderRefreshIssue {
+                                provider_type: "rule".to_string(),
+                                name: provider.name.clone(),
+                                message,
+                                used_fallback: false,
+                            });
+                        }
+                    }
+                }
+            } else {
+                write_text_atomic_async(&cache_path, &provider.rules.join("\n")).await?;
                 provider.cache_path = Some(cache_path.display().to_string());
                 provider.last_error = None;
             }
@@ -828,6 +1392,14 @@ fn load_rule_provider_text(
     load_provider_text("rule provider", store_root, path, url)
 }
 
+fn provider_http_client(timeout_secs: u64) -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs.clamp(1, 300)))
+        .no_proxy()
+        .build()
+        .context("failed to build provider HTTP client")
+}
+
 fn load_proxy_provider_text(
     store_root: &Path,
     path: Option<&str>,
@@ -854,9 +1426,8 @@ fn load_provider_text(
                 Ok(text) => return Ok(text),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to read {kind} {}", candidate.display())
-                    });
+                    return Err(error)
+                        .with_context(|| format!("failed to read {kind} {}", candidate.display()));
                 }
             }
         }
@@ -864,12 +1435,15 @@ fn load_provider_text(
     if let Some(url) = url.filter(|item| !item.trim().is_empty()) {
         return fetch_provider_url_blocking(kind, url);
     }
-    Err(anyhow!("{kind} has neither payload, readable path, nor url"))
+    Err(anyhow!(
+        "{kind} has neither payload, readable path, nor url"
+    ))
 }
 
 fn fetch_provider_url_blocking(kind: &str, url: &str) -> anyhow::Result<String> {
     let kind = kind.to_string();
     let url = url.to_string();
+    let source = provider_source_label(&url);
     std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -880,15 +1454,154 @@ fn fetch_provider_url_blocking(kind: &str, url: &str) -> anyhow::Result<String> 
             .get(&url)
             .header("User-Agent", "Supercore/0.1")
             .send()
-            .with_context(|| format!("failed to download {kind} {url}"))?
+            .with_context(|| format!("failed to download {kind} from {source}"))?
             .error_for_status()
-            .with_context(|| format!("{kind} returned error status {url}"))?;
+            .with_context(|| format!("{kind} returned error status from {source}"))?;
         response
             .text()
-            .with_context(|| format!("failed to read {kind} body {url}"))
+            .with_context(|| format!("failed to read {kind} body from {source}"))
     })
     .join()
     .map_err(|_| anyhow!("provider download thread panicked"))?
+}
+
+async fn load_provider_text_async(
+    kind: &str,
+    store_root: &Path,
+    path: Option<&str>,
+    url: Option<&str>,
+    client: &reqwest::Client,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<String> {
+    if let Some(path) = path.filter(|item| !item.trim().is_empty()) {
+        let path = PathBuf::from(path);
+        let candidates = if path.is_absolute() {
+            vec![path]
+        } else {
+            vec![store_root.join(&path), PathBuf::from(&path)]
+        };
+        for candidate in candidates {
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(anyhow!("provider refresh cancelled"));
+                }
+                result = async_fs::read_to_string(&candidate) => result,
+            };
+            match result {
+                Ok(text) => return Ok(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read {kind} {}", candidate.display()));
+                }
+            }
+        }
+    }
+    if let Some(url) = url.filter(|item| !item.trim().is_empty()) {
+        return fetch_provider_url_async(kind, url, client, cancellation).await;
+    }
+    Err(anyhow!(
+        "{kind} has neither payload, readable path, nor url"
+    ))
+}
+
+async fn fetch_provider_url_async(
+    kind: &str,
+    url: &str,
+    client: &reqwest::Client,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<String> {
+    let parsed = url::Url::parse(url).context("provider url is invalid")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("provider url must use http or https"));
+    }
+    let source = provider_source_label(url);
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("provider refresh cancelled")),
+        response = client
+            .get(url)
+            .header("User-Agent", concat!("Supercore/", env!("CARGO_PKG_VERSION")))
+            .send() => {
+                response.with_context(|| format!("failed to download {kind} from {source}"))?
+            }
+    };
+    let mut response = response
+        .error_for_status()
+        .with_context(|| format!("{kind} returned error status from {source}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_PROVIDER_BODY_BYTES as u64)
+    {
+        return Err(anyhow!(
+            "{kind} body exceeds {} bytes",
+            MAX_PROVIDER_BODY_BYTES
+        ));
+    }
+
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => return Err(anyhow!("provider refresh cancelled")),
+            chunk = response.chunk() => {
+                chunk.with_context(|| format!("failed to read {kind} body from {source}"))?
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_BODY_BYTES {
+            return Err(anyhow!(
+                "{kind} body exceeds {} bytes",
+                MAX_PROVIDER_BODY_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).with_context(|| format!("{kind} body from {source} is not UTF-8"))
+}
+
+async fn cached_proxy_provider_nodes(path: &Path) -> Option<Vec<SubscriptionNode>> {
+    let text = async_fs::read_to_string(path).await.ok()?;
+    let nodes = parse_proxy_provider_nodes(&text).ok()?;
+    (!nodes.is_empty()).then_some(nodes)
+}
+
+async fn cached_rule_provider_rules(path: &Path) -> Option<Vec<String>> {
+    let text = async_fs::read_to_string(path).await.ok()?;
+    let rules = parse_rule_provider_rules(&text);
+    (!rules.is_empty()).then_some(rules)
+}
+
+async fn write_text_atomic_async(path: &Path, text: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        async_fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create provider cache dir {}", parent.display()))?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
+    async_fs::write(&tmp, text)
+        .await
+        .with_context(|| format!("failed to write provider cache {}", tmp.display()))?;
+    async_fs::rename(&tmp, path).await.with_context(|| {
+        format!(
+            "failed to replace provider cache {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })
+}
+
+fn provider_source_label(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            })
+        })
+        .unwrap_or_else(|| "<redacted-provider-source>".to_string())
 }
 
 fn parse_proxy_provider_nodes(text: &str) -> anyhow::Result<Vec<SubscriptionNode>> {
@@ -982,6 +1695,7 @@ where
 async fn fetch_subscription_url_with_options(
     url: &str,
     options: SubscriptionUpdateOptions,
+    cancellation: &CancellationToken,
 ) -> anyhow::Result<String> {
     let timeout_secs = options.timeout_secs.clamp(1, 300);
     let client = reqwest::Client::builder()
@@ -991,12 +1705,20 @@ async fn fetch_subscription_url_with_options(
     let attempts = options.retries.saturating_add(1);
     let mut last_error = None;
     for attempt in 0..attempts {
-        match fetch_subscription_url_once(&client, url).await {
+        if cancellation.is_cancelled() {
+            return Err(anyhow!("subscription update cancelled"));
+        }
+        match fetch_subscription_url_once(&client, url, cancellation).await {
             Ok(text) => return Ok(text),
             Err(error) => {
                 last_error = Some(error);
                 if attempt + 1 < attempts {
-                    sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return Err(anyhow!("subscription update cancelled"));
+                        }
+                        _ = sleep(Duration::from_millis(250 * (attempt as u64 + 1))) => {}
+                    }
                 }
             }
         }
@@ -1007,15 +1729,59 @@ async fn fetch_subscription_url_with_options(
 async fn fetch_subscription_url_once(
     client: &reqwest::Client,
     url: &str,
+    cancellation: &CancellationToken,
 ) -> anyhow::Result<String> {
-    let response = client
-        .get(url)
-        .header(
-            "User-Agent",
-            concat!("Supercore/", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.text().await?)
+    let parsed = url::Url::parse(url).context("subscription url is invalid")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("subscription url must use http or https"));
+    }
+    let source = provider_source_label(url);
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("subscription update cancelled")),
+        response = client
+            .get(url)
+            .header(
+                "User-Agent",
+                concat!("Supercore/", env!("CARGO_PKG_VERSION")),
+            )
+            .send() => {
+                response.with_context(|| format!("failed to download subscription from {source}"))?
+            }
+    };
+    let mut response = response
+        .error_for_status()
+        .with_context(|| format!("subscription endpoint returned an error from {source}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_SUBSCRIPTION_BODY_BYTES as u64)
+    {
+        return Err(anyhow!(
+            "subscription body exceeds {} bytes",
+            MAX_SUBSCRIPTION_BODY_BYTES
+        ));
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(anyhow!("subscription update cancelled"));
+            }
+            chunk = response.chunk() => {
+                chunk.with_context(|| {
+                    format!("failed to read subscription body from {source}")
+                })?
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_BODY_BYTES {
+            return Err(anyhow!(
+                "subscription body exceeds {} bytes",
+                MAX_SUBSCRIPTION_BODY_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).with_context(|| format!("subscription body from {source} is not UTF-8"))
 }

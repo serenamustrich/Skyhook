@@ -129,6 +129,9 @@
 - `a0832c8 Secure the versioned control plane`
 - `430a927 Modularize outbound transport foundations`
 - `ad66698 Add cancellable control tasks and probe progress`
+- `a14623b Document the final Skyhook execution plan`
+- `422579e Stream unified control telemetry events`
+- `76bf497 Drive the macOS client from control events`
 
 已经完成的基础：
 
@@ -142,6 +145,9 @@
 - TCP、TLS、HTTP CONNECT、WebSocket、HTTP/2、gRPC、HTTPUpgrade、QUIC 配置公共模块。
 - Direct、Reject、HTTP、Naive、Group、Unsupported 和 registry 初步拆分。
 - Snell v4/v5 connection reuse。
+- 统一 telemetry event bus 和有界事件通道。
+- Swift 标准 SSE parser、断线重连、快照恢复和 polling 回退。
+- 实时速率、日志、节点健康和测速进度的事件驱动更新。
 
 ### 5.2 当前 M0 任务控制面
 
@@ -174,14 +180,17 @@
 `Last-Event-ID`、指数退避重连、完整快照恢复和轮询兜底，并使用核心 rate 事件直接
 更新实时速率。Swift full 当前为 96 passed。
 
-Provider、Geo、TUN、Doctor 长任务迁移仍未完成，因此 M0 继续保持 `IN_PROGRESS`。
+Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新也已补齐；订阅导入、
+订阅更新和 Provider 解析全部使用异步可取消的直连下载路径。TUN 安装、启停和恢复
+将在 M5 的正式 lifecycle/helper/网络事务完成后接入同一 task/event 框架，不在 M0
+增加无法控制真实 TUN 生命周期的假接口。M0 已达到 `VERIFIED`。
 
 ### 5.3 当前结构债务
 
 - `Supercore/src/outbound/mod.rs`：约 12,446 行。
-- `Supercore/src/core/mod.rs`：约 2,162 行。
-- `Supercore/src/api/mod.rs`：约 1,499 行。
-- `AppState.swift`：约 2,883 行。
+- `Supercore/src/core/mod.rs`：约 2,234 行。
+- `Supercore/src/api/mod.rs`：约 1,768 行。
+- `AppState.swift`：约 3,046 行。
 - `SettingsWindow.swift`：约 1,614 行。
 - 协议实现仍大量集中在 `outbound/mod.rs`。
 - API、核心协调和 UI 状态职责仍过度集中。
@@ -191,14 +200,33 @@ Provider、Geo、TUN、Doctor 长任务迁移仍未完成，因此 M0 继续保�
 
 ### 5.4 最近验证基线
 
-历史里程碑验证曾达到：
+历史里程碑验证曾达到 Rust 263 passed、0 failed、1 external-subscription ignored，
+Swift 89 passed、0 failed，并且 Rust/Swift release build 通过；这些只作为历史基线，
+不替代当前阶段重新验证。
 
-- Rust：263 passed、0 failed、1 external-subscription ignored。
-- Swift：89 passed、0 failed。
-- Rust/Swift release build 通过。
+M0 最终确认基线：
 
-task/SSE/progress 基础已完成一轮统一回归；下一步继续完成 telemetry event bus 和
-剩余长任务迁移，再关闭 M0。
+- Rust lib：92 passed、0 failed。
+- Rust subscription store：13 passed、0 failed。
+- Rust Geo assets：3 passed、0 failed。
+- Swift full：97 passed、0 failed。
+- `cargo check --lib`：通过且无 warning。
+
+task/SSE/progress/telemetry 和现有长任务迁移已经完成，M0 关闭。当前直接执行点进入
+M1：API、Core、Outbound 模块化和统一网络基础设施。
+
+### 5.5 当前直接执行队列
+
+接下来由 Codex 严格按以下顺序直接开发，不交接给其他开发者或模型：
+
+1. 进入 M1，依次拆分 API、Core、Outbound，并统一错误、DialContext、transport、UDP 和 cancellation。
+2. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
+3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
+4. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、日志和 Doctor。
+5. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
+6. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
+
+在第 6 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
 
 ## 6. 不可违反的开发规则
 
@@ -354,7 +382,7 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
 
 ## 9. M0：收口当前 task/SSE 工作区
 
-状态：`IN_PROGRESS`
+状态：`VERIFIED`
 
 ### 9.1 保护和审查
 
@@ -400,9 +428,11 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
 - 单订阅更新。
 - Provider 更新。
 - Geo 数据更新。
-- TUN 安装、启动、停止、恢复。
 - Doctor 深度检查。
 - 诊断包导出。
+
+TUN 安装、启动、停止和恢复在 M5 完成真实 privileged helper、lifecycle 和网络事务后
+接入 task 框架；M0 不增加只改状态、不控制真实系统操作的占位接口。
 
 ### 9.4 SSE 初版收口
 
@@ -440,7 +470,7 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
 - Rust lib 全量测试。
 - Swift 全量测试。
 - 更新 API 文档和中英文 README 的 task/event 说明。
-- 创建提交：`Control: add bounded cancellable tasks and SSE events`。
+- 创建提交：`Control: migrate remaining long operations to tasks`。
 
 M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 
@@ -1922,7 +1952,7 @@ README 只写最终功能、安装、使用、架构、协议状态和可复现�
 
 ## 24. 最终完成清单
 
-- [ ] M0：当前 task/SSE/progress 代码已收口并验证。
+- [x] M0：当前 task/SSE/progress 代码已收口并验证。
 - [ ] M1：核心、API、transport、UDP 和 cancellation 基础完成。
 - [ ] M2：当前 partial 协议全部完成真实拨号。
 - [ ] M3：Mihomo 冻结基线缺失协议全部补齐。

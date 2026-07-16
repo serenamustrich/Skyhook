@@ -53,13 +53,19 @@ TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未
 - `POST /v1/subscriptions/use`
 - `POST /v1/subscriptions/import`
 - `POST /v1/subscriptions/reload-active`
+- `POST /v1/subscriptions/update`
 - `POST /v1/subscriptions/update-all`
 - `POST /v1/subscriptions/active-config`
+- `POST /v1/providers/update`
+- `POST /v1/providers/update-all`
 - `GET /v1/traffic/subscriptions`
 - `GET /v1/smart-rules`
 - `POST /v1/smart-rules`
 - `GET /v1/tun`
 - `GET /v1/doctor`
+- `POST /v1/doctor/run`
+- `POST /v1/diagnostics/export`
+- `POST /v1/geo/update`
 - `GET /v1/tasks`
 - `GET /v1/tasks/{id}`
 - `POST /v1/tasks/{id}/cancel`
@@ -71,7 +77,8 @@ LaunchDaemon 从 root-only `0600` 文件读取 Token，plist 中不保存明文�
 
 `POST /v1/probes/group` 使用 JSON body 传递 `group`，避免路径二次编码问题，支持包含 `/`、中文、emoji 的组名。
 
-全量测速、代理组测速、订阅导入和更新全部订阅使用异步任务模型。写请求会先返回
+全量测速、代理组测速、订阅导入、单订阅/全部订阅更新、Provider 更新、Geo 更新、
+Doctor 深检和诊断导出使用异步任务模型。写请求会先返回
 HTTP `202` 和 `task_id`，客户端随后读取 `/v1/tasks/{id}` 获取真实进度、结果和结构化
 错误，并可通过 `/v1/tasks/{id}/cancel` 取消底层操作。任务记录有界保留，终态默认
 保留 24 小时且最多 512 条。`/v1/events` 通过 SSE 推送带版本、事件 ID 和时间戳的
@@ -79,6 +86,12 @@ task、测速进度、运行状态、订阅更新、连接、流量、日志和�
 流量采样默认按 250ms 节流，事件通道有界，不会因为慢客户端阻塞代理数据面。
 macOS App 默认使用 SSE 驱动实时速率、增量日志和任务进度；断线时自动退回
 1 秒流量/2 秒日志轮询，重连后先拉取完整快照，再关闭轮询兜底。
+
+订阅、Proxy Provider、Rule Provider 和 Geo 数据下载默认使用直连 HTTP 客户端，不
+继承系统代理。下载支持实际取消和响应大小上限，任务结果只显示来源主机，不返回
+可能包含 Token 的完整 URL。Provider 刷新失败时优先继续使用缓存或上次规范化数据。
+诊断导出默认不包含订阅 URL、节点凭据、节点名称、原始日志或连接目标，文件权限为
+`0600`，并在受控数据目录内有界保留。
 
 启动代理只加载本地订阅缓存，不在启动过程中下载订阅或立即执行全局测速。后台订阅更新和定时测速在各自间隔到期后独立执行。
 

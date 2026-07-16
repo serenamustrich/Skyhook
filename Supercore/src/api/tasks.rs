@@ -34,6 +34,7 @@ pub(crate) struct TaskFailure {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct TaskRecord {
     pub id: String,
+    pub trace_id: String,
     pub kind: String,
     pub status: TaskStatus,
     pub current: u64,
@@ -94,6 +95,7 @@ impl TaskManager {
         let now = Utc::now();
         let record = TaskRecord {
             id: id.clone(),
+            trace_id: Uuid::new_v4().to_string(),
             kind: kind.into(),
             status: TaskStatus::Queued,
             current: 0,
@@ -249,6 +251,31 @@ impl TaskManager {
         self.get(id).await
     }
 
+    pub(crate) async fn cancel_all(&self, message: impl Into<String>) -> Vec<TaskRecord> {
+        let message = message.into();
+        let updated = {
+            let mut tasks = self.tasks.write().await;
+            let mut updated = Vec::new();
+            for task in tasks.values_mut() {
+                if is_terminal(task.record.status) {
+                    continue;
+                }
+                task.cancellation.cancel();
+                task.record.status = TaskStatus::Cancelled;
+                task.record.message = message.clone();
+                task.record.finished_at = Some(Utc::now());
+                task.record.result = None;
+                task.record.error = None;
+                updated.push(task.record.clone());
+            }
+            updated
+        };
+        for record in &updated {
+            self.publish(record.clone());
+        }
+        updated
+    }
+
     pub(crate) async fn get(&self, id: &str) -> Option<TaskRecord> {
         self.tasks
             .read()
@@ -374,6 +401,7 @@ mod tests {
         assert!(!created.id.is_empty());
         assert_eq!(created.event, "task_updated");
         assert_eq!(created.task.id, record.id);
+        assert!(!created.task.trace_id.is_empty());
         manager.mark_running(&record.id, "running").await;
         manager.progress(&record.id, 1, Some(2), "half").await;
         let snapshot = manager.get(&record.id).await.unwrap();
@@ -430,5 +458,28 @@ mod tests {
 
         assert!(manager.get(&finished.id).await.is_none());
         assert!(manager.get(&active.id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cancels_only_active_tasks() {
+        let manager = TaskManager::default();
+        let (active, active_cancellation) = manager.create("active", None).await;
+        manager.mark_running(&active.id, "running").await;
+        let (finished, _) = manager.create("finished", Some(1)).await;
+        manager.succeed(&finished.id, json!({ "ok": true })).await;
+
+        let cancelled = manager.cancel_all("control server stopped").await;
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, active.id);
+        assert!(active_cancellation.is_cancelled());
+        assert_eq!(
+            manager.get(&active.id).await.unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert_eq!(
+            manager.get(&finished.id).await.unwrap().status,
+            TaskStatus::Succeeded
+        );
     }
 }

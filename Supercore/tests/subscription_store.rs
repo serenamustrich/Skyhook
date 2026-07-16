@@ -7,8 +7,16 @@ use std::{
 use supercore::{
     config::{OutboundConfig, RuleTarget, SuperConfig},
     subscription::parse_subscription,
-    subscription_store::{runtime_config_from_document, SubscriptionStore},
+    subscription_store::{
+        runtime_config_from_document, SubscriptionStore, SubscriptionUpdateOptions,
+    },
 };
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::Duration,
+};
+use tokio_util::sync::CancellationToken;
 
 const FIRST_SUB: &str = r#"
 proxies:
@@ -252,10 +260,9 @@ rules:
     assert_eq!(imported.meta.node_count, 1);
     assert_eq!(imported.meta.supported_outbound_count, 1);
     assert_eq!(document.proxy_providers[0].nodes[0].name, "Provider-HK");
-    assert!(config
-        .outbounds
-        .iter()
-        .any(|item| matches!(item, OutboundConfig::Shadowsocks { name, .. } if name == "Provider-HK")));
+    assert!(config.outbounds.iter().any(
+        |item| matches!(item, OutboundConfig::Shadowsocks { name, .. } if name == "Provider-HK")
+    ));
     assert!(config.outbounds.iter().any(|item| {
         matches!(
             item,
@@ -389,6 +396,267 @@ fn active_runtime_config_uses_convertible_subscription_rules() {
         .iter()
         .any(|rule| rule.target == RuleTarget::Match && rule.outbound == "Auto"));
 
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn provider_refresh_updates_and_preserves_cached_nodes_on_failure() {
+    let root = unique_store_dir("provider-refresh");
+    let provider_path = root.join("provider.yaml");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &provider_path,
+        r#"
+proxies:
+  - name: Provider-HK
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+"#,
+    )
+    .unwrap();
+    let subscription = format!(
+        r#"
+proxy-providers:
+  airport:
+    type: file
+    path: "{}"
+proxy-groups:
+  - name: Proxy
+    type: select
+    use:
+      - airport
+rules:
+  - MATCH,Proxy
+"#,
+        provider_path.display()
+    );
+    let store = SubscriptionStore::new(&root);
+    let imported = store
+        .import_text(Some("Provider".to_string()), None, &subscription, false)
+        .unwrap();
+
+    fs::write(
+        &provider_path,
+        r#"
+proxies:
+  - name: Provider-SG
+    type: trojan
+    server: sg.example.com
+    port: 443
+    password: secret
+"#,
+    )
+    .unwrap();
+    let summary = store
+        .refresh_providers(&imported.meta.id, 2, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(summary.committed);
+    assert!(summary.updated);
+    assert_eq!(summary.refreshed_count, 1);
+    assert_eq!(
+        store.document(&imported.meta.id).unwrap().nodes[0].name,
+        "Provider-SG"
+    );
+
+    fs::remove_file(&provider_path).unwrap();
+    let summary = store
+        .refresh_providers(&imported.meta.id, 2, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(summary.committed);
+    assert!(!summary.updated);
+    assert_eq!(summary.fallback_count, 1);
+    assert_eq!(summary.issues.len(), 1);
+    assert!(summary.issues[0].used_fallback);
+    assert_eq!(
+        store.document(&imported.meta.id).unwrap().nodes[0].name,
+        "Provider-SG"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn provider_refresh_cancellation_stops_network_work_without_committing() {
+    let root = unique_store_dir("provider-cancel");
+    let provider_path = root.join("provider.yaml");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &provider_path,
+        r#"
+proxies:
+  - name: Provider-Old
+    type: ss
+    server: old.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+"#,
+    )
+    .unwrap();
+    let initial_subscription = format!(
+        r#"
+proxy-providers:
+  airport:
+    type: file
+    path: "{}"
+"#,
+        provider_path.display()
+    );
+    let store = SubscriptionStore::new(&root);
+    let imported = store
+        .import_text(
+            Some("Provider".to_string()),
+            None,
+            &initial_subscription,
+            false,
+        )
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    fs::write(
+        root.join("subscriptions")
+            .join(&imported.meta.id)
+            .join("source.txt"),
+        format!(
+            r#"
+proxy-providers:
+  airport:
+    type: http
+    url: "http://{address}/secret-token/provider"
+"#
+        ),
+    )
+    .unwrap();
+
+    let cancellation = CancellationToken::new();
+    let cancellation_trigger = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation_trigger.cancel();
+    });
+    let error = store
+        .refresh_providers(&imported.meta.id, 10, &cancellation)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(
+        store.document(&imported.meta.id).unwrap().nodes[0].name,
+        "Provider-Old"
+    );
+
+    server.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn subscription_update_reports_progress_and_uses_async_provider_pipeline() {
+    let root = unique_store_dir("subscription-update-progress");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await.unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            SECOND_SUB.len(),
+            SECOND_SUB
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+    let store = SubscriptionStore::new(&root);
+    let imported = store
+        .import_text(
+            Some("Update".to_string()),
+            Some(format!("http://{address}/private-token/subscription")),
+            FIRST_SUB,
+            false,
+        )
+        .unwrap();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let summaries = store
+        .update_all_from_urls_with_progress(
+            SubscriptionUpdateOptions {
+                timeout_secs: 2,
+                retries: 0,
+                concurrency: 1,
+            },
+            CancellationToken::new(),
+            Some(progress_tx),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].updated);
+    let progress = progress_rx.recv().await.unwrap();
+    assert_eq!(progress.completed, 1);
+    assert_eq!(progress.total, 1);
+    assert_eq!(progress.id, imported.meta.id);
+    assert!(progress.updated);
+    assert_eq!(
+        store.document(&imported.meta.id).unwrap().nodes[0].name,
+        "SG-01"
+    );
+    server.await.unwrap();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn subscription_update_cancellation_keeps_previous_document() {
+    let root = unique_store_dir("subscription-update-cancel");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+    let store = SubscriptionStore::new(&root);
+    let imported = store
+        .import_text(
+            Some("Update".to_string()),
+            Some(format!("http://{address}/private-token/subscription")),
+            FIRST_SUB,
+            false,
+        )
+        .unwrap();
+    let cancellation = CancellationToken::new();
+    let cancellation_trigger = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation_trigger.cancel();
+    });
+
+    let error = store
+        .update_all_from_urls_with_progress(
+            SubscriptionUpdateOptions {
+                timeout_secs: 10,
+                retries: 0,
+                concurrency: 1,
+            },
+            cancellation,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("cancelled"));
+    assert_eq!(
+        store.document(&imported.meta.id).unwrap().nodes[0].name,
+        "HK-01"
+    );
+    server.abort();
     fs::remove_dir_all(root).ok();
 }
 

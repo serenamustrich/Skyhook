@@ -41,8 +41,13 @@
   2 秒日志轮询。
 - 未知节点规模的全量测速 task 等待预算已从约 1 秒修正为至少 60 秒，更新全部订阅
   的 task 等待上限提高到 5 分钟。本批次 Swift full 96 passed。
-- Provider、Geo、TUN 和深度 Doctor 等长任务尚未全部迁移，因此 M0 继续保持
-  `IN_PROGRESS`。
+- M0 长任务控制面已完成：单订阅/全部订阅更新、Provider 更新、Geo 更新、Doctor
+  深检和诊断导出均返回 HTTP `202` + `task_id`/`trace_id`，支持真实取消和进度事件。
+- 订阅、Provider 和 Geo 下载使用直连 `no_proxy` 客户端，限制响应大小并隐藏可能
+  含 Token 的完整 URL；Provider 失败保留缓存或上次规范化数据。
+- 诊断导出默认脱敏，文件权限为 `0600` 且有界保留；控制服务退出会取消所有活跃
+  task。M0 最终回归：Rust lib 92 passed、订阅 13 passed、Geo 3 passed、Swift full
+  97 passed，全部 0 failed，因此 M0 状态为 `VERIFIED`。
 
 ## 0. 开发总原则
 

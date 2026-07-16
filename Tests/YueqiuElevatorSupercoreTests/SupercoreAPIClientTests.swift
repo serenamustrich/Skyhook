@@ -280,6 +280,121 @@ final class SupercoreAPIClientTests: XCTestCase {
         XCTAssertEqual(SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path, "/v1/tasks/task-123")
     }
 
+    func testRemainingLongOperationClientsUseTaskEndpointsAndDecodeResults() async throws {
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            {
+              "ok":true,
+              "result":{
+                "id":"subscription-1",
+                "name":"Primary",
+                "updated":true,
+                "error":null
+              },
+              "runtime":{"reloaded":true,"summary":"ready"}
+            }
+            """.utf8
+        )
+        let subscription = try await client.updateSubscription(id: "subscription-1")
+        XCTAssertTrue(subscription.result.updated)
+        XCTAssertEqual(
+            SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path,
+            "/v1/subscriptions/update"
+        )
+
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            {
+              "ok":true,
+              "partial_failure":false,
+              "results":[],
+              "runtime":{"reloaded":false,"summary":null}
+            }
+            """.utf8
+        )
+        let provider = try await client.updateProviders(subscriptionID: "subscription-1")
+        XCTAssertTrue(provider.ok)
+        XCTAssertFalse(provider.partialFailure)
+        XCTAssertEqual(
+            SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path,
+            "/v1/providers/update"
+        )
+        let providerBody = try XCTUnwrap(SupercoreProbeGroupCaptureProtocol.lastBody)
+        let providerPayload = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: providerBody) as? [String: String]
+        )
+        XCTAssertEqual(providerPayload["subscription_id"], "subscription-1")
+
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            {
+              "ok":true,
+              "summaries":[
+                {
+                  "kind":"geoip",
+                  "source":"https://geo.example",
+                  "path":"/tmp/geoip.mmdb",
+                  "updated":true,
+                  "bytes":128,
+                  "error":null
+                }
+              ],
+              "runtime":{"reloaded":true,"summary":"ready"}
+            }
+            """.utf8
+        )
+        let geo = try await client.updateGeoAssets()
+        XCTAssertEqual(geo.summaries.first?.source, "https://geo.example")
+        XCTAssertEqual(
+            SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path,
+            "/v1/geo/update"
+        )
+
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            {
+              "ok":true,
+              "report":{
+                "schema_version":1,
+                "redacted":false,
+                "checks":[
+                  {"id":"control_loopback","status":"passed","message":"ok"}
+                ]
+              }
+            }
+            """.utf8
+        )
+        let doctor = try await client.runDoctor()
+        XCTAssertEqual(doctor.report.schemaVersion, 1)
+        XCTAssertEqual(doctor.report.checks.first?.status, "passed")
+        XCTAssertEqual(
+            SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path,
+            "/v1/doctor/run"
+        )
+
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            {
+              "ok":true,
+              "export":{
+                "path":"/tmp/diagnostic.json",
+                "bytes":256,
+                "sha256":"abc123",
+                "redacted":true
+              }
+            }
+            """.utf8
+        )
+        let diagnostic = try await client.exportDiagnostics()
+        XCTAssertTrue(diagnostic.export.redacted)
+        XCTAssertEqual(diagnostic.export.bytes, 256)
+        XCTAssertEqual(
+            SupercoreProbeGroupCaptureProtocol.lastRequest?.url?.path,
+            "/v1/diagnostics/export"
+        )
+    }
+
     func testCancellingProbeSendsCoreTaskCancellation() async throws {
         let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
         SupercoreProbeGroupCaptureProtocol.enqueueResponse(

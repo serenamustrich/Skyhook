@@ -242,6 +242,62 @@ final class SupercoreAPIClient: @unchecked Sendable {
         try response.throwIfNeeded()
     }
 
+    func updateSubscription(id: String) async throws -> SupercoreSubscriptionUpdateResponse {
+        let body = try JSONSerialization.data(withJSONObject: ["id": id])
+        return try await requestTask(
+            path: "/v1/subscriptions/update",
+            method: "POST",
+            taskTimeout: 300,
+            body: body
+        )
+    }
+
+    func updateProviders(subscriptionID: String? = nil) async throws -> SupercoreProviderUpdateResponse {
+        var payload: [String: Any] = [:]
+        if let subscriptionID, !subscriptionID.isEmpty {
+            payload["subscription_id"] = subscriptionID
+        }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        return try await requestTask(
+            path: "/v1/providers/update",
+            method: "POST",
+            taskTimeout: 300,
+            body: body
+        )
+    }
+
+    func updateAllProviders() async throws -> SupercoreProviderUpdateResponse {
+        try await requestTask(
+            path: "/v1/providers/update-all",
+            method: "POST",
+            taskTimeout: 300
+        )
+    }
+
+    func updateGeoAssets() async throws -> SupercoreGeoUpdateResponse {
+        try await requestTask(
+            path: "/v1/geo/update",
+            method: "POST",
+            taskTimeout: 300
+        )
+    }
+
+    func runDoctor() async throws -> SupercoreDoctorResponse {
+        try await requestTask(
+            path: "/v1/doctor/run",
+            method: "POST",
+            taskTimeout: 30
+        )
+    }
+
+    func exportDiagnostics() async throws -> SupercoreDiagnosticExportResponse {
+        try await requestTask(
+            path: "/v1/diagnostics/export",
+            method: "POST",
+            taskTimeout: 30
+        )
+    }
+
     func reloadActiveSubscription() async throws {
         let response: SupercoreOKResponse = try await request(
             path: "/v1/subscriptions/reload-active",
@@ -542,11 +598,22 @@ struct SupercoreTaskEventEnvelope: Decodable {
 
 struct SupercoreTaskProgress: Decodable {
     let id: String
+    let traceID: String?
     let kind: String
     let status: String
     let current: UInt64
     let total: UInt64?
     let message: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case traceID = "trace_id"
+        case kind
+        case status
+        case current
+        case total
+        case message
+    }
 }
 
 struct SupercoreProbeProgressEvent: Decodable {
@@ -1057,6 +1124,132 @@ private extension CustomRuleAction {
         case .reject, .outbound: nil
         }
     }
+}
+
+struct SupercoreProviderUpdateResponse: Decodable, Sendable {
+    let ok: Bool
+    let partialFailure: Bool
+    let results: [SupercoreProviderSubscriptionResult]
+    let runtime: SupercoreRuntimeReload
+
+    enum CodingKeys: String, CodingKey {
+        case ok
+        case partialFailure = "partial_failure"
+        case results
+        case runtime
+    }
+}
+
+struct SupercoreProviderSubscriptionResult: Decodable, Sendable {
+    let id: String
+    let name: String
+    let result: SupercoreProviderRefreshResult
+}
+
+struct SupercoreProviderRefreshResult: Decodable, Sendable {
+    let committed: Bool
+    let updated: Bool
+    let providerCount: Int?
+    let refreshedCount: Int?
+    let fallbackCount: Int?
+    let nodeCount: Int?
+    let ruleCount: Int?
+    let issues: [SupercoreProviderRefreshIssue]?
+    let fatalError: String?
+
+    enum CodingKeys: String, CodingKey {
+        case committed
+        case updated
+        case providerCount = "provider_count"
+        case refreshedCount = "refreshed_count"
+        case fallbackCount = "fallback_count"
+        case nodeCount = "node_count"
+        case ruleCount = "rule_count"
+        case issues
+        case fatalError = "fatal_error"
+    }
+}
+
+struct SupercoreProviderRefreshIssue: Decodable, Sendable {
+    let providerType: String
+    let name: String
+    let message: String
+    let usedFallback: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case providerType = "provider_type"
+        case name
+        case message
+        case usedFallback = "used_fallback"
+    }
+}
+
+struct SupercoreRuntimeReload: Decodable, Sendable {
+    let reloaded: Bool
+    let summary: String?
+}
+
+struct SupercoreSubscriptionUpdateResponse: Decodable, Sendable {
+    let ok: Bool
+    let result: SupercoreSubscriptionUpdateResult
+    let runtime: SupercoreRuntimeReload
+}
+
+struct SupercoreSubscriptionUpdateResult: Decodable, Sendable {
+    let id: String
+    let name: String
+    let updated: Bool
+    let error: String?
+}
+
+struct SupercoreGeoUpdateResponse: Decodable, Sendable {
+    let ok: Bool
+    let summaries: [SupercoreGeoUpdateSummary]
+    let runtime: SupercoreRuntimeReload
+}
+
+struct SupercoreGeoUpdateSummary: Decodable, Sendable {
+    let kind: String
+    let source: String
+    let path: String
+    let updated: Bool
+    let bytes: UInt64
+    let error: String?
+}
+
+struct SupercoreDoctorResponse: Decodable, Sendable {
+    let ok: Bool
+    let report: SupercoreDoctorReport
+}
+
+struct SupercoreDoctorReport: Decodable, Sendable {
+    let schemaVersion: Int
+    let redacted: Bool
+    let checks: [SupercoreDoctorCheck]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case redacted
+        case checks
+    }
+}
+
+struct SupercoreDoctorCheck: Decodable, Sendable {
+    let id: String
+    let status: String
+    let message: String
+}
+
+struct SupercoreDiagnosticExportResponse: Decodable, Sendable {
+    let ok: Bool
+    let export: SupercoreDiagnosticExport
+}
+
+struct SupercoreDiagnosticExport: Decodable, Sendable {
+    let path: String
+    let bytes: UInt64
+    let sha256: String
+    let redacted: Bool
 }
 
 struct SupercoreOKResponse: Decodable, Sendable {

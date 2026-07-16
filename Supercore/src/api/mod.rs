@@ -1,3 +1,4 @@
+mod diagnostics;
 mod tasks;
 
 use std::{
@@ -5,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use axum::{
     extract::{FromRef, Path as AxumPath, Request, State},
     http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode},
@@ -18,23 +19,27 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::trace::TraceLayer;
 
 use crate::{
     config::{OutboundConfig, RuleTarget, SmartRouteRule, SuperConfig},
     core::{ProbeOptions, ProbeProgress, Runtime},
+    geo::{self, GeoUpdateProgress},
     outbound::error::{classify_message, OutboundErrorKind},
     routing::Destination,
     smart::SmartRecommendationAction,
-    subscription_store::SubscriptionStore,
+    subscription_store::{SubscriptionMeta, SubscriptionStore, SubscriptionUpdateProgress},
 };
 
+use diagnostics::{build_doctor_report, export_diagnostic_report};
 use tasks::{TaskFailure, TaskManager, TaskRecord};
 
 const CONTROL_TOKEN_ENV: &str = "SKYHOOK_CONTROL_TOKEN";
 const CONTROL_TOKEN_FILE_ENV: &str = "SKYHOOK_CONTROL_TOKEN_FILE";
 const MIN_CONTROL_TOKEN_BYTES: usize = 32;
+const MAX_SUBSCRIPTION_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ControlAuthState {
@@ -157,6 +162,11 @@ struct SubscriptionUseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct SubscriptionUpdateRequest {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CountryUseRequest {
     code: String,
 }
@@ -170,6 +180,12 @@ struct OutboundUseRequest {
 struct ActiveSubscriptionConfigRequest {
     #[serde(default)]
     use_first_node: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderUpdateRequest {
+    #[serde(default)]
+    subscription_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,12 +207,16 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
             "control API write operations are disabled because no control token was configured"
         );
     }
-    let app = build_router(runtime, auth);
+    let tasks = TaskManager::default();
+    let app = build_router_with_tasks(runtime, auth, tasks.clone());
     let listener = tokio::net::TcpListener::bind(control_listen).await?;
-    axum::serve(listener, app).await?;
+    let result = axum::serve(listener, app).await;
+    tasks.cancel_all("control server stopped").await;
+    result?;
     Ok(())
 }
 
+#[cfg(test)]
 fn build_router(runtime: Arc<Runtime>, auth: ControlAuthState) -> Router {
     build_router_with_tasks(runtime, auth, TaskManager::default())
 }
@@ -230,12 +250,15 @@ fn build_router_with_tasks(
             "/v1/subscriptions/update-all",
             post(update_all_subscriptions),
         )
+        .route("/v1/subscriptions/update", post(update_subscription))
         .route(
             "/v1/subscriptions/active-config",
             post(active_subscription_config),
         )
         .route("/v1/providers/proxies", get(proxy_providers))
         .route("/v1/providers/rules", get(rule_providers))
+        .route("/v1/providers/update", post(update_providers))
+        .route("/v1/providers/update-all", post(update_all_providers))
         .route("/v1/rules", get(rules_snapshot))
         .route("/v1/smart-rules", get(smart_rules).post(upsert_smart_rule))
         .route("/v1/smart-rules/enabled", post(set_smart_rule_enabled))
@@ -256,6 +279,9 @@ fn build_router_with_tasks(
         .route("/v1/config/reload", post(reload_config))
         .route("/v1/tun", get(tun_status))
         .route("/v1/doctor", get(doctor))
+        .route("/v1/doctor/run", post(run_doctor))
+        .route("/v1/diagnostics/export", post(export_diagnostics))
+        .route("/v1/geo/update", post(update_geo))
         .route("/v1/tasks", get(task_list))
         .route("/v1/tasks/:id", get(task_status))
         .route("/v1/tasks/:id/cancel", post(cancel_task))
@@ -436,6 +462,7 @@ fn task_accepted(record: &TaskRecord) -> Response {
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "task_id": record.id,
+            "trace_id": record.trace_id,
             "kind": record.kind,
             "status": record.status,
         })),
@@ -614,6 +641,233 @@ async fn doctor(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> 
     }))
 }
 
+async fn run_doctor(State(state): State<ApiState>) -> Response {
+    let (record, cancellation) = state.tasks.create("doctor_run", Some(3)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, "collecting runtime diagnostics")
+            .await;
+        tasks
+            .progress(&task_id, 1, Some(3), "inspecting profiles and caches")
+            .await;
+        let operation = build_doctor_report(&runtime, false);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            report = operation => {
+                tasks
+                    .progress(&task_id, 2, Some(3), "evaluating health checks")
+                    .await;
+                runtime.telemetry().publish_event(
+                    "doctor_completed",
+                    serde_json::json!({ "task_id": task_id }),
+                );
+                tasks
+                    .progress(&task_id, 3, Some(3), "finalizing doctor report")
+                    .await;
+                tasks.succeed(
+                    &task_id,
+                    serde_json::json!({
+                        "ok": true,
+                        "report": report,
+                    }),
+                ).await;
+            }
+        }
+    });
+    task_accepted(&record)
+}
+
+async fn export_diagnostics(State(state): State<ApiState>) -> Response {
+    let (record, cancellation) = state.tasks.create("diagnostic_export", Some(3)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, "building redacted diagnostic report")
+            .await;
+        tasks
+            .progress(&task_id, 1, Some(3), "collecting redacted diagnostics")
+            .await;
+        let operation = export_diagnostic_report(&runtime, &task_id, &cancellation);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            result = operation => {
+                match result {
+                    Ok(export) => {
+                        tasks
+                            .progress(&task_id, 2, Some(3), "securing diagnostic artifact")
+                            .await;
+                        runtime.telemetry().publish_event(
+                            "diagnostic_exported",
+                            serde_json::json!({
+                                "task_id": task_id,
+                                "bytes": export.bytes,
+                                "redacted": export.redacted,
+                            }),
+                        );
+                        tasks
+                            .progress(&task_id, 3, Some(3), "diagnostic export ready")
+                            .await;
+                        tasks.succeed(
+                            &task_id,
+                            serde_json::json!({
+                                "ok": true,
+                                "export": export,
+                            }),
+                        ).await;
+                    }
+                    Err(_error) if cancellation.is_cancelled() => {
+                        tasks.mark_cancelled(&task_id).await;
+                    }
+                    Err(error) => {
+                        tasks.fail(
+                            &task_id,
+                            task_failure("diagnostic_export_failed", error),
+                        ).await;
+                    }
+                }
+            }
+        }
+    });
+    task_accepted(&record)
+}
+
+async fn update_geo(State(state): State<ApiState>) -> Response {
+    let geo_config = state.runtime.base_config().geo;
+    let total = [
+        geo_config.geoip_url.as_deref(),
+        geo_config.geosite_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|url| !url.trim().is_empty())
+    .count() as u64;
+    let (record, cancellation) = state.tasks.create("geo_update", Some(total)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(&task_id, format!("updating {total} geo assets"))
+            .await;
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<GeoUpdateProgress>();
+        let progress_tasks = tasks.clone();
+        let progress_runtime = runtime.clone();
+        let progress_task_id = task_id.clone();
+        let progress_handle = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                progress_runtime.telemetry().publish_event(
+                    "geo_update_progress",
+                    serde_json::json!({
+                        "task_id": progress_task_id,
+                        "completed": progress.completed,
+                        "total": progress.total,
+                        "kind": progress.kind,
+                    }),
+                );
+                progress_tasks
+                    .progress(
+                        &progress_task_id,
+                        progress.completed,
+                        Some(progress.total),
+                        format!("updated {} geo asset", progress.kind),
+                    )
+                    .await;
+            }
+        });
+        let operation = geo::update_geo_assets_with_progress(
+            &geo_config,
+            true,
+            cancellation.clone(),
+            Some(progress_tx),
+        );
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let _ = progress_handle.await;
+                tasks.mark_cancelled(&task_id).await;
+            }
+            result = operation => {
+                match result {
+                    Ok(summaries) => {
+                        let mut runtime_reloaded = false;
+                        if summaries.iter().any(|summary| {
+                            summary.kind == "geoip" && summary.error.is_none()
+                        }) {
+                            let mut base_config = runtime.base_config();
+                            base_config.geoip_database =
+                                Some(geo::geoip_cache_path(&base_config.geo));
+                            match runtime.set_base_config(base_config) {
+                                Ok(()) => match reload_active_subscription_config(&runtime) {
+                                    Ok(_) => runtime_reloaded = true,
+                                    Err(error) => {
+                                        let _ = progress_handle.await;
+                                        tasks.fail(
+                                            &task_id,
+                                            task_failure("geo_runtime_reload_failed", error),
+                                        ).await;
+                                        return;
+                                    }
+                                },
+                                Err(error) => {
+                                    let _ = progress_handle.await;
+                                    tasks.fail(
+                                        &task_id,
+                                        task_failure("geo_base_config_update_failed", error),
+                                    ).await;
+                                    return;
+                                }
+                            }
+                        }
+                        let _ = progress_handle.await;
+                        runtime.telemetry().publish_event(
+                            "geo_updated",
+                            serde_json::json!({
+                                "task_id": task_id,
+                                "count": summaries.len(),
+                                "runtime_reloaded": runtime_reloaded,
+                            }),
+                        );
+                        tasks.succeed(
+                            &task_id,
+                            serde_json::json!({
+                                "ok": true,
+                                "summaries": summaries,
+                                "runtime": {
+                                    "reloaded": runtime_reloaded,
+                                },
+                            }),
+                        ).await;
+                    }
+                    Err(_error) if cancellation.is_cancelled() => {
+                        let _ = progress_handle.await;
+                        tasks.mark_cancelled(&task_id).await;
+                    }
+                    Err(error) => {
+                        let _ = progress_handle.await;
+                        tasks.fail(
+                            &task_id,
+                            task_failure("geo_update_failed", error),
+                        ).await;
+                    }
+                }
+            }
+        }
+    });
+    task_accepted(&record)
+}
+
 async fn connections(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "traffic": runtime.telemetry().traffic(),
@@ -697,6 +951,228 @@ async fn rule_providers(State(runtime): State<Arc<Runtime>>) -> Json<serde_json:
     Json(serde_json::json!({
         "providers": providers,
     }))
+}
+
+async fn update_providers(
+    State(state): State<ApiState>,
+    request: Option<Json<ProviderUpdateRequest>>,
+) -> Response {
+    let store = subscription_store(&state.runtime);
+    let index = match store.index() {
+        Ok(index) => index,
+        Err(error) => return classified_api_error("subscription_index_read_failed", error),
+    };
+    let requested_id = request
+        .and_then(|Json(request)| request.subscription_id)
+        .filter(|id| !id.trim().is_empty());
+    let target_id = requested_id.or(index.active_id.clone());
+    let Some(target_id) = target_id else {
+        return invalid_request(
+            "provider_subscription_missing",
+            "provide subscription_id or select an active subscription",
+        );
+    };
+    let Some(target) = index
+        .subscriptions
+        .into_iter()
+        .find(|item| item.id == target_id)
+    else {
+        return invalid_request(
+            "provider_subscription_not_found",
+            format!("subscription {target_id} does not exist"),
+        );
+    };
+    queue_provider_updates(state, vec![target]).await
+}
+
+async fn update_all_providers(State(state): State<ApiState>) -> Response {
+    let targets = match subscription_store(&state.runtime).index() {
+        Ok(index) => index.subscriptions,
+        Err(error) => return classified_api_error("subscription_index_read_failed", error),
+    };
+    queue_provider_updates(state, targets).await
+}
+
+async fn queue_provider_updates(state: ApiState, targets: Vec<SubscriptionMeta>) -> Response {
+    let total = targets.len() as u64;
+    let (record, cancellation) = state.tasks.create("provider_update", Some(total)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks
+            .mark_running(
+                &task_id,
+                format!("updating providers for {total} subscriptions"),
+            )
+            .await;
+        let config = runtime.base_config();
+        let timeout_secs = config.subscriptions.update_timeout_secs;
+        let concurrency = config.subscriptions.update_concurrency.max(1);
+        let store = SubscriptionStore::new(config.subscriptions.store_path);
+        let active_id = store.index().ok().and_then(|index| index.active_id);
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let mut jobs = JoinSet::new();
+
+        for target in targets {
+            let store = store.clone();
+            let semaphore = semaphore.clone();
+            let cancellation = cancellation.clone();
+            jobs.spawn(async move {
+                let permit = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return (
+                            target,
+                            Err(anyhow!("provider refresh cancelled")),
+                        );
+                    }
+                    permit = semaphore.acquire_owned() => permit,
+                };
+                let _permit = match permit {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        return (
+                            target,
+                            Err(anyhow!("provider update scheduler closed: {error}")),
+                        );
+                    }
+                };
+                let result = store
+                    .refresh_providers(&target.id, timeout_secs, &cancellation)
+                    .await;
+                (target, result)
+            });
+        }
+
+        let mut completed = 0_u64;
+        let mut summaries = Vec::new();
+        let mut committed_ids = HashSet::new();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    jobs.abort_all();
+                    while jobs.join_next().await.is_some() {}
+                    tasks.mark_cancelled(&task_id).await;
+                    return;
+                }
+                joined = jobs.join_next() => {
+                    let Some(joined) = joined else {
+                        break;
+                    };
+                    completed = completed.saturating_add(1);
+                    let (id, name, summary) = match joined {
+                        Ok((_target, Ok(summary))) => {
+                            if summary.committed {
+                                committed_ids.insert(summary.id.clone());
+                            }
+                            (
+                                summary.id.clone(),
+                                summary.name.clone(),
+                                serde_json::json!(summary),
+                            )
+                        }
+                        Ok((target, Err(error))) => (
+                            target.id,
+                            target.name,
+                            serde_json::json!({
+                                "committed": false,
+                                "updated": false,
+                                "fatal_error": error.to_string(),
+                            }),
+                        ),
+                        Err(error) => (
+                            "unknown".to_string(),
+                            "unknown".to_string(),
+                            serde_json::json!({
+                                "committed": false,
+                                "updated": false,
+                                "fatal_error": format!("provider update task failed: {error}"),
+                            }),
+                        ),
+                    };
+                    runtime.telemetry().publish_event(
+                        "provider_update_progress",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "completed": completed,
+                            "total": total,
+                            "subscription_id": id,
+                            "subscription_name": name,
+                            "result": summary,
+                        }),
+                    );
+                    tasks
+                        .progress(
+                            &task_id,
+                            completed,
+                            Some(total),
+                            format!("updated providers for {name}"),
+                        )
+                        .await;
+                    summaries.push(serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "result": summary,
+                    }));
+                }
+            }
+        }
+
+        summaries.sort_by(|left, right| {
+            left["name"]
+                .as_str()
+                .cmp(&right["name"].as_str())
+                .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+        });
+        let reload = if active_id
+            .as_ref()
+            .is_some_and(|active_id| committed_ids.contains(active_id))
+        {
+            match reload_active_subscription_config(&runtime) {
+                Ok(config) => serde_json::json!({
+                    "reloaded": true,
+                    "summary": config.summary(),
+                }),
+                Err(error) => {
+                    tasks
+                        .fail(
+                            &task_id,
+                            task_failure("provider_runtime_reload_failed", error),
+                        )
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            serde_json::json!({ "reloaded": false })
+        };
+        let failed = summaries
+            .iter()
+            .filter(|summary| summary["result"]["fatal_error"].is_string())
+            .count();
+        publish_subscription_event(
+            &runtime,
+            "provider_update",
+            serde_json::json!({
+                "count": total,
+                "failed": failed,
+                "reloaded": reload["reloaded"],
+            }),
+        );
+        tasks
+            .succeed(
+                &task_id,
+                serde_json::json!({
+                    "ok": true,
+                    "partial_failure": failed > 0,
+                    "results": summaries,
+                    "runtime": reload,
+                }),
+            )
+            .await;
+    });
+    task_accepted(&record)
 }
 
 async fn groups(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
@@ -966,18 +1442,28 @@ async fn import_subscription(
         tasks
             .mark_running(&task_id, "downloading subscription")
             .await;
+        let operation_cancellation = cancellation.clone();
         let operation = async {
             let url = request.url.clone();
             let update_timeout_secs = runtime.config().subscriptions.update_timeout_secs;
-            let text =
-                subscription_source_text(request.text, request.url, update_timeout_secs).await?;
-            let result = subscription_store(&runtime).import_text_with_id(
-                request.id,
-                request.name,
-                url,
-                &text,
-                request.switch,
-            )?;
+            let text = subscription_source_text(
+                request.text,
+                request.url,
+                update_timeout_secs,
+                &operation_cancellation,
+            )
+            .await?;
+            let result = subscription_store(&runtime)
+                .import_text_with_id_async(
+                    request.id,
+                    request.name,
+                    url,
+                    &text,
+                    request.switch,
+                    update_timeout_secs,
+                    &operation_cancellation,
+                )
+                .await?;
             let reload = if result.active_changed {
                 let config = reload_active_subscription_config(&runtime)?;
                 serde_json::json!({ "reloaded": true, "summary": config.summary() })
@@ -1006,6 +1492,9 @@ async fn import_subscription(
                         );
                         tasks.progress(&task_id, 1, Some(1), "saving subscription").await;
                         tasks.succeed(&task_id, result).await;
+                    }
+                    Err(_error) if cancellation.is_cancelled() => {
+                        tasks.mark_cancelled(&task_id).await;
                     }
                     Err(error) => tasks.fail(
                         &task_id,
@@ -1061,6 +1550,93 @@ async fn use_subscription(
     }
 }
 
+async fn update_subscription(
+    State(state): State<ApiState>,
+    Json(request): Json<SubscriptionUpdateRequest>,
+) -> Response {
+    if request.id.trim().is_empty() {
+        return invalid_request("subscription_id_missing", "subscription id cannot be empty");
+    }
+    let store = subscription_store(&state.runtime);
+    let active_id = match store.index() {
+        Ok(index) => index.active_id,
+        Err(error) => return classified_api_error("subscription_index_read_failed", error),
+    };
+    let options = (&state.runtime.config().subscriptions).into();
+    let (record, cancellation) = state.tasks.create("subscription_update", Some(1)).await;
+    let task_id = record.id.clone();
+    let runtime = state.runtime.clone();
+    let tasks = state.tasks.clone();
+    tokio::spawn(async move {
+        tasks.mark_running(&task_id, "updating subscription").await;
+        let operation = store.update_from_url_with(&request.id, options, &cancellation);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                tasks.mark_cancelled(&task_id).await;
+            }
+            result = operation => {
+                match result {
+                    Ok(summary) => {
+                        let reload = if summary.updated
+                            && active_id.as_deref() == Some(summary.id.as_str())
+                        {
+                            match reload_active_subscription_config(&runtime) {
+                                Ok(config) => serde_json::json!({
+                                    "reloaded": true,
+                                    "summary": config.summary(),
+                                }),
+                                Err(error) => {
+                                    tasks.fail(
+                                        &task_id,
+                                        task_failure("subscription_runtime_reload_failed", error),
+                                    ).await;
+                                    return;
+                                }
+                            }
+                        } else {
+                            serde_json::json!({ "reloaded": false })
+                        };
+                        publish_subscription_event(
+                            &runtime,
+                            "update",
+                            serde_json::json!({
+                                "subscription_id": summary.id,
+                                "updated": summary.updated,
+                                "reloaded": reload["reloaded"],
+                            }),
+                        );
+                        tasks.progress(
+                            &task_id,
+                            1,
+                            Some(1),
+                            format!("updated subscription {}", summary.name),
+                        ).await;
+                        tasks.succeed(
+                            &task_id,
+                            serde_json::json!({
+                                "ok": true,
+                                "result": summary,
+                                "runtime": reload,
+                            }),
+                        ).await;
+                    }
+                    Err(_error) if cancellation.is_cancelled() => {
+                        tasks.mark_cancelled(&task_id).await;
+                    }
+                    Err(error) => {
+                        tasks.fail(
+                            &task_id,
+                            task_failure("subscription_update_failed", error),
+                        ).await;
+                    }
+                }
+            }
+        }
+    });
+    task_accepted(&record)
+}
+
 async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
     let store = subscription_store(&state.runtime);
     let total = match store.index() {
@@ -1079,10 +1655,49 @@ async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
         tasks
             .mark_running(&task_id, format!("updating {total} subscriptions"))
             .await;
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SubscriptionUpdateProgress>();
+        let progress_tasks = tasks.clone();
+        let progress_runtime = runtime.clone();
+        let progress_task_id = task_id.clone();
+        let progress_handle = tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                progress_runtime.telemetry().publish_event(
+                    "subscription_update_progress",
+                    serde_json::json!({
+                        "task_id": progress_task_id,
+                        "completed": progress.completed,
+                        "total": progress.total,
+                        "subscription_id": progress.id,
+                        "subscription_name": progress.name,
+                        "updated": progress.updated,
+                    }),
+                );
+                progress_tasks
+                    .progress(
+                        &progress_task_id,
+                        progress.completed,
+                        Some(progress.total),
+                        format!("updated subscription {}", progress.name),
+                    )
+                    .await;
+            }
+        });
         let operation = async {
-            let results = store.update_all_from_urls_with(options).await?;
-            let updated = results.iter().any(|item| item.updated);
-            let reload = if updated {
+            let active_id = store.index()?.active_id;
+            let results = store
+                .update_all_from_urls_with_progress(
+                    options,
+                    cancellation.clone(),
+                    Some(progress_tx),
+                )
+                .await?;
+            let active_updated = active_id.as_ref().is_some_and(|active_id| {
+                results
+                    .iter()
+                    .any(|item| item.updated && item.id == *active_id)
+            });
+            let reload = if active_updated {
                 let config = reload_active_subscription_config(&runtime)?;
                 serde_json::json!({ "reloaded": true, "summary": config.summary() })
             } else {
@@ -1095,12 +1710,15 @@ async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
             }))
         };
         tokio::select! {
+            biased;
             _ = cancellation.cancelled() => {
+                let _ = progress_handle.await;
                 tasks.mark_cancelled(&task_id).await;
             }
             result = operation => {
                 match result {
                     Ok(result) => {
+                        let _ = progress_handle.await;
                         publish_subscription_event(
                             &runtime,
                             "update_all",
@@ -1117,10 +1735,17 @@ async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
                         ).await;
                         tasks.succeed(&task_id, result).await;
                     }
-                    Err(error) => tasks.fail(
-                        &task_id,
-                        task_failure("subscription_update_failed", error),
-                    ).await,
+                    Err(_error) if cancellation.is_cancelled() => {
+                        let _ = progress_handle.await;
+                        tasks.mark_cancelled(&task_id).await;
+                    }
+                    Err(error) => {
+                        let _ = progress_handle.await;
+                        tasks.fail(
+                            &task_id,
+                            task_failure("subscription_update_failed", error),
+                        ).await;
+                    }
                 }
             }
         }
@@ -1306,6 +1931,7 @@ async fn subscription_source_text(
     text: Option<String>,
     url: Option<String>,
     timeout_secs: u64,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<String> {
     if let Some(text) = text.filter(|item| !item.trim().is_empty()) {
         return Ok(text);
@@ -1313,22 +1939,76 @@ async fn subscription_source_text(
     let Some(url) = url else {
         return Err(anyhow::anyhow!("provide text or url"));
     };
-    fetch_subscription_url(url, timeout_secs).await
+    fetch_subscription_url(url, timeout_secs, cancellation).await
 }
 
-async fn fetch_subscription_url(url: String, timeout_secs: u64) -> anyhow::Result<String> {
-    let response = reqwest::Client::builder()
+async fn fetch_subscription_url(
+    url: String,
+    timeout_secs: u64,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<String> {
+    let parsed = url::Url::parse(&url).context("subscription url is invalid")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(anyhow!("subscription url must use http or https"));
+    }
+    let source = parsed
+        .host_str()
+        .map(|host| format!("{}://{host}", parsed.scheme()))
+        .unwrap_or_else(|| "<redacted-subscription-source>".to_string());
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
-        .build()?
-        .get(url)
-        .header(
-            "User-Agent",
-            concat!("Supercore/", env!("CARGO_PKG_VERSION")),
-        )
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(response.text().await?)
+        .no_proxy()
+        .build()?;
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("subscription import cancelled")),
+        response = client
+            .get(url)
+            .header(
+                "User-Agent",
+                concat!("Supercore/", env!("CARGO_PKG_VERSION")),
+            )
+            .send() => {
+                response.with_context(|| {
+                    format!("failed to download subscription from {source}")
+                })?
+            }
+    };
+    let mut response = response
+        .error_for_status()
+        .with_context(|| format!("subscription endpoint returned an error from {source}"))?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_SUBSCRIPTION_BODY_BYTES as u64)
+    {
+        return Err(anyhow!(
+            "subscription body exceeds {} bytes",
+            MAX_SUBSCRIPTION_BODY_BYTES
+        ));
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(anyhow!("subscription import cancelled"));
+            }
+            chunk = response.chunk() => {
+                chunk.with_context(|| {
+                    format!("failed to read subscription body from {source}")
+                })?
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_BODY_BYTES {
+            return Err(anyhow!(
+                "subscription body exceeds {} bytes",
+                MAX_SUBSCRIPTION_BODY_BYTES
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).with_context(|| format!("subscription body from {source} is not UTF-8"))
 }
 
 #[cfg(test)]
@@ -1621,6 +2301,184 @@ mod tests {
         assert!(text.contains("id:"));
         assert!(text.contains("\"schema_version\":1"));
         assert!(text.contains("\"message\":\"event test\""));
+    }
+
+    #[tokio::test]
+    async fn remaining_long_operation_routes_complete_as_tasks_and_export_redacted_diagnostics() {
+        let root = std::env::temp_dir().join(format!(
+            "skyhook-api-long-operations-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut config = SuperConfig::default();
+        config.subscriptions.store_path = root.clone();
+        let store = SubscriptionStore::new(&root);
+        store
+            .import_text(
+                Some("Private Subscription".to_string()),
+                Some("https://secret.example/api-secret/subscription".to_string()),
+                r#"
+proxies:
+  - name: Private-Node
+    type: ss
+    server: private.example
+    port: 8388
+    cipher: aes-128-gcm
+    password: test-password
+rules:
+  - MATCH,Private-Node
+"#,
+                false,
+            )
+            .unwrap();
+        let runtime = Arc::new(Runtime::new(config).unwrap());
+        let token: Arc<str> = Arc::from("0123456789abcdef0123456789abcdef");
+        let app = build_router(
+            runtime,
+            ControlAuthState {
+                token: Some(token.clone()),
+            },
+        );
+
+        let import_body = serde_json::json!({
+            "name": "Imported Task",
+            "text": r#"
+proxies:
+  - name: Imported-Node
+    type: ss
+    server: imported.example
+    port: 8388
+    cipher: aes-128-gcm
+    password: imported-password
+"#,
+            "switch": false,
+        })
+        .to_string();
+        let imported = run_task_request(
+            app.clone(),
+            token.as_ref(),
+            "/v1/subscriptions/import",
+            Some(&import_body),
+        )
+        .await;
+        assert_eq!(imported["status"], "succeeded");
+        assert_eq!(
+            imported["result"]["result"]["active_changed"],
+            serde_json::Value::Bool(false)
+        );
+        let imported_id = imported["result"]["result"]["meta"]["id"].as_str().unwrap();
+        let update_body = serde_json::json!({ "id": imported_id }).to_string();
+        let updated = run_task_request(
+            app.clone(),
+            token.as_ref(),
+            "/v1/subscriptions/update",
+            Some(&update_body),
+        )
+        .await;
+        assert_eq!(updated["status"], "succeeded");
+        assert_eq!(updated["result"]["result"]["updated"], false);
+        assert_eq!(
+            updated["result"]["result"]["error"],
+            "subscription has no url"
+        );
+
+        let provider = run_task_request(
+            app.clone(),
+            token.as_ref(),
+            "/v1/providers/update-all",
+            None,
+        )
+        .await;
+        assert_eq!(provider["status"], "succeeded");
+        assert_eq!(
+            provider["result"]["results"].as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let geo = run_task_request(app.clone(), token.as_ref(), "/v1/geo/update", None).await;
+        assert_eq!(geo["status"], "succeeded");
+        assert_eq!(geo["result"]["summaries"].as_array().map(Vec::len), Some(0));
+
+        let doctor = run_task_request(app.clone(), token.as_ref(), "/v1/doctor/run", None).await;
+        assert_eq!(doctor["status"], "succeeded");
+        assert_eq!(doctor["result"]["report"]["schema_version"], 1);
+
+        let diagnostics =
+            run_task_request(app, token.as_ref(), "/v1/diagnostics/export", None).await;
+        assert_eq!(diagnostics["status"], "succeeded");
+        assert_eq!(diagnostics["result"]["export"]["redacted"], true);
+        let diagnostic_path =
+            PathBuf::from(diagnostics["result"]["export"]["path"].as_str().unwrap());
+        assert!(diagnostic_path.starts_with(&root));
+        let diagnostic = std::fs::read_to_string(&diagnostic_path).unwrap();
+        assert!(!diagnostic.contains("api-secret"));
+        assert!(!diagnostic.contains("test-password"));
+        assert!(!diagnostic.contains("Private-Node"));
+        assert!(!diagnostic.contains("imported-password"));
+        assert!(!diagnostic.contains("Imported-Node"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&diagnostic_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    async fn run_task_request(
+        app: Router,
+        token: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> serde_json::Value {
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.unwrap_or_default().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let accepted = to_bytes(accepted.into_body(), 64 * 1024).await.unwrap();
+        let accepted: serde_json::Value = serde_json::from_slice(&accepted).unwrap();
+        let task_id = accepted["task_id"].as_str().unwrap();
+
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/tasks/{task_id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if matches!(
+                snapshot["status"].as_str(),
+                Some("succeeded" | "failed" | "cancelled")
+            ) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {task_id} did not finish");
     }
 
     #[test]
