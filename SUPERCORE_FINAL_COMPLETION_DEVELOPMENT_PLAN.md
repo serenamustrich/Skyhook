@@ -28,6 +28,14 @@
   1 秒触发全局测速。
 - 当前 M1 回归：Rust lib 78 passed、Swift full 91 passed；完整 Rust integration 和
   release 门留到 M1 模块拆分完成后统一执行。
+- M1 异步任务控制面已在提交 `ad66698` 落地：全量测速、代理组测速、订阅导入和
+  更新全部订阅返回 HTTP `202` + `task_id`，支持状态查询、底层取消和 SSE task
+  进度。
+- TaskManager 终态默认保留 24 小时、最多 512 条，活跃任务不被清理；invalid probe
+  URL 也会为每个 requested node 返回真实终态，不再遗漏未找到节点。
+- 本批次回归：Rust lib 87 passed、Swift full 93 passed。`/v1/events` 当前只推送
+  task 事件；流量、日志、连接和运行状态事件仍待统一 telemetry event bus，不能
+  标记完整事件面已完成。
 
 ## 0. 开发总原则
 
