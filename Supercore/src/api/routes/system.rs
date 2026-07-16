@@ -8,13 +8,10 @@ use crate::{
     geo::{self, GeoUpdateProgress},
 };
 
-use super::{
-    super::{
-        build_doctor_report, classified_api_error, export_diagnostic_report, invalid_request,
-        openapi_document, task_accepted, task_failure, ApiState, ConfigReloadRequest,
-        StatusResponse, VersionResponse,
-    },
-    subscriptions::reload_active_subscription_config,
+use super::super::{
+    build_doctor_report, classified_api_error, export_diagnostic_report, invalid_request,
+    openapi_document, task_accepted, task_failure, ApiState, ConfigReloadRequest, StatusResponse,
+    VersionResponse,
 };
 
 pub(super) async fn api_schema() -> Json<serde_json::Value> {
@@ -228,7 +225,7 @@ pub(super) async fn update_geo(State(state): State<ApiState>) -> Response {
                             base_config.geoip_database =
                                 Some(geo::geoip_cache_path(&base_config.geo));
                             match runtime.set_base_config(base_config) {
-                                Ok(()) => match reload_active_subscription_config(&runtime) {
+                                Ok(()) => match runtime.reload_active_subscription() {
                                     Ok(_) => runtime_reloaded = true,
                                     Err(error) => {
                                         let _ = progress_handle.await;
@@ -338,7 +335,7 @@ pub(super) async fn reload_config(
     if let Err(error) = runtime.set_base_config(base_config) {
         return invalid_request("config_validation_failed", error.to_string());
     }
-    match reload_active_subscription_config(&runtime) {
+    match runtime.reload_active_subscription() {
         Ok(config) => super::super::json_response(serde_json::json!({
             "ok": true,
             "runtime": {

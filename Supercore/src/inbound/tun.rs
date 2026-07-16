@@ -2,7 +2,7 @@ use std::{net::IpAddr, sync::Arc};
 
 use anyhow::Context;
 use tproxy_config::IpCidr;
-use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, CancellationToken, ProxyType, DEFAULT_MTU};
+use tun2proxy::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType, DEFAULT_MTU};
 
 use crate::{
     config::{TunConfig, TunDnsStrategy, TunStack},
@@ -66,7 +66,7 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         )
         .await;
 
-    let shutdown = CancellationToken::new();
+    let shutdown = runtime.cancellation_token();
     let mtu = if config.mtu == 0 {
         DEFAULT_MTU
     } else {

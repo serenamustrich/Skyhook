@@ -193,7 +193,9 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 ### 5.3 当前结构债务
 
 - `Supercore/src/outbound/mod.rs`：约 12,446 行。
-- `Supercore/src/core/mod.rs`：约 2,234 行。
+- `Supercore/src/core/mod.rs`：当前 17 行，只保留模块声明和公共导出；运行时职责已迁移
+  到 `capability.rs`、`connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、
+  `reload.rs`、`runtime.rs`、`selection.rs` 和 `subscription.rs`。
 - `Supercore/src/api/mod.rs`：当前约 732 行，其中生产装配代码约 75 行，其余为现有
   API 回归测试；所有业务 handler 已迁出。
 - `Supercore/src/api/routes/`：当前已有 `probes.rs`、`providers.rs`、
@@ -234,7 +236,7 @@ M1 第一批已完成：
 - `api/routes/probes.rs`：全部/代理组测速 handler、组展开和失败汇总。
 - Rust lib 92 passed、0 failed；M1 继续保持 `IN_PROGRESS`。
 
-M1 第二批已实现并验证，等待本批提交：
+M1 API 第二批已提交：
 
 - 新增：
   - `api/routes/subscriptions.rs`
@@ -248,14 +250,34 @@ M1 第二批已实现并验证，等待本批提交：
 - schema compatibility test 覆盖全部声明路径与 router 注册路径。
 - `cargo check --lib`：通过且无 warning。
 - Rust lib：93 passed、0 failed、0 ignored。
-- 本批在创建独立提交前仍属于工作区修改；提交完成后进入 Core 拆分。
+- 提交：`9585296 Core: split control API route domains`。
+
+M1 Core 拆分已实现并验证，等待本批提交：
+
+- `core/mod.rs` 从约 2,234 行缩减为 17 行公共入口。
+- 拆分 runtime state、lifecycle、reload、subscription merge、selection、capability、
+  probe、connection relay 和 DNS exchange。
+- reload 在构建和校验新 state 成功后才替换当前 state；失败保留旧 runtime。
+- 新增核心 cancellation root，传播到：
+  - API graceful shutdown。
+  - mixed/DNS listener 和连接任务。
+  - TUN backend。
+  - 后台测速和订阅更新。
+  - TCP/UDP `DialContext`。
+  - DNS/DoH/DoT 和双向 relay。
+- 主进程响应 Ctrl-C 或任一关键服务退出后，先触发 graceful shutdown，超时后再终止
+  残余任务。
+- `cargo check --all-targets`：通过且无 warning。
+- Rust lib：95 passed、0 failed、0 ignored。
+- `config_and_runtime`：20 passed。
+- `plan_behavior`：21 passed。
 
 ### 5.5 当前直接执行队列
 
 接下来由 Codex 严格按以下顺序直接开发：
 
-1. 提交已经验证的 API 路由域拆分。
-2. 继续 M1：依次拆分 Core、Outbound，并统一错误、DialContext、transport、UDP 和
+1. 提交已经验证的 Core runtime/lifecycle/selection 拆分。
+2. 继续 M1：拆分 Outbound，并统一错误、DialContext、transport、UDP 和
    cancellation。
 3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
 4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
@@ -427,7 +449,7 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
    - 删除 `api/mod.rs` 中已经迁移到 `system.rs` 的重复 handler。
    - `api/mod.rs` 最终只保留模块声明、`ApiState`、`serve`、router 组合和测试入口。
    - 清理无用 import，执行 API 定向测试和 Rust lib 回归。
-2. [ ] `Core: modularize runtime lifecycle and selection`
+2. [x] `Core: modularize runtime lifecycle and selection`
    - 拆分 runtime、reload、selection、probe、background jobs 和 subscription merge。
    - reload 改为构建、校验、原子替换；失败继续使用旧 runtime。
 3. [ ] `Core: modularize outbound protocol registry`
@@ -564,6 +586,10 @@ M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 - 增加 schema compatibility test。
 
 ### 10.2 Core 拆分
+
+当前进度：结构拆分、失败 reload 保留旧状态、subscription merge 下沉和 cancellation
+tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 21 项测试；
+本批等待独立提交。
 
 - 从 `core/mod.rs` 拆出：
   - runtime lifecycle

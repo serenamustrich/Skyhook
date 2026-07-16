@@ -53,6 +53,10 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 - Native versioned control API under `/v1/*`.
 - Control-plane modules isolate authentication, structured errors, schemas, SSE events, route
   registration, and probe handlers instead of concentrating those responsibilities in one file.
+- Runtime modules isolate lifecycle, atomic reload, subscription merge, selection/capabilities,
+  probing, connection relay, and DNS exchange; `core/mod.rs` is only the public composition entry.
+- A runtime cancellation tree drives graceful control API shutdown, mixed/DNS listener shutdown,
+  TUN cancellation, background probe/update cancellation, and active dial contexts.
 - Shared transport modules for TCP, TLS, HTTP CONNECT, WebSocket, HTTP/2, gRPC, HTTPUpgrade, and
   QUIC client configuration.
 - Traceable, cancellable dial contexts propagated through concrete outbounds and proxy groups.

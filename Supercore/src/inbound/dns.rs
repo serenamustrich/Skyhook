@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
+    task::JoinSet,
     time::{timeout, Duration},
 };
 
@@ -59,47 +60,67 @@ async fn serve_udp(
     enhanced_mode: crate::config::DnsEnhancedMode,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 65_535];
+    let shutdown = runtime.cancellation_token();
+    let mut queries = JoinSet::new();
     loop {
-        let (len, peer) = udp.recv_from(&mut buf).await?;
-        let query = buf[..len].to_vec();
-        let runtime = runtime.clone();
-        let udp = udp.clone();
-        tokio::spawn(async move {
-            if let crate::config::DnsEnhancedMode::FakeIp = enhanced_mode {
-                if let Some(domain) = extract_domain_from_dns_query(&query) {
-                    if let Some(fake_ip) = runtime.fakeip_store().lookup_or_create(&domain).await {
-                        let response = build_fake_ip_dns_response(&query, &domain, fake_ip);
-                        if !response.is_empty() {
-                            let _ = udp.send_to(&response, peer).await;
-                            return;
-                        }
-                    }
-                }
-            }
-
-            match runtime.exchange_dns_over_tcp(&query).await {
-                Ok(response) => {
-                    let _ = udp.send_to(&response, peer).await;
-                }
-                Err(error) => {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            Some(result) = queries.join_next(), if !queries.is_empty() => {
+                if let Err(error) = result {
                     runtime
                         .telemetry()
-                        .log(
-                            "warn",
-                            format!("dns udp query from {peer} failed, trying system DNS fallback: {error:#}"),
-                        )
+                        .log("warn", format!("dns udp task failed: {error}"))
                         .await;
-                    if let Ok(system_response) = fallback_system_dns(runtime.as_ref(), &query).await {
-                        let _ = udp.send_to(&system_response, peer).await;
-                    }
                 }
             }
-        });
+            received = udp.recv_from(&mut buf) => {
+                let (len, peer) = received?;
+                let query = buf[..len].to_vec();
+                let runtime = runtime.clone();
+                let udp = udp.clone();
+                queries.spawn(async move {
+                    if let crate::config::DnsEnhancedMode::FakeIp = enhanced_mode {
+                        if let Some(domain) = extract_domain_from_dns_query(&query) {
+                            if let Some(fake_ip) = runtime.fakeip_store().lookup_or_create(&domain).await {
+                                let response = build_fake_ip_dns_response(&query, &domain, fake_ip);
+                                if !response.is_empty() {
+                                    let _ = udp.send_to(&response, peer).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    match runtime.exchange_dns_over_tcp(&query).await {
+                        Ok(response) => {
+                            let _ = udp.send_to(&response, peer).await;
+                        }
+                        Err(_) if runtime.is_shutting_down() => {}
+                        Err(error) => {
+                            runtime
+                                .telemetry()
+                                .log(
+                                    "warn",
+                                    format!("dns udp query from {peer} failed, trying system DNS fallback: {error:#}"),
+                                )
+                                .await;
+                            if let Ok(system_response) = fallback_system_dns(runtime.as_ref(), &query).await {
+                                let _ = udp.send_to(&system_response, peer).await;
+                            }
+                        }
+                    }
+                });
+            }
+        }
     }
+    queries.abort_all();
+    while queries.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn fallback_system_dns(runtime: &Runtime, query: &[u8]) -> anyhow::Result<Vec<u8>> {
     let config = runtime.config();
+    let cancellation = runtime.cancellation_token();
     let mut servers = discover_system_dns_servers();
     servers.extend(
         config
@@ -125,12 +146,20 @@ async fn fallback_system_dns(runtime: &Runtime, query: &[u8]) -> anyhow::Result<
             IpAddr::V6(_) => "[::]:0",
         };
         let sock = UdpSocket::bind(bind_addr).await?;
-        if let Err(error) = sock.send_to(query, server).await {
+        let sent = tokio::select! {
+            _ = cancellation.cancelled() => return Err(anyhow!("dns fallback cancelled")),
+            result = sock.send_to(query, server) => result,
+        };
+        if let Err(error) = sent {
             errors.push(format!("{server}: {error}"));
             continue;
         }
         let mut buf = vec![0u8; 65_535];
-        match timeout(Duration::from_secs(1), sock.recv(&mut buf)).await {
+        let received = tokio::select! {
+            _ = cancellation.cancelled() => return Err(anyhow!("dns fallback cancelled")),
+            result = timeout(Duration::from_secs(1), sock.recv(&mut buf)) => result,
+        };
+        match received {
             Ok(Ok(len)) => {
                 buf.truncate(len);
                 return Ok(buf);
@@ -219,18 +248,36 @@ async fn serve_tcp(
     tcp: TcpListener,
     enhanced_mode: crate::config::DnsEnhancedMode,
 ) -> anyhow::Result<()> {
+    let shutdown = runtime.cancellation_token();
+    let mut clients = JoinSet::new();
     loop {
-        let (stream, peer) = tcp.accept().await?;
-        let runtime = runtime.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_tcp_client(runtime.clone(), stream, enhanced_mode).await {
-                runtime
-                    .telemetry()
-                    .log("warn", format!("dns tcp client {peer} failed: {error:#}"))
-                    .await;
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            Some(result) = clients.join_next(), if !clients.is_empty() => {
+                if let Err(error) = result {
+                    runtime
+                        .telemetry()
+                        .log("warn", format!("dns tcp task failed: {error}"))
+                        .await;
+                }
             }
-        });
+            accepted = tcp.accept() => {
+                let (stream, peer) = accepted?;
+                let runtime = runtime.clone();
+                clients.spawn(async move {
+                    if let Err(error) = handle_tcp_client(runtime.clone(), stream, enhanced_mode).await {
+                        runtime
+                            .telemetry()
+                            .log("warn", format!("dns tcp client {peer} failed: {error:#}"))
+                            .await;
+                    }
+                });
+            }
+        }
     }
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_tcp_client(
@@ -238,9 +285,14 @@ async fn handle_tcp_client(
     mut stream: TcpStream,
     enhanced_mode: crate::config::DnsEnhancedMode,
 ) -> anyhow::Result<()> {
+    let shutdown = runtime.cancellation_token();
     loop {
         let mut len = [0u8; 2];
-        match stream.read_exact(&mut len).await {
+        let read = tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            result = stream.read_exact(&mut len) => result,
+        };
+        match read {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(error) => return Err(error.into()),

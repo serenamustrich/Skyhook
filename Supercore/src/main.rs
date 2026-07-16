@@ -15,7 +15,7 @@ use supercore::{
     subscription_store::{SubscriptionStore, SubscriptionUpdateOptions, DEFAULT_STORE_DIR},
 };
 use tokio::task::JoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -152,8 +152,11 @@ async fn main() -> anyhow::Result<()> {
             let runtime = Arc::new(Runtime::new_with_base(base_config, config)?);
 
             tracing::info!(%mixed_addr, %control_addr, "starting supercore");
-            tokio::spawn(runtime.clone().background_probe_loop());
-            tokio::spawn(background_subscription_update_loop(subscription_config));
+            let probe_task = tokio::spawn(runtime.clone().background_probe_loop());
+            let subscription_task = tokio::spawn(background_subscription_update_loop(
+                runtime.clone(),
+                subscription_config,
+            ));
 
             let mut tasks = JoinSet::new();
             tasks.spawn(api::serve(runtime.clone()));
@@ -163,11 +166,37 @@ async fn main() -> anyhow::Result<()> {
             if runtime.config().dns.enabled && runtime.config().dns.listen.is_some() {
                 tasks.spawn(inbound::dns::serve(runtime.clone()));
             }
-            tasks.spawn(inbound::mixed::serve(runtime));
+            tasks.spawn(inbound::mixed::serve(runtime.clone()));
 
-            if let Some(result) = tasks.join_next().await {
-                result??;
+            let outcome = tokio::select! {
+                signal = tokio::signal::ctrl_c() => signal.map_err(anyhow::Error::from),
+                result = tasks.join_next() => match result {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) => Err(anyhow::Error::from(error)),
+                    None => Ok(()),
+                },
+            };
+
+            runtime.shutdown();
+            let graceful = async {
+                while let Some(result) = tasks.join_next().await {
+                    if let Err(error) = result {
+                        tracing::warn!(error = %error, "service task stopped during shutdown");
+                    }
+                }
+            };
+            if timeout(Duration::from_secs(5), graceful).await.is_err() {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
             }
+
+            for mut task in [probe_task, subscription_task] {
+                if timeout(Duration::from_secs(2), &mut task).await.is_err() {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+            outcome?;
         }
         Command::Check { config } => {
             let config = load_runtime_config(&config).await?;
@@ -402,14 +431,22 @@ fn apply_active_subscription(config: SuperConfig) -> anyhow::Result<SuperConfig>
     SubscriptionStore::new(store_path).active_runtime_config(config, use_first_node)
 }
 
-async fn background_subscription_update_loop(config: SubscriptionConfig) {
+async fn background_subscription_update_loop(runtime: Arc<Runtime>, config: SubscriptionConfig) {
     if !config.auto_update || config.update_interval_secs == 0 {
         return;
     }
     let store = SubscriptionStore::new(config.store_path.clone());
+    let cancellation = runtime.cancellation_token();
     loop {
-        sleep(Duration::from_secs(config.update_interval_secs)).await;
-        match store.update_all_from_urls_with((&config).into()).await {
+        tokio::select! {
+            _ = cancellation.cancelled() => return,
+            _ = sleep(Duration::from_secs(config.update_interval_secs)) => {}
+        }
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            result = store.update_all_from_urls_with((&config).into()) => result,
+        };
+        match result {
             Ok(results) => {
                 let updated = results.iter().filter(|item| item.updated).count();
                 tracing::info!(

@@ -48,6 +48,7 @@ impl FromRef<ApiState> for TaskManager {
 
 pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let control_listen = runtime.config().core.control_listen;
+    let shutdown = runtime.cancellation_token();
     validate_control_listen(control_listen)?;
     let auth = ControlAuthState {
         token: load_control_token()?,
@@ -60,7 +61,11 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let tasks = TaskManager::default();
     let app = build_router_with_tasks(runtime, auth, tasks.clone());
     let listener = tokio::net::TcpListener::bind(control_listen).await?;
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
+        .await;
     tasks.cancel_all("control server stopped").await;
     result?;
     Ok(())

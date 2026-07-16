@@ -9,18 +9,16 @@ use crate::{
     subscription_store::{SubscriptionMeta, SubscriptionStore},
 };
 
-use super::{
-    super::{
-        classified_api_error, invalid_request, publish_subscription_event, task_accepted,
-        task_failure, ApiState, ProviderUpdateRequest,
-    },
-    subscriptions::{reload_active_subscription_config, subscription_store},
+use super::super::{
+    classified_api_error, invalid_request, publish_subscription_event, task_accepted, task_failure,
+    ApiState, ProviderUpdateRequest,
 };
 
 pub(super) async fn proxy_providers(
     State(runtime): State<Arc<Runtime>>,
 ) -> Json<serde_json::Value> {
-    let subscriptions = subscription_store(&runtime)
+    let subscriptions = runtime
+        .subscription_store()
         .index()
         .map(|index| index.subscriptions)
         .unwrap_or_default();
@@ -63,7 +61,7 @@ pub(super) async fn update_providers(
     State(state): State<ApiState>,
     request: Option<Json<ProviderUpdateRequest>>,
 ) -> Response {
-    let store = subscription_store(&state.runtime);
+    let store = state.runtime.subscription_store();
     let index = match store.index() {
         Ok(index) => index,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
@@ -92,7 +90,7 @@ pub(super) async fn update_providers(
 }
 
 pub(super) async fn update_all_providers(State(state): State<ApiState>) -> Response {
-    let targets = match subscription_store(&state.runtime).index() {
+    let targets = match state.runtime.subscription_store().index() {
         Ok(index) => index.subscriptions,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
     };
@@ -235,7 +233,7 @@ async fn queue_provider_updates(state: ApiState, targets: Vec<SubscriptionMeta>)
             .as_ref()
             .is_some_and(|active_id| committed_ids.contains(active_id))
         {
-            match reload_active_subscription_config(&runtime) {
+            match runtime.reload_active_subscription() {
                 Ok(config) => serde_json::json!({
                     "reloaded": true,
                     "summary": config.summary(),

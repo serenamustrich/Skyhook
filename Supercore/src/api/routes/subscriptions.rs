@@ -5,9 +5,8 @@ use axum::{extract::State, http::StatusCode, response::Response, Json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    core::Runtime,
-    outbound::error::classify_message,
-    subscription_store::{SubscriptionStore, SubscriptionUpdateProgress},
+    core::Runtime, outbound::error::classify_message,
+    subscription_store::SubscriptionUpdateProgress,
 };
 
 use super::super::{
@@ -19,7 +18,7 @@ use super::super::{
 const MAX_SUBSCRIPTION_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 pub(super) async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Response {
-    match subscription_store(&runtime).index() {
+    match runtime.subscription_store().index() {
         Ok(index) => json_response(serde_json::json!({
             "ok": true,
             "index": index,
@@ -29,7 +28,7 @@ pub(super) async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Respon
 }
 
 pub(super) async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) -> Response {
-    match subscription_store(&runtime).index() {
+    match runtime.subscription_store().index() {
         Ok(index) => json_response(serde_json::json!({
             "ok": true,
             "active_id": index.active_id,
@@ -70,7 +69,8 @@ pub(super) async fn import_subscription(
                 &operation_cancellation,
             )
             .await?;
-            let result = subscription_store(&runtime)
+            let result = runtime
+                .subscription_store()
                 .import_text_with_id_async(
                     request.id,
                     request.name,
@@ -82,7 +82,7 @@ pub(super) async fn import_subscription(
                 )
                 .await?;
             let reload = if result.active_changed {
-                let config = reload_active_subscription_config(&runtime)?;
+                let config = runtime.reload_active_subscription()?;
                 serde_json::json!({ "reloaded": true, "summary": config.summary() })
             } else {
                 serde_json::json!({ "reloaded": false })
@@ -128,8 +128,8 @@ pub(super) async fn use_subscription(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SubscriptionUseRequest>,
 ) -> Response {
-    match subscription_store(&runtime).set_active(&request.id) {
-        Ok(meta) => match reload_active_subscription_config(&runtime) {
+    match runtime.subscription_store().set_active(&request.id) {
+        Ok(meta) => match runtime.reload_active_subscription() {
             Ok(config) => json_response(serde_json::json!({
                 "ok": true,
                 "subscription": meta,
@@ -157,7 +157,7 @@ pub(super) async fn update_subscription(
     if request.id.trim().is_empty() {
         return invalid_request("subscription_id_missing", "subscription id cannot be empty");
     }
-    let store = subscription_store(&state.runtime);
+    let store = state.runtime.subscription_store();
     let active_id = match store.index() {
         Ok(index) => index.active_id,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
@@ -181,7 +181,7 @@ pub(super) async fn update_subscription(
                         let reload = if summary.updated
                             && active_id.as_deref() == Some(summary.id.as_str())
                         {
-                            match reload_active_subscription_config(&runtime) {
+                            match runtime.reload_active_subscription() {
                                 Ok(config) => serde_json::json!({
                                     "reloaded": true,
                                     "summary": config.summary(),
@@ -238,7 +238,7 @@ pub(super) async fn update_subscription(
 }
 
 pub(super) async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
-    let store = subscription_store(&state.runtime);
+    let store = state.runtime.subscription_store();
     let total = match store.index() {
         Ok(index) => index.subscriptions.len() as u64,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
@@ -298,7 +298,7 @@ pub(super) async fn update_all_subscriptions(State(state): State<ApiState>) -> R
                     .any(|item| item.updated && item.id == *active_id)
             });
             let reload = if active_updated {
-                let config = reload_active_subscription_config(&runtime)?;
+                let config = runtime.reload_active_subscription()?;
                 serde_json::json!({ "reloaded": true, "summary": config.summary() })
             } else {
                 serde_json::json!({ "reloaded": false })
@@ -354,7 +354,7 @@ pub(super) async fn update_all_subscriptions(State(state): State<ApiState>) -> R
 }
 
 pub(super) async fn reload_active_subscription(State(runtime): State<Arc<Runtime>>) -> Response {
-    match reload_active_subscription_config(&runtime) {
+    match runtime.reload_active_subscription() {
         Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "runtime": {
@@ -370,35 +370,14 @@ pub(super) async fn active_subscription_config(
     State(runtime): State<Arc<Runtime>>,
     request: Option<Json<ActiveSubscriptionConfigRequest>>,
 ) -> Response {
-    let base_config = runtime.base_config();
-    let use_first_node = request
-        .and_then(|Json(request)| request.use_first_node)
-        .unwrap_or(base_config.subscriptions.use_first_node_as_default);
-    match SubscriptionStore::new(base_config.subscriptions.store_path.clone())
-        .active_runtime_config(base_config, use_first_node)
-    {
+    let use_first_node = request.and_then(|Json(request)| request.use_first_node);
+    match runtime.active_subscription_config(use_first_node) {
         Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "config": config,
         })),
         Err(error) => classified_api_error("subscription_config_failed", error),
     }
-}
-
-pub(in crate::api) fn subscription_store(runtime: &Runtime) -> SubscriptionStore {
-    SubscriptionStore::new(runtime.config().subscriptions.store_path.clone())
-}
-
-pub(in crate::api) fn reload_active_subscription_config(
-    runtime: &Runtime,
-) -> anyhow::Result<crate::config::SuperConfig> {
-    let base_config = runtime.base_config();
-    let store = SubscriptionStore::new(base_config.subscriptions.store_path.clone());
-    let config = store.active_runtime_config(
-        base_config,
-        runtime.config().subscriptions.use_first_node_as_default,
-    )?;
-    runtime.reload_config(config)
 }
 
 async fn subscription_source_text(

@@ -5,6 +5,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::Semaphore,
+    task::JoinSet,
 };
 use url::Url;
 
@@ -27,18 +28,36 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
         )
         .await;
 
+    let shutdown = runtime.cancellation_token();
+    let mut clients = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let runtime = runtime.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle_client(runtime.clone(), stream).await {
-                runtime
-                    .telemetry()
-                    .log("warn", format!("mixed client {peer} failed: {error:#}"))
-                    .await;
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            Some(result) = clients.join_next(), if !clients.is_empty() => {
+                if let Err(error) = result {
+                    runtime
+                        .telemetry()
+                        .log("warn", format!("mixed client task failed: {error}"))
+                        .await;
+                }
             }
-        });
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let runtime = runtime.clone();
+                clients.spawn(async move {
+                    if let Err(error) = handle_client(runtime.clone(), stream).await {
+                        runtime
+                            .telemetry()
+                            .log("warn", format!("mixed client {peer} failed: {error:#}"))
+                            .await;
+                    }
+                });
+            }
+        }
     }
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_client(runtime: Arc<Runtime>, stream: TcpStream) -> anyhow::Result<()> {
@@ -114,8 +133,10 @@ async fn handle_socks5_udp_associate(
     let mut udp_buf = vec![0u8; 65_535];
     let mut tcp_probe = [0u8; 1];
     let udp_workers = Arc::new(Semaphore::new(1024));
+    let shutdown = runtime.cancellation_token();
     loop {
         tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
             tcp = stream.read(&mut tcp_probe) => {
                 if tcp.unwrap_or(0) == 0 {
                     return Ok(());
@@ -342,7 +363,14 @@ async fn handle_http(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Re
         .telemetry()
         .add_transfer(id, rewritten.len() as u64, 0)
         .await;
-    let copied = tokio::io::copy(&mut remote_stream, &mut client_write).await?;
+    let shutdown = runtime.cancellation_token();
+    let copied = tokio::select! {
+        _ = shutdown.cancelled() => {
+            runtime.close_connection_record(id).await;
+            return Ok(());
+        }
+        result = tokio::io::copy(&mut remote_stream, &mut client_write) => result?,
+    };
     runtime.telemetry().add_transfer(id, 0, copied).await;
     runtime.close_connection_record(id).await;
     Ok(())
