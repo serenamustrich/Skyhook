@@ -5,6 +5,14 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::routing::Destination;
 
+pub(super) fn destination_socket_addr(destination: &Destination) -> String {
+    if destination.host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{}]:{}", destination.host, destination.port)
+    } else {
+        destination.authority()
+    }
+}
+
 pub fn encode_socks5_destination(
     destination: &Destination,
     output: &mut Vec<u8>,

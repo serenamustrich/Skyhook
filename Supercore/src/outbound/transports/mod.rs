@@ -12,7 +12,10 @@ pub(crate) use grpc::open_grpc_tunnel;
 pub(crate) use http2::open_h2_tunnel;
 pub(crate) use http_connect::establish_http_connect;
 pub(crate) use http_upgrade::open_http_upgrade_tunnel;
-pub(crate) use quic::quic_client_config;
+pub(crate) use quic::{
+    connect_quic_endpoint, encode_quic_varint, quic_bind_addr, quic_client_config, random_u16,
+    random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
+};
 pub(crate) use tcp::connect_tcp;
 pub(crate) use tls::{tls_client_config, NoCertificateVerification};
 pub(crate) use websocket::{

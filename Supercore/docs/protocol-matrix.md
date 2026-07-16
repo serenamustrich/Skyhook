@@ -63,6 +63,12 @@
   `src/outbound/vless.rs`。
 - VMess/VLESS 按目标隔离的 session 轮转能力由
   `src/outbound/udp/session_pool.rs` 提供。
+- Hysteria2 的 H3 auth、TCP/UDP framing、Salamander/Gecko obfs 和 reassembly 位于
+  `src/outbound/hysteria2.rs`。
+- TUIC v5 auth、TCP stream、native/QUIC UDP relay 和 reassembly 位于
+  `src/outbound/tuic.rs`。
+- 两者共用的 endpoint 连接生命周期、QUIC varint 和连接超时位于
+  `src/outbound/transports/quic.rs`。
 - 跨协议精确读取 helper 位于 `src/outbound/io.rs`；协议私有 crypto/framing 不进入
   公共 outbound 根模块。
 
