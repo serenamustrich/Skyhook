@@ -40,6 +40,7 @@ pub(super) struct TuicOutbound {
     congestion_control: Option<String>,
     udp_relay_mode: Option<String>,
     alpn: Option<String>,
+    connection: TokioMutex<Option<Arc<TuicConnection>>>,
     udp_sessions: TokioMutex<TuicUdpPool>,
 }
 
@@ -50,18 +51,10 @@ struct TuicUdpPool {
 }
 
 struct TuicUdpSession {
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
+    shared: Arc<TuicConnection>,
     mode: String,
     associate_id: u16,
     next_packet_id: u16,
-}
-
-impl Drop for TuicUdpSession {
-    fn drop(&mut self) {
-        self.connection
-            .close(quinn::VarInt::from_u32(0), b"supercore close");
-    }
 }
 
 #[async_trait]
@@ -87,20 +80,9 @@ impl Outbound for TuicOutbound {
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
         let _udp_mode = self.udp_relay_mode.as_deref().unwrap_or("native");
-        let _congestion_control = self.congestion_control.as_deref().unwrap_or("default");
         let user_id = Uuid::parse_str(&self.uuid)
             .map_err(|error| anyhow!("invalid tuic uuid for {}: {error}", self.name))?;
-        let connection = open_tuic_connection(
-            &self.server,
-            self.port,
-            self.sni.as_deref(),
-            self.skip_cert_verify,
-            self.alpn.as_deref(),
-            &user_id,
-            &self.password,
-            timeout_ms,
-        )
-        .await?;
+        let connection = self.tuic_connection(&user_id, timeout_ms).await?;
         let (mut send, recv) = timeout(
             Duration::from_millis(timeout_ms),
             connection.connection.open_bi(),
@@ -112,8 +94,7 @@ impl Outbound for TuicOutbound {
         send.write_all(&request).await?;
         send.flush().await?;
         Ok(Box::new(TuicTcpStream {
-            _endpoint: connection.endpoint,
-            connection: connection.connection,
+            _shared: connection,
             recv,
             send,
         }))
@@ -148,14 +129,14 @@ impl Outbound for TuicOutbound {
                     if session.mode == "quic" {
                         None
                     } else {
-                        session.connection.max_datagram_size()
+                        session.shared.connection.max_datagram_size()
                     },
                 )?;
                 if session.mode == "quic" {
                     for message in messages {
                         let mut stream = timeout(
                             Duration::from_millis(timeout_ms),
-                            session.connection.open_uni(),
+                            session.shared.connection.open_uni(),
                         )
                         .await
                         .context("tuic udp stream open timed out")?
@@ -166,7 +147,7 @@ impl Outbound for TuicOutbound {
                     timeout(Duration::from_millis(timeout_ms), async {
                         let mut reassembly = TuicUdpReassembly::default();
                         loop {
-                            let mut incoming = session.connection.accept_uni().await?;
+                            let mut incoming = session.shared.connection.accept_uni().await?;
                             let data = incoming
                                 .read_to_end(65_535 + 512)
                                 .await
@@ -186,7 +167,10 @@ impl Outbound for TuicOutbound {
                     for message in messages {
                         timeout(
                             Duration::from_millis(timeout_ms),
-                            session.connection.send_datagram_wait(Bytes::from(message)),
+                            session
+                                .shared
+                                .connection
+                                .send_datagram_wait(Bytes::from(message)),
                         )
                         .await
                         .context("tuic udp send timed out")?
@@ -195,7 +179,7 @@ impl Outbound for TuicOutbound {
                     timeout(Duration::from_millis(timeout_ms), async {
                         let mut reassembly = TuicUdpReassembly::default();
                         loop {
-                            let datagram = session.connection.read_datagram().await?;
+                            let datagram = session.shared.connection.read_datagram().await?;
                             if let Some(payload) = parse_tuic_packet_message(
                                 &datagram,
                                 session.associate_id,
@@ -243,8 +227,39 @@ impl TuicOutbound {
             congestion_control,
             udp_relay_mode,
             alpn,
+            connection: TokioMutex::new(None),
             udp_sessions: TokioMutex::new(TuicUdpPool::default()),
         }
+    }
+
+    async fn tuic_connection(
+        &self,
+        user_id: &Uuid,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Arc<TuicConnection>> {
+        let mut pooled = self.connection.lock().await;
+        if let Some(connection) = pooled
+            .as_ref()
+            .filter(|connection| connection.connection.close_reason().is_none())
+        {
+            return Ok(Arc::clone(connection));
+        }
+        let connection = Arc::new(
+            open_tuic_connection(
+                &self.server,
+                self.port,
+                self.sni.as_deref(),
+                self.skip_cert_verify,
+                self.alpn.as_deref(),
+                self.congestion_control.as_deref(),
+                user_id,
+                &self.password,
+                timeout_ms,
+            )
+            .await?,
+        );
+        *pooled = Some(Arc::clone(&connection));
+        Ok(connection)
     }
 
     async fn tuic_udp_session(
@@ -260,20 +275,9 @@ impl TuicOutbound {
         if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
             let user_id = Uuid::parse_str(&self.uuid)
                 .map_err(|error| anyhow!("invalid tuic uuid for {}: {error}", self.name))?;
-            let connection = open_tuic_connection(
-                &self.server,
-                self.port,
-                self.sni.as_deref(),
-                self.skip_cert_verify,
-                self.alpn.as_deref(),
-                &user_id,
-                &self.password,
-                timeout_ms,
-            )
-            .await?;
+            let connection = self.tuic_connection(&user_id, timeout_ms).await?;
             let session = Arc::new(TokioMutex::new(TuicUdpSession {
-                _endpoint: connection.endpoint,
-                connection: connection.connection,
+                shared: connection,
                 mode: mode.to_string(),
                 associate_id: random_u16()?,
                 next_packet_id: random_u16()?,
@@ -293,22 +297,21 @@ impl TuicOutbound {
 }
 
 struct TuicConnection {
-    endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
-}
-
-struct TuicTcpStream {
     _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
-    recv: quinn::RecvStream,
-    send: quinn::SendStream,
 }
 
-impl Drop for TuicTcpStream {
+impl Drop for TuicConnection {
     fn drop(&mut self) {
         self.connection
             .close(quinn::VarInt::from_u32(0), b"supercore close");
     }
+}
+
+struct TuicTcpStream {
+    _shared: Arc<TuicConnection>,
+    recv: quinn::RecvStream,
+    send: quinn::SendStream,
 }
 
 impl AsyncRead for TuicTcpStream {
@@ -348,6 +351,7 @@ async fn open_tuic_connection(
     sni: Option<&str>,
     skip_cert_verify: bool,
     alpn: Option<&str>,
+    congestion_control: Option<&str>,
     user_id: &Uuid,
     password: &str,
     timeout_ms: u64,
@@ -362,7 +366,7 @@ async fn open_tuic_connection(
         endpoint,
         remote,
         &server_name,
-        quic_client_config(skip_cert_verify, alpn.or(Some("h3")))?,
+        quic_client_config(skip_cert_verify, alpn.or(Some("h3")), congestion_control)?,
         timeout_ms,
         "tuic",
     )
@@ -384,7 +388,7 @@ async fn open_tuic_connection(
     stream.finish()?;
 
     Ok(TuicConnection {
-        endpoint,
+        _endpoint: endpoint,
         connection,
     })
 }

@@ -83,6 +83,14 @@ pub(crate) struct GrpcTunnelStream {
     closed: bool,
 }
 
+impl Drop for GrpcTunnelStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.send.send_reset(h2::Reason::CANCEL);
+        }
+    }
+}
+
 impl GrpcTunnelStream {
     fn poll_response(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
         if self.recv.is_some() {

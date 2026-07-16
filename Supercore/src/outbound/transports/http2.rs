@@ -71,6 +71,14 @@ pub(crate) struct Http2TunnelStream {
     closed: bool,
 }
 
+impl Drop for Http2TunnelStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.send.send_reset(h2::Reason::CANCEL);
+        }
+    }
+}
+
 impl Http2TunnelStream {
     fn poll_response(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
         if self.recv.is_some() {

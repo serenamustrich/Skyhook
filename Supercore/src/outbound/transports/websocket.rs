@@ -95,6 +95,7 @@ where
 
     tokio::spawn(async move {
         let mut buf = [0u8; 16 * 1024];
+        let mut fragments = None;
         loop {
             tokio::select! {
                 local = local_read.read(&mut buf) => {
@@ -117,9 +118,15 @@ where
                 }
                 remote = read_websocket_message(&mut remote_read) => {
                     match remote {
-                        Ok(Some(WebSocketMessage::Data(frame))) => {
-                            if local_write.write_all(&frame).await.is_err() {
-                                break;
+                        Ok(Some(WebSocketMessage::Data { opcode, fin, payload })) => {
+                            match reassemble_data(&mut fragments, opcode, fin, payload) {
+                                Ok(Some(frame)) => {
+                                    if local_write.write_all(&frame).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(_) => break,
                             }
                         }
                         Ok(Some(WebSocketMessage::Ping(payload))) => {
@@ -213,9 +220,18 @@ pub(crate) async fn read_websocket_frame<R>(reader: &mut R) -> anyhow::Result<Op
 where
     R: AsyncRead + Unpin,
 {
+    let mut fragments = None;
     loop {
         match read_websocket_message(reader).await? {
-            Some(WebSocketMessage::Data(payload)) => return Ok(Some(payload)),
+            Some(WebSocketMessage::Data {
+                opcode,
+                fin,
+                payload,
+            }) => {
+                if let Some(payload) = reassemble_data(&mut fragments, opcode, fin, payload)? {
+                    return Ok(Some(payload));
+                }
+            }
             Some(WebSocketMessage::Close(_)) | None => return Ok(None),
             Some(WebSocketMessage::Ping(_)) | Some(WebSocketMessage::Pong) => {}
         }
@@ -223,7 +239,11 @@ where
 }
 
 enum WebSocketMessage {
-    Data(Vec<u8>),
+    Data {
+        opcode: u8,
+        fin: bool,
+        payload: Vec<u8>,
+    },
     Ping(Vec<u8>),
     Pong,
     Close(Vec<u8>),
@@ -236,6 +256,12 @@ where
     let mut header = [0u8; 2];
     if !read_exact_or_eof(reader, &mut header).await? {
         return Ok(None);
+    }
+    let fin = header[0] & 0x80 != 0;
+    if header[0] & 0x70 != 0 {
+        return Err(anyhow!(
+            "websocket RSV bits require an unsupported extension"
+        ));
     }
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
@@ -263,12 +289,58 @@ where
             *byte ^= mask[index % 4];
         }
     }
+    if opcode >= 0x8 && (!fin || payload.len() > 125) {
+        return Err(anyhow!("invalid fragmented websocket control frame"));
+    }
     match opcode {
-        0x0..=0x2 => Ok(Some(WebSocketMessage::Data(payload))),
+        0x0..=0x2 => Ok(Some(WebSocketMessage::Data {
+            opcode,
+            fin,
+            payload,
+        })),
         0x8 => Ok(Some(WebSocketMessage::Close(payload))),
         0x9 => Ok(Some(WebSocketMessage::Ping(payload))),
         0xA => Ok(Some(WebSocketMessage::Pong)),
         other => Err(anyhow!("unsupported websocket opcode {other}")),
+    }
+}
+
+fn reassemble_data(
+    fragments: &mut Option<Vec<u8>>,
+    opcode: u8,
+    fin: bool,
+    payload: Vec<u8>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    match opcode {
+        0x0 => {
+            let buffer = fragments
+                .as_mut()
+                .ok_or_else(|| anyhow!("websocket continuation has no initial frame"))?;
+            if buffer.len().saturating_add(payload.len()) > 16 * 1024 * 1024 {
+                return Err(anyhow!("websocket fragmented message is too large"));
+            }
+            buffer.extend_from_slice(&payload);
+            if fin {
+                Ok(fragments.take())
+            } else {
+                Ok(None)
+            }
+        }
+        0x1 | 0x2 if fin => {
+            if fragments.is_some() {
+                return Err(anyhow!(
+                    "websocket data frame interrupted fragmented message"
+                ));
+            }
+            Ok(Some(payload))
+        }
+        0x1 | 0x2 => {
+            if fragments.replace(payload).is_some() {
+                return Err(anyhow!("websocket started a second fragmented message"));
+            }
+            Ok(None)
+        }
+        _ => Err(anyhow!("unsupported websocket data opcode {opcode}")),
     }
 }
 

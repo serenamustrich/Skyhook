@@ -41,15 +41,14 @@ pub(super) struct Hysteria2Outbound {
     obfs: Option<String>,
     obfs_password: Option<String>,
     alpn: Option<String>,
+    connection: TokioMutex<Option<Arc<Hysteria2Connection>>>,
     udp_sessions: TokioMutex<Hysteria2UdpPool>,
 }
 
 type Hysteria2UdpPool = RoundRobinSessionPool<Hysteria2UdpSession>;
 
 struct Hysteria2UdpSession {
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
-    h3_driver: JoinHandle<()>,
+    shared: Arc<Hysteria2Connection>,
     session_id: u32,
     next_packet_id: u16,
 }
@@ -64,14 +63,6 @@ enum Hysteria2ObfsKind {
 struct Hysteria2ObfsConfig {
     kind: Hysteria2ObfsKind,
     key: Vec<u8>,
-}
-
-impl Drop for Hysteria2UdpSession {
-    fn drop(&mut self) {
-        self.connection
-            .close(quinn::VarInt::from_u32(0), b"supercore close");
-        self.h3_driver.abort();
-    }
 }
 
 #[async_trait]
@@ -102,17 +93,9 @@ impl Outbound for Hysteria2Outbound {
     ) -> anyhow::Result<BoxedStream> {
         let obfs_config =
             hysteria2_obfs_config(self.obfs.as_deref(), self.obfs_password.as_deref())?;
-        let connection = open_hysteria2_connection(
-            &self.server,
-            self.port,
-            self.sni.as_deref(),
-            self.skip_cert_verify,
-            &self.password,
-            self.alpn.as_deref(),
-            obfs_config.as_ref(),
-            timeout_ms,
-        )
-        .await?;
+        let connection = self
+            .hysteria2_connection(obfs_config.as_ref(), timeout_ms)
+            .await?;
         let (mut send, mut recv) = timeout(
             Duration::from_millis(timeout_ms),
             connection.connection.open_bi(),
@@ -125,9 +108,7 @@ impl Outbound for Hysteria2Outbound {
         send.flush().await?;
         read_hysteria2_tcp_response(&mut recv).await?;
         Ok(Box::new(Hysteria2TcpStream {
-            _endpoint: connection.endpoint,
-            connection: connection.connection,
-            h3_driver: connection.h3_driver,
+            _shared: connection,
             recv,
             send,
         }))
@@ -155,12 +136,15 @@ impl Outbound for Hysteria2Outbound {
                     packet_id,
                     destination,
                     payload,
-                    session.connection.max_datagram_size(),
+                    session.shared.connection.max_datagram_size(),
                 )?;
                 for message in messages {
                     timeout(
                         Duration::from_millis(timeout_ms),
-                        session.connection.send_datagram_wait(Bytes::from(message)),
+                        session
+                            .shared
+                            .connection
+                            .send_datagram_wait(Bytes::from(message)),
                     )
                     .await
                     .context("hysteria2 udp send timed out")?
@@ -169,7 +153,7 @@ impl Outbound for Hysteria2Outbound {
                 timeout(Duration::from_millis(timeout_ms), async {
                     let mut reassembly = Hysteria2UdpReassembly::default();
                     loop {
-                        let datagram = session.connection.read_datagram().await?;
+                        let datagram = session.shared.connection.read_datagram().await?;
                         if let Some(payload) = parse_hysteria2_udp_message(
                             &datagram,
                             session.session_id,
@@ -214,18 +198,25 @@ impl Hysteria2Outbound {
             obfs,
             obfs_password,
             alpn,
+            connection: TokioMutex::new(None),
             udp_sessions: TokioMutex::new(Hysteria2UdpPool::default()),
         }
     }
 
-    async fn hysteria2_udp_session(
+    async fn hysteria2_connection(
         &self,
         obfs_config: Option<&Hysteria2ObfsConfig>,
         timeout_ms: u64,
-    ) -> anyhow::Result<Arc<TokioMutex<Hysteria2UdpSession>>> {
-        let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
-            let connection = open_hysteria2_connection(
+    ) -> anyhow::Result<Arc<Hysteria2Connection>> {
+        let mut pooled = self.connection.lock().await;
+        if let Some(connection) = pooled
+            .as_ref()
+            .filter(|connection| connection.connection.close_reason().is_none())
+        {
+            return Ok(Arc::clone(connection));
+        }
+        let connection = Arc::new(
+            open_hysteria2_connection(
                 &self.server,
                 self.port,
                 self.sni.as_deref(),
@@ -235,18 +226,25 @@ impl Hysteria2Outbound {
                 obfs_config,
                 timeout_ms,
             )
-            .await?;
+            .await?,
+        );
+        *pooled = Some(Arc::clone(&connection));
+        Ok(connection)
+    }
+
+    async fn hysteria2_udp_session(
+        &self,
+        obfs_config: Option<&Hysteria2ObfsConfig>,
+        timeout_ms: u64,
+    ) -> anyhow::Result<Arc<TokioMutex<Hysteria2UdpSession>>> {
+        let mut pool = self.udp_sessions.lock().await;
+        if pool.len() < UDP_SESSION_POOL_SIZE {
+            let connection = self.hysteria2_connection(obfs_config, timeout_ms).await?;
             if !connection.udp_supported {
-                connection
-                    .connection
-                    .close(quinn::VarInt::from_u32(0), b"supercore close");
-                connection.h3_driver.abort();
                 return Err(anyhow!("hysteria2 server does not support udp relay"));
             }
             let session = Arc::new(TokioMutex::new(Hysteria2UdpSession {
-                _endpoint: connection.endpoint,
-                connection: connection.connection,
-                h3_driver: connection.h3_driver,
+                shared: connection,
                 session_id: random_u32()?,
                 next_packet_id: random_u16()?,
             }));
@@ -264,10 +262,18 @@ impl Hysteria2Outbound {
 }
 
 struct Hysteria2Connection {
-    endpoint: quinn::Endpoint,
+    _endpoint: quinn::Endpoint,
     connection: quinn::Connection,
     h3_driver: JoinHandle<()>,
     udp_supported: bool,
+}
+
+impl Drop for Hysteria2Connection {
+    fn drop(&mut self) {
+        self.connection
+            .close(quinn::VarInt::from_u32(0), b"supercore close");
+        self.h3_driver.abort();
+    }
 }
 
 #[derive(Debug)]
@@ -606,19 +612,9 @@ fn hysteria2_obfs_config(
 }
 
 struct Hysteria2TcpStream {
-    _endpoint: quinn::Endpoint,
-    connection: quinn::Connection,
-    h3_driver: JoinHandle<()>,
+    _shared: Arc<Hysteria2Connection>,
     recv: quinn::RecvStream,
     send: quinn::SendStream,
-}
-
-impl Drop for Hysteria2TcpStream {
-    fn drop(&mut self) {
-        self.connection
-            .close(quinn::VarInt::from_u32(0), b"supercore close");
-        self.h3_driver.abort();
-    }
 }
 
 impl AsyncRead for Hysteria2TcpStream {
@@ -667,8 +663,8 @@ async fn open_hysteria2_connection(
     }
     let remote = resolve_quic_remote("hysteria2", server, port).await?;
     let endpoint = if let Some(obfs_config) = obfs_config {
-        let socket = create_bound_std_udp(remote)
-            .context("failed to bind hysteria2 obfs udp socket")?;
+        let socket =
+            create_bound_std_udp(remote).context("failed to bind hysteria2 obfs udp socket")?;
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let inner = runtime
             .wrap_udp_socket(socket)
@@ -693,7 +689,7 @@ async fn open_hysteria2_connection(
         endpoint,
         remote,
         &server_name,
-        quic_client_config(skip_cert_verify, alpn)?,
+        quic_client_config(skip_cert_verify, alpn, None)?,
         timeout_ms,
         "hysteria2",
     )
@@ -759,7 +755,7 @@ async fn open_hysteria2_connection(
         .unwrap_or(true);
 
     Ok(Hysteria2Connection {
-        endpoint,
+        _endpoint: endpoint,
         connection,
         h3_driver,
         udp_supported,

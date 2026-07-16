@@ -8,7 +8,7 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.6（按 2026-07-17 `f556713` 基线及 `NEXT-008A` 已验证工作区重新核对）
+> 计划版本：v1.7（按 2026-07-17 `1b5c0c9` 基线及 `NEXT-008B1` 已验证工作区重新核对）
 >
 > 当前文档状态：`EXECUTING`。M1 正按本文档直接实施。
 >
@@ -149,6 +149,7 @@
 - `94bd50a Core: isolate Trojan VMess and VLESS`
 - `a7047a2 Core: isolate QUIC protocol runtimes`
 - `f556713 Core: minimize outbound module root`
+- `1b5c0c9 Network: add context aware socket dialing`
 
 已经完成的基础：
 
@@ -308,9 +309,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `f556713` 基线和当前 `NEXT-008A` 工作区上重新核对：
+2026-07-17 在 `1b5c0c9` 基线和当前 `NEXT-008B1` 工作区上重新核对：
 
-- 当前分支为 `main`，已提交基线停在 `f556713`。
+- 当前分支为 `main`，已提交基线停在 `1b5c0c9`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -755,8 +756,13 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - TLS client session cache 已启用。
      - 验证：`cargo check --all-targets` 无 warning；outbound lib 48 passed。
    - [ ] `NEXT-008B`：完成 transport edge cases 和连接池。
-     - WebSocket early data/fragmentation、H2 RST/GOAWAY、gRPC cancellation/trailers、
-       HTTPUpgrade 超时，以及 QUIC endpoint/connection pool、MTU/zero-RTT policy。
+     - [x] `NEXT-008B1`：WebSocket fragmentation/ping/pong/close、H2/gRPC drop reset、
+       gRPC trailers、QUIC MTU/zero-RTT/congestion policy，以及 Hysteria2/TUIC 复用同一
+       已认证 QUIC connection。
+     - [ ] `NEXT-008B2`：WebSocket early data 配置、HTTPUpgrade 显式阶段超时、H2
+       GOAWAY/RST 定向测试和 QUIC pool 并发/失效重建测试。
+     - 验证：`cargo check --all-targets` 无 warning；outbound lib 48 passed；
+       `vless_hy2_tuic` 19 passed。
    - [ ] `NEXT-008C`：完成 common fields。
      - IP version、interface-name、routing-mark 平台限制、UDP 开关、证书指纹、TFO、
        MPTCP、dialer-proxy 和 smux 全部进入正式配置、capability 和拨号路径。

@@ -16,6 +16,7 @@ use crate::outbound::udp::create_bound_std_udp;
 pub(crate) fn quic_client_config(
     skip_cert_verify: bool,
     alpn: Option<&str>,
+    congestion_control: Option<&str>,
 ) -> anyhow::Result<quinn::ClientConfig> {
     let provider = aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(provider.into())
@@ -42,13 +43,37 @@ pub(crate) fn quic_client_config(
         .filter(|items| !items.is_empty())
         .unwrap_or_else(|| vec![b"h3".to_vec()]);
     config.alpn_protocols = protocols;
+    let active = active_dial_context();
+    config.enable_early_data = active.as_ref().is_some_and(|context| context.quic_zero_rtt);
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
         .context("failed to build quic rustls client config")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    if let Some(context) = active_dial_context() {
+    match congestion_control
+        .unwrap_or("cubic")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "default" | "cubic" => {}
+        "bbr" => {
+            transport_config
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+        "new-reno" | "new_reno" | "newreno" => {
+            transport_config.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        value => return Err(anyhow!("unsupported QUIC congestion controller {value}")),
+    }
+    if let Some(context) = active {
         transport_config.keep_alive_interval(context.keepalive);
+        if let Some(mtu) = context.quic_mtu {
+            let mtu = mtu.clamp(1_200, 65_527);
+            transport_config.initial_mtu(mtu).min_mtu(mtu.min(1_200));
+        }
     }
     client_config.transport_config(Arc::new(transport_config));
     Ok(client_config)
