@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    future::Future,
     io::{Cursor, Error, ErrorKind, IoSliceMut},
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -59,16 +58,43 @@ use crate::{
 };
 
 pub mod context;
+mod direct;
 pub mod error;
+mod group;
+mod http_proxy;
+mod naive;
 mod pool;
+mod registry;
+mod reject;
 mod transports;
 mod udp;
+mod unsupported;
 
+use direct::DirectOutbound;
+use http_proxy::HttpOutbound;
+use naive::NaiveOutbound;
 use pool::IdlePool;
-use transports::{connect_tcp, tls_client_config, NoCertificateVerification};
+use registry::{attach_groups, insert_leaf};
+use reject::RejectOutbound;
+use transports::{
+    connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
+    perform_websocket_handshake, perform_websocket_handshake_with_headers, quic_client_config,
+    spawn_websocket_stream, tls_client_config, NoCertificateVerification,
+};
 use udp::{resolve_udp_socket_addr, RoundRobinSessionPool};
+use unsupported::UnsupportedProtocolOutbound;
 
 use self::context::DialContext;
+use self::error::{OutboundError, OutboundErrorKind};
+
+#[cfg(test)]
+use group::GroupOutbound;
+
+#[cfg(test)]
+use transports::{
+    read_websocket_frame, render_transport_headers, websocket_accept_key,
+    write_websocket_binary_frame, write_websocket_frame,
+};
 
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -87,8 +113,18 @@ pub trait Outbound: Send + Sync {
     ) -> anyhow::Result<BoxedStream>;
 
     async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
-        self.connect(&context.destination, context.timeout_ms())
-            .await
+        tokio::select! {
+            _ = context.cancellation.cancelled() => {
+                Err(OutboundError::new(
+                    OutboundErrorKind::Cancelled,
+                    "connect",
+                    format!("dial {} was cancelled", context.destination.authority()),
+                )
+                .for_protocol(self.kind())
+                .into())
+            }
+            result = self.connect(&context.destination, context.timeout_ms()) => result,
+        }
     }
 
     async fn udp_exchange(
@@ -97,11 +133,13 @@ pub trait Outbound: Send + Sync {
         _payload: &[u8],
         _timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        Err(anyhow!(
-            "outbound {} ({}) does not support udp",
-            self.name(),
-            self.kind()
-        ))
+        Err(OutboundError::new(
+            OutboundErrorKind::Unsupported,
+            "udp_exchange",
+            format!("outbound {} does not support udp", self.name()),
+        )
+        .for_protocol(self.kind())
+        .into())
     }
 
     async fn udp_exchange_context(
@@ -109,8 +147,18 @@ pub trait Outbound: Send + Sync {
         context: &DialContext,
         payload: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
-        self.udp_exchange(&context.destination, payload, context.timeout_ms())
-            .await
+        tokio::select! {
+            _ = context.cancellation.cancelled() => {
+                Err(OutboundError::new(
+                    OutboundErrorKind::Cancelled,
+                    "udp_exchange",
+                    format!("UDP exchange with {} was cancelled", context.destination.authority()),
+                )
+                .for_protocol(self.kind())
+                .into())
+            }
+            result = self.udp_exchange(&context.destination, payload, context.timeout_ms()) => result,
+        }
     }
 }
 
@@ -126,64 +174,30 @@ pub fn build_outbounds(
             continue;
         }
         let outbound = build_leaf_outbound(config)?;
-        if outbounds
-            .insert(config.name().to_string(), outbound)
-            .is_some()
-        {
-            return Err(anyhow!("duplicate outbound name {}", config.name()));
-        }
+        insert_leaf(&mut outbounds, config.name(), outbound)?;
     }
 
-    for config in configs {
-        let OutboundConfig::Group {
-            name,
-            kind,
-            members,
-        } = config
-        else {
-            continue;
-        };
-        let mut group_members = Vec::new();
-        for member in members {
-            let outbound = outbounds
-                .get(member)
-                .cloned()
-                .ok_or_else(|| anyhow!("group {name} references undefined outbound {member}"))?;
-            group_members.push(outbound);
-        }
-        if group_members.is_empty() {
-            return Err(anyhow!("group {name} has no members"));
-        }
-        let outbound: Arc<dyn Outbound> = Arc::new(GroupOutbound {
-            name: name.clone(),
-            kind: kind.clone(),
-            members: group_members,
-            telemetry: telemetry.clone(),
-        });
-        if outbounds.insert(name.clone(), outbound).is_some() {
-            return Err(anyhow!("duplicate outbound name {name}"));
-        }
-    }
+    attach_groups(configs, &mut outbounds, telemetry)?;
     Ok(outbounds)
 }
 
 fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbound>> {
     let outbound: Arc<dyn Outbound> = match config {
-        OutboundConfig::Direct { name } => Arc::new(DirectOutbound { name: name.clone() }),
-        OutboundConfig::Reject { name } => Arc::new(RejectOutbound { name: name.clone() }),
+        OutboundConfig::Direct { name } => Arc::new(DirectOutbound::new(name.clone())),
+        OutboundConfig::Reject { name } => Arc::new(RejectOutbound::new(name.clone())),
         OutboundConfig::Http {
             name,
             server,
             port,
             username,
             password,
-        } => Arc::new(HttpOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            username: username.clone(),
-            password: password.clone(),
-        }),
+        } => Arc::new(HttpOutbound::new(
+            name.clone(),
+            server.clone(),
+            *port,
+            username.clone(),
+            password.clone(),
+        )),
         OutboundConfig::Socks5 {
             name,
             server,
@@ -363,16 +377,16 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             sni,
             skip_cert_verify,
             alpn,
-        } => Arc::new(NaiveOutbound {
-            name: name.clone(),
-            server: server.clone(),
-            port: *port,
-            username: username.clone(),
-            password: password.clone(),
-            sni: sni.clone(),
-            skip_cert_verify: *skip_cert_verify,
-            alpn: alpn.clone(),
-        }),
+        } => Arc::new(NaiveOutbound::new(
+            name.clone(),
+            server.clone(),
+            *port,
+            username.clone(),
+            password.clone(),
+            sni.clone(),
+            *skip_cert_verify,
+            alpn.clone(),
+        )),
         OutboundConfig::Ssr {
             name,
             server,
@@ -416,10 +430,10 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             reuse: *reuse,
             v4_pool: Arc::new(TokioMutex::new(SnellV4ConnectionPool::default())),
         }),
-        OutboundConfig::Hysteria { name, .. } => Arc::new(UnsupportedProtocolOutbound {
-            name: name.clone(),
-            protocol: "hysteria".to_string(),
-        }),
+        OutboundConfig::Hysteria { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
+            name.clone(),
+            "hysteria".to_string(),
+        )),
         OutboundConfig::AnyTls {
             name,
             server,
@@ -496,418 +510,30 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             private_key: private_key.clone(),
             private_key_passphrase: private_key_passphrase.clone(),
         }),
-        OutboundConfig::Mieru { name, .. } => Arc::new(UnsupportedProtocolOutbound {
-            name: name.clone(),
-            protocol: "mieru".to_string(),
-        }),
-        OutboundConfig::Juicity { name, .. } => Arc::new(UnsupportedProtocolOutbound {
-            name: name.clone(),
-            protocol: "juicity".to_string(),
-        }),
-        OutboundConfig::Masque { name, .. } => Arc::new(UnsupportedProtocolOutbound {
-            name: name.clone(),
-            protocol: "masque".to_string(),
-        }),
-        OutboundConfig::OpenVpn { name, .. } => Arc::new(UnsupportedProtocolOutbound {
-            name: name.clone(),
-            protocol: "openvpn".to_string(),
-        }),
-        OutboundConfig::Unknown { name, protocol, .. } => Arc::new(UnsupportedProtocolOutbound {
-            name: name.clone(),
-            protocol: protocol.clone(),
-        }),
+        OutboundConfig::Mieru { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
+            name.clone(),
+            "mieru".to_string(),
+        )),
+        OutboundConfig::Juicity { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
+            name.clone(),
+            "juicity".to_string(),
+        )),
+        OutboundConfig::Masque { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
+            name.clone(),
+            "masque".to_string(),
+        )),
+        OutboundConfig::OpenVpn { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
+            name.clone(),
+            "openvpn".to_string(),
+        )),
+        OutboundConfig::Unknown { name, protocol, .. } => Arc::new(
+            UnsupportedProtocolOutbound::new(name.clone(), protocol.clone()),
+        ),
         OutboundConfig::Group { name, .. } => {
             return Err(anyhow!("group {name} must be built after leaf outbounds"));
         }
     };
     Ok(outbound)
-}
-
-struct DirectOutbound {
-    name: String,
-}
-
-struct RejectOutbound {
-    name: String,
-}
-
-struct UnsupportedProtocolOutbound {
-    name: String,
-    protocol: String,
-}
-
-struct GroupOutbound {
-    name: String,
-    kind: String,
-    members: Vec<Arc<dyn Outbound>>,
-    telemetry: Option<Arc<Telemetry>>,
-}
-
-#[async_trait]
-impl Outbound for GroupOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "group"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let context = DialContext::new(destination.clone(), timeout_ms);
-        self.connect_context(&context).await
-    }
-
-    async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
-        let members = self.ordered_members().await;
-
-        let mut errors = Vec::new();
-        for member in members {
-            match member.connect_context(context).await {
-                Ok(stream) => return Ok(stream),
-                Err(error) => errors.push(format!("{}: {error}", member.name())),
-            }
-        }
-        Err(anyhow!(
-            "group {} failed to connect via {}: {}",
-            self.name,
-            self.kind,
-            errors.join("; ")
-        ))
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let context = DialContext::new(destination.clone(), timeout_ms);
-        self.udp_exchange_context(&context, payload).await
-    }
-
-    async fn udp_exchange_context(
-        &self,
-        context: &DialContext,
-        payload: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        let members = self.ordered_members().await;
-
-        let mut errors = Vec::new();
-        for member in members {
-            match member.udp_exchange_context(context, payload).await {
-                Ok(response) => return Ok(response),
-                Err(error) => errors.push(format!("{}: {error}", member.name())),
-            }
-        }
-        Err(anyhow!(
-            "group {} failed to exchange udp via {}: {}",
-            self.name,
-            self.kind,
-            errors.join("; ")
-        ))
-    }
-}
-
-impl GroupOutbound {
-    async fn ordered_members(&self) -> Vec<Arc<dyn Outbound>> {
-        if !group_uses_health_order(&self.kind) {
-            return self.members.clone();
-        }
-        let Some(telemetry) = &self.telemetry else {
-            return self.members.clone();
-        };
-        let health = telemetry
-            .outbound_health()
-            .await
-            .into_iter()
-            .map(|item| (item.name.clone(), item))
-            .collect::<HashMap<_, _>>();
-        let mut indexed = self
-            .members
-            .iter()
-            .enumerate()
-            .map(|(index, member)| {
-                let item = health.get(member.name());
-                let healthy = item
-                    .map(|health| health.successes > 0 && health.last_error.is_none())
-                    .unwrap_or(false);
-                let latency = item.and_then(|health| health.last_latency_ms);
-                let score = item.map(|health| health.score);
-                (index, healthy, latency, score, member.clone())
-            })
-            .collect::<Vec<_>>();
-        indexed.sort_by(|lhs, rhs| {
-            rhs.1
-                .cmp(&lhs.1)
-                .then_with(|| lhs.2.unwrap_or(u64::MAX).cmp(&rhs.2.unwrap_or(u64::MAX)))
-                .then_with(|| rhs.3.unwrap_or(0).cmp(&lhs.3.unwrap_or(0)))
-                .then_with(|| lhs.0.cmp(&rhs.0))
-        });
-        indexed
-            .into_iter()
-            .map(|(_, _, _, _, member)| member)
-            .collect()
-    }
-}
-
-fn group_uses_health_order(kind: &str) -> bool {
-    matches!(
-        kind.to_ascii_lowercase().as_str(),
-        "select" | "url-test" | "fallback" | "load-balance" | "auto" | "latency"
-    )
-}
-
-#[async_trait]
-impl Outbound for DirectOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "direct"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        Ok(Box::new(
-            connect_tcp(&destination.authority(), timeout_ms).await?,
-        ))
-    }
-
-    async fn udp_exchange(
-        &self,
-        destination: &Destination,
-        payload: &[u8],
-        timeout_ms: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let bind_addr = if destination.host.parse::<std::net::Ipv6Addr>().is_ok() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = UdpSocket::bind(bind_addr).await.with_context(|| {
-            format!("failed to bind udp socket for {}", destination.authority())
-        })?;
-        let target = destination_socket_addr(destination);
-        timeout(
-            Duration::from_millis(timeout_ms),
-            socket.send_to(payload, target.as_str()),
-        )
-        .await
-        .context("udp send timed out")?
-        .with_context(|| format!("failed to send udp packet to {target}"))?;
-        let mut buf = vec![0u8; 65_535];
-        let (len, _) = timeout(
-            Duration::from_millis(timeout_ms),
-            socket.recv_from(&mut buf),
-        )
-        .await
-        .context("udp receive timed out")?
-        .with_context(|| {
-            format!(
-                "failed to receive udp packet from {}",
-                destination.authority()
-            )
-        })?;
-        buf.truncate(len);
-        Ok(buf)
-    }
-}
-
-#[async_trait]
-impl Outbound for RejectOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "reject"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        _timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        Err(anyhow!(
-            "rejected by outbound rule for {}",
-            destination.authority()
-        ))
-    }
-}
-
-#[async_trait]
-impl Outbound for UnsupportedProtocolOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "unsupported-protocol"
-    }
-
-    async fn connect(
-        &self,
-        _destination: &Destination,
-        _timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        Err(anyhow!(
-            "protocol {} is recognized but native dialing is not implemented yet",
-            self.protocol
-        ))
-    }
-}
-
-struct HttpOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-#[async_trait]
-impl Outbound for HttpOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "http"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let proxy = format!("{}:{}", self.server, self.port);
-        let mut stream = connect_tcp(&proxy, timeout_ms).await?;
-        let mut request = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\n",
-            destination.authority(),
-            destination.authority()
-        );
-        if let (Some(username), Some(password)) = (&self.username, &self.password) {
-            let token = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                format!("{username}:{password}"),
-            );
-            request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
-        }
-        request.push_str("\r\n");
-        stream.write_all(request.as_bytes()).await?;
-
-        let mut response = Vec::new();
-        let mut buf = [0u8; 1];
-        while response.len() < 8192 {
-            stream.read_exact(&mut buf).await?;
-            response.push(buf[0]);
-            if response.ends_with(b"\r\n\r\n") {
-                break;
-            }
-        }
-        let status_line = std::str::from_utf8(&response)
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("");
-        if !status_line.contains(" 200 ") {
-            return Err(anyhow!("http proxy connect failed: {status_line}"));
-        }
-        Ok(Box::new(stream))
-    }
-}
-
-struct NaiveOutbound {
-    name: String,
-    server: String,
-    port: u16,
-    username: Option<String>,
-    password: Option<String>,
-    sni: Option<String>,
-    skip_cert_verify: bool,
-    alpn: Vec<String>,
-}
-
-#[async_trait]
-impl Outbound for NaiveOutbound {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> &'static str {
-        "naive"
-    }
-
-    async fn connect(
-        &self,
-        destination: &Destination,
-        timeout_ms: u64,
-    ) -> anyhow::Result<BoxedStream> {
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let server_name = self.sni.as_deref().unwrap_or(&self.server).to_string();
-        let mut tls_config = tls_client_config(self.skip_cert_verify)?;
-        tls_config.alpn_protocols = if self.alpn.is_empty() {
-            vec![b"http/1.1".to_vec()]
-        } else {
-            self.alpn
-                .iter()
-                .map(|value| value.as_bytes().to_vec())
-                .collect()
-        };
-        let connector = TlsConnector::from(Arc::new(tls_config));
-        let tls_server_name = ServerName::try_from(server_name)
-            .map_err(|error| anyhow!("invalid naive server name: {error}"))?;
-        let mut stream = timeout(
-            Duration::from_millis(timeout_ms),
-            connector.connect(tls_server_name, tcp),
-        )
-        .await
-        .context("naive tls handshake timed out")?
-        .context("naive tls handshake failed")?;
-        let mut request = format!(
-            "CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: Keep-Alive\r\n",
-            destination.authority(),
-            destination.authority()
-        );
-        if let (Some(username), Some(password)) = (&self.username, &self.password) {
-            let token = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                format!("{username}:{password}"),
-            );
-            request.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
-        }
-        request.push_str("\r\n");
-        stream.write_all(request.as_bytes()).await?;
-
-        let mut response = Vec::new();
-        let mut buf = [0u8; 1];
-        while response.len() < 8192 {
-            stream.read_exact(&mut buf).await?;
-            response.push(buf[0]);
-            if response.ends_with(b"\r\n\r\n") {
-                break;
-            }
-        }
-        let status_line = std::str::from_utf8(&response)
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("");
-        if !status_line.contains(" 200 ") {
-            return Err(anyhow!("naive connect failed: {status_line}"));
-        }
-        Ok(Box::new(stream))
-    }
 }
 
 struct AnyTlsOutbound {
@@ -5883,44 +5509,6 @@ async fn open_hysteria2_connection(
     })
 }
 
-fn quic_client_config(
-    skip_cert_verify: bool,
-    alpn: Option<&str>,
-) -> anyhow::Result<quinn::ClientConfig> {
-    let provider = aws_lc_rs::default_provider();
-    let builder = ClientConfig::builder_with_provider(provider.into())
-        .with_protocol_versions(&[&rustls::version::TLS13])?;
-    let mut config = if skip_cert_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
-    } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
-    let protocols = alpn
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(|item| item.as_bytes().to_vec())
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec![b"h3".to_vec()]);
-    config.alpn_protocols = protocols;
-    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
-        .context("failed to build quic rustls client config")?;
-    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    client_config.transport_config(Arc::new(transport_config));
-    Ok(client_config)
-}
-
 fn build_hysteria2_tcp_request(destination: &Destination) -> anyhow::Result<Vec<u8>> {
     let address = destination_socket_addr(destination);
     let mut output = Vec::with_capacity(address.len() + 16);
@@ -7143,887 +6731,6 @@ fn reality_tls_client_config(
             short_id: decode_reality_short_id(short_id)?,
         }));
     Ok(config)
-}
-
-async fn open_grpc_tunnel<S>(
-    stream: S,
-    host: &str,
-    service_name: Option<&str>,
-    timeout_ms: u64,
-) -> anyhow::Result<GrpcTunnelStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (send_request, connection) = timeout(
-        Duration::from_millis(timeout_ms),
-        h2::client::Builder::new().handshake(stream),
-    )
-    .await
-    .context("grpc h2 handshake timed out")?
-    .context("grpc h2 handshake failed")?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(error = %error, "grpc h2 connection ended");
-        }
-    });
-
-    let mut send_request = timeout(Duration::from_millis(timeout_ms), send_request.ready())
-        .await
-        .context("grpc h2 client readiness timed out")?
-        .context("grpc h2 client is not ready")?;
-    let path = grpc_service_path(service_name);
-    let uri = format!("https://{host}{path}");
-    let request = http::Request::builder()
-        .method(http::Method::POST)
-        .version(http::Version::HTTP_2)
-        .uri(uri)
-        .header(http::header::CONTENT_TYPE, "application/grpc")
-        .header("te", "trailers")
-        .header(http::header::USER_AGENT, "Supercore/0.1")
-        .body(())
-        .context("failed to build grpc request")?;
-    let (response, send) = send_request
-        .send_request(request, false)
-        .context("failed to send grpc request")?;
-
-    Ok(GrpcTunnelStream {
-        send,
-        response: Some(response),
-        recv: None,
-        incoming: BytesMut::new(),
-        read_buffer: BytesMut::new(),
-        closed: false,
-    })
-}
-
-async fn open_h2_tunnel<S>(
-    stream: S,
-    host: &str,
-    path: &str,
-    timeout_ms: u64,
-) -> anyhow::Result<Http2TunnelStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (send_request, connection) = timeout(
-        Duration::from_millis(timeout_ms),
-        h2::client::Builder::new().handshake(stream),
-    )
-    .await
-    .context("h2 handshake timed out")?
-    .context("h2 handshake failed")?;
-    tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            tracing::debug!(error = %error, "h2 connection ended");
-        }
-    });
-
-    let mut send_request = timeout(Duration::from_millis(timeout_ms), send_request.ready())
-        .await
-        .context("h2 client readiness timed out")?
-        .context("h2 client is not ready")?;
-    let path = http_path(path);
-    let uri = format!("https://{host}{path}");
-    let request = http::Request::builder()
-        .method(http::Method::PUT)
-        .version(http::Version::HTTP_2)
-        .uri(uri)
-        .header(http::header::USER_AGENT, "Supercore/0.1")
-        .body(())
-        .context("failed to build h2 request")?;
-    let (response, send) = send_request
-        .send_request(request, false)
-        .context("failed to send h2 request")?;
-
-    Ok(Http2TunnelStream {
-        send,
-        response: Some(response),
-        recv: None,
-        read_buffer: BytesMut::new(),
-        closed: false,
-    })
-}
-
-async fn open_http_upgrade_tunnel<S>(
-    mut stream: S,
-    host: &str,
-    path: &str,
-    headers: &BTreeMap<String, String>,
-) -> anyhow::Result<HttpUpgradeStream<S>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let path = http_path(path);
-    let custom_headers =
-        render_transport_headers(headers, &["host", "connection", "upgrade", "user-agent"])?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         {custom_headers}\
-         Connection: Upgrade\r\n\
-         Upgrade: websocket\r\n\
-         User-Agent: Supercore/0.1\r\n\
-         \r\n"
-    );
-    stream.write_all(request.as_bytes()).await?;
-    stream.flush().await?;
-
-    let mut response = Vec::with_capacity(1024);
-    let mut buffer = [0u8; 512];
-    let header_end = loop {
-        if response.len() >= 64 * 1024 {
-            return Err(anyhow!("http upgrade response headers are too large"));
-        }
-        let count = stream.read(&mut buffer).await?;
-        if count == 0 {
-            return Err(anyhow!("http upgrade ended before response headers"));
-        }
-        response.extend_from_slice(&buffer[..count]);
-        if let Some(header_end) = find_header_end(&response) {
-            break header_end;
-        }
-    };
-    let header_text = std::str::from_utf8(&response[..header_end])?;
-    let status_line = header_text.lines().next().unwrap_or("");
-    if !status_line.contains(" 101 ") {
-        return Err(anyhow!("http upgrade failed: {status_line}"));
-    }
-    let mut connection_upgrade = false;
-    let mut upgrade_websocket = false;
-    for line in header_text.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.eq_ignore_ascii_case("connection") {
-            connection_upgrade = value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
-        } else if name.eq_ignore_ascii_case("upgrade") {
-            upgrade_websocket = value.trim().eq_ignore_ascii_case("websocket");
-        }
-    }
-    if !connection_upgrade || !upgrade_websocket {
-        return Err(anyhow!(
-            "http upgrade response is missing Connection: Upgrade or Upgrade: websocket"
-        ));
-    }
-
-    Ok(HttpUpgradeStream {
-        stream,
-        prefetched: BytesMut::from(&response[header_end..]),
-    })
-}
-
-struct HttpUpgradeStream<S> {
-    stream: S,
-    prefetched: BytesMut,
-}
-
-impl<S> AsyncRead for HttpUpgradeStream<S>
-where
-    S: AsyncRead + Unpin,
-{
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), Error>> {
-        if !self.prefetched.is_empty() && buf.remaining() > 0 {
-            let length = self.prefetched.len().min(buf.remaining());
-            let chunk = self.prefetched.split_to(length);
-            buf.put_slice(&chunk);
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl<S> AsyncWrite for HttpUpgradeStream<S>
-where
-    S: AsyncWrite + Unpin,
-{
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Result<(), Error>> {
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-fn http_path(path: &str) -> String {
-    let path = path.trim();
-    if path.is_empty() {
-        "/".to_string()
-    } else if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    }
-}
-
-fn grpc_service_path(service_name: Option<&str>) -> String {
-    let Some(service_name) = service_name.map(str::trim).filter(|item| !item.is_empty()) else {
-        return "/Tun".to_string();
-    };
-    if service_name.starts_with('/') {
-        return service_name.to_string();
-    }
-    format!("/{}/Tun", service_name.trim_matches('/'))
-}
-
-struct Http2TunnelStream {
-    send: h2::SendStream<Bytes>,
-    response: Option<h2::client::ResponseFuture>,
-    recv: Option<h2::RecvStream>,
-    read_buffer: BytesMut,
-    closed: bool,
-}
-
-impl Http2TunnelStream {
-    fn poll_response(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
-        if self.recv.is_some() {
-            return Poll::Ready(Ok(()));
-        }
-        let response = self
-            .response
-            .as_mut()
-            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "h2 response missing"))?;
-        let response = match Pin::new(response).poll(cx) {
-            Poll::Ready(Ok(response)) => response,
-            Poll::Ready(Err(error)) => {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("h2 response failed: {error}"),
-                )));
-            }
-            Poll::Pending => return Poll::Pending,
-        };
-        if !response.status().is_success() {
-            return Poll::Ready(Err(Error::new(
-                ErrorKind::ConnectionAborted,
-                format!("h2 response status {}", response.status()),
-            )));
-        }
-        self.recv = Some(response.into_body());
-        self.response = None;
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl AsyncRead for Http2TunnelStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), Error>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        loop {
-            if !self.read_buffer.is_empty() {
-                let len = self.read_buffer.len().min(buf.remaining());
-                let chunk = self.read_buffer.split_to(len);
-                buf.put_slice(&chunk);
-                return Poll::Ready(Ok(()));
-            }
-            match self.poll_response(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-            let recv = self
-                .recv
-                .as_mut()
-                .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "h2 receive stream missing"));
-            let recv = match recv {
-                Ok(recv) => recv,
-                Err(error) => return Poll::Ready(Err(error)),
-            };
-            match recv.poll_data(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let len = chunk.len();
-                    self.read_buffer.extend_from_slice(&chunk);
-                    if let Some(recv) = self.recv.as_mut() {
-                        let _ = recv.flow_control().release_capacity(len);
-                    }
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    return Poll::Ready(Err(Error::new(
-                        ErrorKind::ConnectionAborted,
-                        format!("h2 receive failed: {error}"),
-                    )));
-                }
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-impl AsyncWrite for Http2TunnelStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        if self.closed {
-            return Poll::Ready(Err(Error::new(
-                ErrorKind::BrokenPipe,
-                "h2 send stream is closed",
-            )));
-        }
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let len = buf.len().min(16 * 1024);
-        self.send.reserve_capacity(len);
-        match self.send.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(capacity))) if capacity >= len => {}
-            Poll::Ready(Some(Ok(_))) | Poll::Pending => return Poll::Pending,
-            Poll::Ready(Some(Err(error))) => {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    format!("h2 send capacity failed: {error}"),
-                )));
-            }
-            Poll::Ready(None) => {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "h2 send stream has no capacity",
-                )));
-            }
-        }
-        match self
-            .send
-            .send_data(Bytes::copy_from_slice(&buf[..len]), false)
-        {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(error) => Poll::Ready(Err(Error::new(
-                ErrorKind::BrokenPipe,
-                format!("h2 send failed: {error}"),
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<Result<(), Error>> {
-        if !self.closed {
-            self.closed = true;
-            if let Err(error) = self.send.send_data(Bytes::new(), true) {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    format!("h2 shutdown failed: {error}"),
-                )));
-            }
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-struct GrpcTunnelStream {
-    send: h2::SendStream<Bytes>,
-    response: Option<h2::client::ResponseFuture>,
-    recv: Option<h2::RecvStream>,
-    incoming: BytesMut,
-    read_buffer: BytesMut,
-    closed: bool,
-}
-
-impl GrpcTunnelStream {
-    fn poll_response(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
-        if self.recv.is_some() {
-            return Poll::Ready(Ok(()));
-        }
-        let response = self
-            .response
-            .as_mut()
-            .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "grpc response missing"))?;
-        let response = match Pin::new(response).poll(cx) {
-            Poll::Ready(Ok(response)) => response,
-            Poll::Ready(Err(error)) => {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::ConnectionAborted,
-                    format!("grpc response failed: {error}"),
-                )));
-            }
-            Poll::Pending => return Poll::Pending,
-        };
-        if !response.status().is_success() {
-            return Poll::Ready(Err(Error::new(
-                ErrorKind::ConnectionAborted,
-                format!("grpc response status {}", response.status()),
-            )));
-        }
-        if let Err(error) = validate_grpc_status(response.headers()) {
-            return Poll::Ready(Err(error));
-        }
-        self.recv = Some(response.into_body());
-        self.response = None;
-        Poll::Ready(Ok(()))
-    }
-
-    fn decode_next_message(&mut self) -> Result<bool, Error> {
-        if self.incoming.len() < 5 {
-            return Ok(false);
-        }
-        let compressed = self.incoming[0];
-        if compressed != 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "compressed grpc messages are not supported",
-            ));
-        }
-        let len = u32::from_be_bytes([
-            self.incoming[1],
-            self.incoming[2],
-            self.incoming[3],
-            self.incoming[4],
-        ]) as usize;
-        if self.incoming.len() < 5 + len {
-            return Ok(false);
-        }
-        bytes::Buf::advance(&mut self.incoming, 5);
-        let payload = self.incoming.split_to(len);
-        self.read_buffer.extend_from_slice(&payload);
-        Ok(true)
-    }
-}
-
-impl AsyncRead for GrpcTunnelStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), Error>> {
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        loop {
-            if !self.read_buffer.is_empty() {
-                let len = self.read_buffer.len().min(buf.remaining());
-                let chunk = self.read_buffer.split_to(len);
-                buf.put_slice(&chunk);
-                return Poll::Ready(Ok(()));
-            }
-
-            match self.decode_next_message() {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(error) => return Poll::Ready(Err(error)),
-            }
-
-            match self.poll_response(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-
-            let recv = self
-                .recv
-                .as_mut()
-                .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "grpc receive stream missing"));
-            let recv = match recv {
-                Ok(recv) => recv,
-                Err(error) => return Poll::Ready(Err(error)),
-            };
-            match recv.poll_data(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let len = chunk.len();
-                    self.incoming.extend_from_slice(&chunk);
-                    if let Some(recv) = self.recv.as_mut() {
-                        let _ = recv.flow_control().release_capacity(len);
-                    }
-                }
-                Poll::Ready(Some(Err(error))) => {
-                    return Poll::Ready(Err(Error::new(
-                        ErrorKind::ConnectionAborted,
-                        format!("grpc receive failed: {error}"),
-                    )));
-                }
-                Poll::Ready(None) => match recv.poll_trailers(cx) {
-                    Poll::Ready(Ok(Some(trailers))) => {
-                        if let Err(error) = validate_grpc_status(&trailers) {
-                            return Poll::Ready(Err(error));
-                        }
-                        return Poll::Ready(Ok(()));
-                    }
-                    Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
-                    Poll::Ready(Err(error)) => {
-                        return Poll::Ready(Err(Error::new(
-                            ErrorKind::ConnectionAborted,
-                            format!("grpc trailers failed: {error}"),
-                        )));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                },
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
-fn validate_grpc_status(headers: &http::HeaderMap) -> Result<(), Error> {
-    let Some(status) = headers.get("grpc-status") else {
-        return Ok(());
-    };
-    let status = status.to_str().map_err(|error| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("invalid grpc-status header: {error}"),
-        )
-    })?;
-    if status == "0" {
-        return Ok(());
-    }
-    let message = headers
-        .get("grpc-message")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("remote gRPC tunnel failed");
-    Err(Error::new(
-        ErrorKind::ConnectionAborted,
-        format!("grpc-status {status}: {message}"),
-    ))
-}
-
-impl AsyncWrite for GrpcTunnelStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, Error>> {
-        if self.closed {
-            return Poll::Ready(Err(Error::new(
-                ErrorKind::BrokenPipe,
-                "grpc send stream is closed",
-            )));
-        }
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let len = buf.len().min(16 * 1024);
-        let frame_len = 5 + len;
-        self.send.reserve_capacity(frame_len);
-        match self.send.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(capacity))) if capacity >= frame_len => {}
-            Poll::Ready(Some(Ok(_))) => return Poll::Pending,
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(Some(Err(error))) => {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    format!("grpc send capacity failed: {error}"),
-                )));
-            }
-            Poll::Ready(None) => {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "grpc send stream has no capacity",
-                )));
-            }
-        }
-        let mut frame = Vec::with_capacity(5 + len);
-        frame.push(0);
-        frame.extend_from_slice(&(len as u32).to_be_bytes());
-        frame.extend_from_slice(&buf[..len]);
-        match self.send.send_data(Bytes::from(frame), false) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(error) => Poll::Ready(Err(Error::new(
-                ErrorKind::BrokenPipe,
-                format!("grpc send failed: {error}"),
-            ))),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut TaskContext<'_>,
-    ) -> Poll<Result<(), Error>> {
-        if !self.closed {
-            self.closed = true;
-            if let Err(error) = self.send.send_data(Bytes::new(), true) {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    format!("grpc shutdown failed: {error}"),
-                )));
-            }
-        }
-        Poll::Ready(Ok(()))
-    }
-}
-
-async fn perform_websocket_handshake<S>(
-    stream: &mut S,
-    host: &str,
-    path: &str,
-) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let headers = BTreeMap::new();
-    perform_websocket_handshake_with_headers(stream, host, path, &headers).await
-}
-
-async fn perform_websocket_handshake_with_headers<S>(
-    stream: &mut S,
-    host: &str,
-    path: &str,
-    headers: &BTreeMap<String, String>,
-) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut key_bytes = [0u8; 16];
-    getrandom::fill(&mut key_bytes)
-        .map_err(|error| anyhow!("failed to generate websocket key: {error}"))?;
-    let key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key_bytes);
-    let path = if path.is_empty() { "/" } else { path };
-    let custom_headers = render_transport_headers(
-        headers,
-        &[
-            "host",
-            "upgrade",
-            "connection",
-            "sec-websocket-key",
-            "sec-websocket-version",
-        ],
-    )?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         {custom_headers}\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         \r\n"
-    );
-    stream.write_all(request.as_bytes()).await?;
-
-    let mut response = Vec::with_capacity(1024);
-    let mut buf = [0u8; 512];
-    while response.len() < 64 * 1024 {
-        let n = stream.read(&mut buf).await?;
-        if n == 0 {
-            return Err(anyhow!("websocket handshake ended before headers"));
-        }
-        response.extend_from_slice(&buf[..n]);
-        if find_header_end(&response).is_some() {
-            break;
-        }
-    }
-    let text = std::str::from_utf8(&response)?;
-    let status_line = text.lines().next().unwrap_or("");
-    if !status_line.contains(" 101 ") {
-        return Err(anyhow!("websocket upgrade failed: {status_line}"));
-    }
-    let expected_accept = websocket_accept_key(&key);
-    let accept_ok = text.lines().any(|line| {
-        line.split_once(':')
-            .map(|(name, value)| {
-                name.eq_ignore_ascii_case("sec-websocket-accept") && value.trim() == expected_accept
-            })
-            .unwrap_or(false)
-    });
-    if !accept_ok {
-        return Err(anyhow!("websocket upgrade missing valid accept key"));
-    }
-    Ok(())
-}
-
-fn render_transport_headers(
-    headers: &BTreeMap<String, String>,
-    reserved: &[&str],
-) -> anyhow::Result<String> {
-    let mut rendered = String::new();
-    for (name, value) in headers {
-        if reserved
-            .iter()
-            .any(|reserved_name| name.eq_ignore_ascii_case(reserved_name))
-        {
-            continue;
-        }
-        let header_name = http::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|error| anyhow!("invalid transport header name {name:?}: {error}"))?;
-        let header_value = http::header::HeaderValue::from_str(value)
-            .map_err(|error| anyhow!("invalid transport header value for {name:?}: {error}"))?;
-        let header_value = header_value
-            .to_str()
-            .map_err(|error| anyhow!("transport header {name:?} is not visible ASCII: {error}"))?;
-        rendered.push_str(header_name.as_str());
-        rendered.push_str(": ");
-        rendered.push_str(header_value);
-        rendered.push_str("\r\n");
-    }
-    Ok(rendered)
-}
-
-fn websocket_accept_key(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        hasher.finalize(),
-    )
-}
-
-fn spawn_websocket_stream<S>(stream: S) -> DuplexStream
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (app_side, relay_side) = tokio::io::duplex(64 * 1024);
-    let (mut local_read, mut local_write) = tokio::io::split(relay_side);
-    let (mut remote_read, mut remote_write) = tokio::io::split(stream);
-
-    tokio::spawn(async move {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match local_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = write_websocket_close_frame(&mut remote_write).await;
-                    let _ = remote_write.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    if write_websocket_binary_frame(&mut remote_write, &buf[..n])
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        loop {
-            match read_websocket_frame(&mut remote_read).await {
-                Ok(Some(frame)) => {
-                    if local_write.write_all(&frame).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    let _ = local_write.shutdown().await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = local_write.shutdown().await;
-                    break;
-                }
-            }
-        }
-    });
-
-    app_side
-}
-
-async fn write_websocket_binary_frame<W>(writer: &mut W, payload: &[u8]) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_websocket_frame(writer, 0x2, payload).await
-}
-
-async fn write_websocket_close_frame<W>(writer: &mut W) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_websocket_frame(writer, 0x8, &[]).await
-}
-
-async fn write_websocket_frame<W>(writer: &mut W, opcode: u8, payload: &[u8]) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    let mut mask = [0u8; 4];
-    getrandom::fill(&mut mask)
-        .map_err(|error| anyhow!("failed to generate websocket mask: {error}"))?;
-    let mut frame = Vec::with_capacity(payload.len() + 14);
-    frame.push(0x80 | (opcode & 0x0f));
-    match payload.len() {
-        0..=125 => frame.push(0x80 | payload.len() as u8),
-        126..=65_535 => {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        }
-        _ => {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        }
-    }
-    frame.extend_from_slice(&mask);
-    for (index, byte) in payload.iter().enumerate() {
-        frame.push(byte ^ mask[index % 4]);
-    }
-    writer.write_all(&frame).await?;
-    Ok(())
-}
-
-async fn read_websocket_frame<R>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut header = [0u8; 2];
-    if !read_exact_or_eof(reader, &mut header).await? {
-        return Ok(None);
-    }
-    let opcode = header[0] & 0x0f;
-    let masked = header[1] & 0x80 != 0;
-    let mut len = (header[1] & 0x7f) as u64;
-    if len == 126 {
-        let mut ext = [0u8; 2];
-        reader.read_exact(&mut ext).await?;
-        len = u16::from_be_bytes(ext) as u64;
-    } else if len == 127 {
-        let mut ext = [0u8; 8];
-        reader.read_exact(&mut ext).await?;
-        len = u64::from_be_bytes(ext);
-    }
-    if len > 16 * 1024 * 1024 {
-        return Err(anyhow!("websocket frame is too large"));
-    }
-    let mut mask = [0u8; 4];
-    if masked {
-        reader.read_exact(&mut mask).await?;
-    }
-    let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload).await?;
-    if masked {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
-    }
-    match opcode {
-        0x0..=0x2 => Ok(Some(payload)),
-        0x8 => Ok(None),
-        0x9 | 0xA => Ok(Some(Vec::new())),
-        other => Err(anyhow!("unsupported websocket opcode {other}")),
-    }
 }
 
 const VMESS_TAG_LEN: usize = 16;
@@ -12001,6 +10708,27 @@ mod tests {
         trace_id: Arc<StdMutex<Option<String>>>,
     }
 
+    struct PendingOutbound;
+
+    #[async_trait]
+    impl Outbound for PendingOutbound {
+        fn name(&self) -> &str {
+            "pending"
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+
+        async fn connect(
+            &self,
+            _destination: &Destination,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<BoxedStream> {
+            std::future::pending().await
+        }
+    }
+
     #[async_trait]
     impl Outbound for ContextRecordingOutbound {
         fn name(&self) -> &str {
@@ -12034,12 +10762,12 @@ mod tests {
         let member: Arc<dyn Outbound> = Arc::new(ContextRecordingOutbound {
             trace_id: Arc::clone(&recorded),
         });
-        let group = GroupOutbound {
-            name: "group".to_string(),
-            kind: "select".to_string(),
-            members: vec![member],
-            telemetry: None,
-        };
+        let group = GroupOutbound::new(
+            "group".to_string(),
+            "select".to_string(),
+            vec![member],
+            None,
+        );
         let context = DialContext::new(Destination::new("example.com", 443), 500);
         let expected = context.trace_id.clone();
         group
@@ -12049,6 +10777,23 @@ mod tests {
         assert_eq!(
             recorded.lock().expect("trace lock").as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_context_cancellation_stops_pending_outbound() {
+        let outbound = PendingOutbound;
+        let context = DialContext::new(Destination::new("example.com", 443), 30_000);
+        context.cancel();
+        let error = match outbound.connect_context(&context).await {
+            Ok(_) => panic!("cancelled dial should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<OutboundError>()
+                .map(|error| error.kind),
+            Some(OutboundErrorKind::Cancelled)
         );
     }
 

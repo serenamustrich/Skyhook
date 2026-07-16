@@ -21,9 +21,12 @@
   - 尚未进行需要管理员权限的 TUN daemon 实机鉴权验证，因此阶段 A 暂不标记
     `VERIFIED`。
 - 阶段 B：`IN_PROGRESS`
-  - DialContext、OutboundError、TCP/TLS transport、通用连接池和 UDP session pool
-    已进入工作区。
-  - 协议模块、WS/H2/gRPC/HTTPUpgrade/QUIC 和 API task/event 仍待拆分。
+  - DialContext、OutboundError、通用连接池和 UDP session pool 已进入工作区。
+  - TCP、TLS、HTTP CONNECT、WebSocket、H2、gRPC、HTTPUpgrade 和 QUIC client config
+    已拆成公共 transport。
+  - Direct、Reject、HTTP、Naive、Group、Unsupported 和 registry 已拆成独立模块。
+  - DialContext 已支持 cancellation token，并传播订阅、组、节点所需的上下文字段。
+  - 其余协议模块、QUIC endpoint/session 公共层和 API task/event 仍待拆分。
 - 阶段 C-K：`NOT_STARTED` 或沿用已有功能，尚未达到本文档的最终验收标准。
 
 ## 1. 最终交付定义

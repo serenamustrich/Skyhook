@@ -51,15 +51,20 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   session pool and UDP fragmentation.
 - Structured YAML config.
 - Native versioned control API under `/v1/*`.
+- Shared transport modules for TCP, TLS, HTTP CONNECT, WebSocket, HTTP/2, gRPC, HTTPUpgrade, and
+  QUIC client configuration.
+- Traceable, cancellable dial contexts propagated through concrete outbounds and proxy groups.
 - Outbound capability reporting for TCP/UDP support, UDP mode, and known protocol limitations.
 - Connection table, traffic totals, event logs, and outbound health.
 - Fast active outbound probes with a 500ms default timeout.
-- Bounded probe concurrency with a 256 default to avoid resource spikes on large subscriptions.
-- Background probe loop that does not block proxy traffic.
+- Bounded probe concurrency with a 50 default to avoid resource spikes on large subscriptions.
+- Background probe loop that waits the configured interval before its first run and does not block
+  proxy traffic.
 - Subscription import parser for Clash YAML and URI-list feeds.
 - Native multi-subscription store with import, list, switch, update-all, and active config export.
 - Per-subscription lifetime upload/download totals.
-- Startup subscription refresh and background subscription refresh, both independent of proxy traffic.
+- Proxy startup always uses the saved local subscription cache and never downloads subscriptions.
+- Optional background subscription refresh starts only after its configured interval.
 - Bounded subscription refresh with timeout, retry, and concurrency limits.
 - Subscription `rule-providers` import, download, cache, and native `RULE-SET` matching.
 - Clash rule conversion for `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`,

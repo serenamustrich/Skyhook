@@ -16,6 +16,9 @@
   - 当前目录已建立独立 Git 工作区，可回滚基线提交为 `a8a55e0`。
 - M1：`IN_PROGRESS`
   - TCP/TLS、UDP resolver/session pool、DialContext、结构化 OutboundError 已开始拆分。
+  - HTTP CONNECT、WebSocket、H2、gRPC、HTTPUpgrade、QUIC config 已形成公共模块。
+  - Direct、Reject、HTTP、Naive、Group、Unsupported 和 registry 已迁出主文件。
+  - DialContext 已支持统一取消信号。
   - Swift 已全部迁移到独立 `/v1` API；旧根路径与 `/supercore/*` 入口已删除。
   - 控制 API 仅监听 loopback，写请求使用启动级 Bearer Token，错误响应包含稳定
     code/kind/trace id。
