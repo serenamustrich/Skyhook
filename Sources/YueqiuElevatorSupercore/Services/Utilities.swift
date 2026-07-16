@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 enum AppError: LocalizedError {
     case missingCore(URL)
@@ -21,6 +22,19 @@ enum AppError: LocalizedError {
         case .apiError(let code, let body): "Supercore API 错误 \(code)：\(body)"
         case .unexpectedResponse: "返回内容异常"
         }
+    }
+}
+
+enum ControlToken {
+    static let account = "supercore-control-token"
+
+    static func generate() throws -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else {
+            throw AppError.processFailed("无法生成 Supercore 控制凭据，Security 状态码 \(status)")
+        }
+        return bytes.map { String(format: "%02x", $0) }.joined()
     }
 }
 

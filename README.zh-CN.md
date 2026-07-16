@@ -37,30 +37,37 @@ TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未
 
 ## Control API 约定
 
-客户端与核心以 HTTP 控制接口协作（`/supercore/*`）：
+客户端与核心使用独立版本化 HTTP 控制接口（`/v1/*`）：
 
-- `GET /supercore/status`
-- `GET /supercore/outbounds`
-- `POST /supercore/outbounds/use`
-- `GET /supercore/groups`
-- `GET /supercore/countries`
-- `POST /supercore/probe/outbounds`
-- `POST /supercore/probe/group`
-- `GET /supercore/proxies`
-- `GET /supercore/rules`
-- `GET /supercore/providers/proxies`
-- `GET /supercore/providers/rules`
-- `GET /supercore/subscriptions`
-- `POST /supercore/subscriptions/use`
-- `POST /supercore/subscriptions/import`
-- `POST /supercore/subscriptions/reload-active`
-- `POST /supercore/subscriptions/update-all`
-- `POST /supercore/subscriptions/active-config`
-- `GET /supercore/traffic/subscriptions`
-- `GET /supercore/smart-rules`
-- `POST /supercore/smart-rules`
+- `GET /v1/status`
+- `GET /v1/outbounds`
+- `POST /v1/outbounds/use`
+- `GET /v1/groups`
+- `GET /v1/countries`
+- `POST /v1/probes`
+- `POST /v1/probes/group`
+- `GET /v1/rules`
+- `GET /v1/providers/proxies`
+- `GET /v1/providers/rules`
+- `GET /v1/subscriptions`
+- `POST /v1/subscriptions/use`
+- `POST /v1/subscriptions/import`
+- `POST /v1/subscriptions/reload-active`
+- `POST /v1/subscriptions/update-all`
+- `POST /v1/subscriptions/active-config`
+- `GET /v1/traffic/subscriptions`
+- `GET /v1/smart-rules`
+- `POST /v1/smart-rules`
+- `GET /v1/tun`
+- `GET /v1/doctor`
 
-`POST /supercore/probe/group` 使用 JSON body 传递 `group`，避免路径二次编码问题，支持包含 `/`、中文、emoji 的组名。
+控制接口只允许监听本机 loopback。读取接口可直接访问，所有写操作必须携带
+`Authorization: Bearer <token>`。普通核心进程每次启动使用新的 256-bit Token；TUN
+LaunchDaemon 从 root-only `0600` 文件读取 Token，plist 中不保存明文凭据。
+
+`POST /v1/probes/group` 使用 JSON body 传递 `group`，避免路径二次编码问题，支持包含 `/`、中文、emoji 的组名。
+
+启动代理只加载本地订阅缓存，不在启动过程中下载订阅或立即执行全局测速。后台订阅更新和定时测速在各自间隔到期后独立执行。
 
 ## 运行提示
 

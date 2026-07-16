@@ -22,6 +22,7 @@ final class TunLaunchDaemonManager: @unchecked Sendable {
 
     private let plistPath = URL(fileURLWithPath: "/Library/LaunchDaemons/cn.yueqiu.elevator.supercore.plist")
     private let logDirectory = URL(fileURLWithPath: "/Library/Logs/YueqiuElevatorSupercore", isDirectory: true)
+    private let stateDirectory = URL(fileURLWithPath: "/Library/Application Support/YueqiuElevatorSupercore", isDirectory: true)
     private let fileManager: FileManager
 
     init(fileManager: FileManager = .default) {
@@ -40,22 +41,36 @@ final class TunLaunchDaemonManager: @unchecked Sendable {
         )
     }
 
-    func installOrUpdate(binaryURL: URL, configURL: URL) throws {
+    func installOrUpdate(binaryURL: URL, configURL: URL, controlToken: String) throws {
         guard fileManager.fileExists(atPath: binaryURL.path) else {
             throw AppError.missingCore(binaryURL)
         }
         guard fileManager.fileExists(atPath: configURL.path) else {
             throw AppError.missingRuntimeConfig
         }
+        guard controlToken.utf8.count >= 32 else {
+            throw AppError.processFailed("TUN 权限服务控制凭据无效")
+        }
         try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binaryURL.path)
         let tempPlist = fileManager.temporaryDirectory
             .appendingPathComponent("cn.yueqiu.elevator.supercore.\(UUID().uuidString).plist")
+        let tempToken = fileManager.temporaryDirectory
+            .appendingPathComponent("cn.yueqiu.elevator.supercore.\(UUID().uuidString).token")
         try plist(binaryURL: binaryURL, configURL: configURL).write(to: tempPlist, atomically: true, encoding: .utf8)
-        defer { try? fileManager.removeItem(at: tempPlist) }
+        try controlToken.write(to: tempToken, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempToken.path)
+        defer {
+            try? fileManager.removeItem(at: tempPlist)
+            try? fileManager.removeItem(at: tempToken)
+        }
 
         let script = ([
             "set -e",
             "/bin/mkdir -p \(shellQuote(logDirectory.path))",
+            "/bin/mkdir -p \(shellQuote(stateDirectory.path))",
+            "/bin/cp \(shellQuote(tempToken.path)) \(shellQuote(controlTokenPath.path))",
+            "/usr/sbin/chown root:wheel \(shellQuote(controlTokenPath.path))",
+            "/bin/chmod 600 \(shellQuote(controlTokenPath.path))",
             "/bin/cp \(shellQuote(tempPlist.path)) \(shellQuote(plistPath.path))",
             "/usr/sbin/chown root:wheel \(shellQuote(plistPath.path))",
             "/bin/chmod 644 \(shellQuote(plistPath.path))",
@@ -72,9 +87,14 @@ final class TunLaunchDaemonManager: @unchecked Sendable {
         let script = ([
             "set -e",
             "/bin/launchctl bootout system \(shellQuote(plistPath.path)) >/dev/null 2>&1 || true",
-            "/bin/rm -f \(shellQuote(plistPath.path))"
+            "/bin/rm -f \(shellQuote(plistPath.path))",
+            "/bin/rm -f \(shellQuote(controlTokenPath.path))"
         ]).joined(separator: "\n")
         try runPrivilegedShell(script)
+    }
+
+    private var controlTokenPath: URL {
+        stateDirectory.appendingPathComponent("control-token")
     }
 
     private func plist(binaryURL: URL, configURL: URL) -> String {
@@ -103,6 +123,8 @@ final class TunLaunchDaemonManager: @unchecked Sendable {
           <dict>
             <key>RUST_LOG</key>
             <string>supercore=info,info</string>
+            <key>SKYHOOK_CONTROL_TOKEN_FILE</key>
+            <string>\(xmlEscape(controlTokenPath.path))</string>
           </dict>
           <key>StandardOutPath</key>
           <string>\(xmlEscape(logDirectory.appendingPathComponent("supercore.out.log").path))</string>

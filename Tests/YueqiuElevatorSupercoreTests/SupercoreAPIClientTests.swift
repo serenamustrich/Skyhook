@@ -9,12 +9,15 @@ final class SupercoreAPIClientTests: XCTestCase {
             private var _lastRequest: URLRequest?
             private var _lastBody: Data?
             private var _responseBody = Data("{\"ok\":true,\"group\":\"\",\"results\":[]}".utf8)
+            private var _responseStatusCode = 200
 
             func reset() {
                 lock.lock()
                 defer { lock.unlock() }
                 _lastRequest = nil
                 _lastBody = nil
+                _responseBody = Data("{\"ok\":true,\"group\":\"\",\"results\":[]}".utf8)
+                _responseStatusCode = 200
             }
 
             func setLastRequest(_ request: URLRequest?, body: Data?) {
@@ -28,6 +31,12 @@ final class SupercoreAPIClientTests: XCTestCase {
                 lock.lock()
                 defer { lock.unlock() }
                 _responseBody = responseBody
+            }
+
+            func setResponseStatusCode(_ statusCode: Int) {
+                lock.lock()
+                defer { lock.unlock() }
+                _responseStatusCode = statusCode
             }
 
             func lastRequest() -> URLRequest? {
@@ -47,6 +56,12 @@ final class SupercoreAPIClientTests: XCTestCase {
                 defer { lock.unlock() }
                 return _responseBody
             }
+
+            func responseStatusCode() -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return _responseStatusCode
+            }
         }
 
         private static let captureState = State()
@@ -62,6 +77,11 @@ final class SupercoreAPIClientTests: XCTestCase {
         static var responseBody: Data {
             get { captureState.responseBody() }
             set { captureState.setResponseBody(newValue) }
+        }
+
+        static var responseStatusCode: Int {
+            get { captureState.responseStatusCode() }
+            set { captureState.setResponseStatusCode(newValue) }
         }
 
         static func reset() {
@@ -82,7 +102,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             Self.captureState.setLastRequest(request, body: requestBody)
             let response = HTTPURLResponse(
                 url: request.url!,
-                statusCode: 200,
+                statusCode: Self.responseStatusCode,
                 httpVersion: nil,
                 headerFields: ["Content-Type": "application/json"]
             )
@@ -138,7 +158,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             SupercoreProbeGroupCaptureProtocol.lastRequest,
             "supercore API client should issue one request"
         )
-        XCTAssertEqual(request.url?.path, "/supercore/probe/group")
+        XCTAssertEqual(request.url?.path, "/v1/probes/group")
 
         let body = try XCTUnwrap(SupercoreProbeGroupCaptureProtocol.lastBody)
         let json = try XCTUnwrap(
@@ -147,6 +167,51 @@ final class SupercoreAPIClientTests: XCTestCase {
         )
         XCTAssertEqual(json["group"] as? String, groupName)
         XCTAssertNil(json["names"])
+    }
+
+    func testAuthenticatedRequestIncludesBearerToken() async throws {
+        let baseURL = URL(string: "http://127.0.0.1:9197")!
+        let client = SupercoreAPIClient(baseURL: baseURL)
+        client.setControlToken("0123456789abcdef0123456789abcdef")
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data("{\"ok\":true}".utf8)
+
+        try await client.useOutbound(name: "HK-01")
+
+        let request = try XCTUnwrap(
+            SupercoreProbeGroupCaptureProtocol.lastRequest,
+            "supercore API client should issue one request"
+        )
+        XCTAssertEqual(request.url?.path, "/v1/outbounds/use")
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "Authorization"),
+            "Bearer 0123456789abcdef0123456789abcdef"
+        )
+    }
+
+    func testStructuredAPIErrorUsesStableCodeAndTrace() async throws {
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        client.setControlToken("0123456789abcdef0123456789abcdef")
+        SupercoreProbeGroupCaptureProtocol.responseStatusCode = 401
+        SupercoreProbeGroupCaptureProtocol.responseBody = Data(
+            """
+            {
+              "code": "control_auth_invalid",
+              "kind": "authentication",
+              "message": "a valid bearer token is required",
+              "retryable": false,
+              "trace_id": "trace-123",
+              "details": {}
+            }
+            """.utf8
+        )
+
+        do {
+            try await client.useOutbound(name: "HK-01")
+            XCTFail("request should fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("control_auth_invalid"))
+            XCTAssertTrue(error.localizedDescription.contains("trace-123"))
+        }
     }
 
     func testProbeGroupWithSlashInNamePreservesRawGroupInBody() async throws {
@@ -165,7 +230,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             try JSONSerialization.jsonObject(with: body) as? [String: Any],
             "probe group request body should be JSON"
         )
-        XCTAssertEqual(request.url?.path, "/supercore/probe/group")
+        XCTAssertEqual(request.url?.path, "/v1/probes/group")
         XCTAssertEqual(json["group"] as? String, groupName)
         XCTAssertNil(json["names"])
         XCTAssertNil(request.url?.query)
@@ -237,7 +302,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             SupercoreProbeGroupCaptureProtocol.lastRequest,
             "supercore API client should issue one request"
         )
-        XCTAssertEqual(request.url?.path, "/supercore/probe/outbounds")
+        XCTAssertEqual(request.url?.path, "/v1/probes")
         XCTAssertEqual(
             request.timeoutInterval,
             ProbeTimeoutCalculator.requestTimeout(timeoutMilliseconds: 500, concurrency: 50, names: names)
@@ -254,7 +319,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             SupercoreProbeGroupCaptureProtocol.lastRequest,
             "supercore API client should issue one request"
         )
-        XCTAssertEqual(request.url?.path, "/supercore/probe/outbounds")
+        XCTAssertEqual(request.url?.path, "/v1/probes")
         XCTAssertEqual(
             request.timeoutInterval,
             ProbeTimeoutCalculator.requestTimeout(timeoutMilliseconds: 500, concurrency: nil, names: nil)

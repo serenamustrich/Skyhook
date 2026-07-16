@@ -50,7 +50,7 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 - TUIC UDP exchange for `native` QUIC datagram mode and `quic` unidirectional-stream mode, with a
   session pool and UDP fragmentation.
 - Structured YAML config.
-- Native control API under `/supercore/*`.
+- Native versioned control API under `/v1/*`.
 - Outbound capability reporting for TCP/UDP support, UDP mode, and known protocol limitations.
 - Connection table, traffic totals, event logs, and outbound health.
 - Fast active outbound probes with a 500ms default timeout.
@@ -120,40 +120,52 @@ is passed.
 ## Control API
 
 - `GET /health`
-- `GET /supercore/version`
-- `GET /supercore/status`
-- `GET /supercore/connections`
-- `GET /supercore/outbounds`
-- `POST /supercore/outbounds/use`
-- `GET /supercore/groups`
-- `GET /supercore/countries`
-- `POST /supercore/countries/use`
-- `POST /supercore/probe/outbounds`
-- `POST /supercore/probe/group`
-- `POST /supercore/route/decision`
-- `GET /supercore/subscriptions`
-- `POST /supercore/subscriptions/import`
-- `POST /supercore/subscriptions/use`
-- `POST /supercore/subscriptions/reload-active`
-- `POST /supercore/subscriptions/update-all`
-- `POST /supercore/subscriptions/active-config`
-- `GET /supercore/traffic/subscriptions`
-- `GET /supercore/smart-rules`
-- `POST /supercore/smart-rules`
-- `POST /supercore/smart-rules/enabled`
-- `POST /supercore/smart-rules/delete`
-- `POST /supercore/smart-rules/apply-recommendations`
-- `POST /supercore/smart-rules/apply-recommendation`
-- `GET /supercore/logs`
-- `GET /supercore/config`
+- `GET /v1/version`
+- `GET /v1/status`
+- `GET /v1/connections`
+- `GET /v1/outbounds`
+- `POST /v1/outbounds/use`
+- `GET /v1/groups`
+- `GET /v1/countries`
+- `POST /v1/countries/use`
+- `POST /v1/probes`
+- `POST /v1/probes/group`
+- `POST /v1/route/decision`
+- `GET /v1/subscriptions`
+- `POST /v1/subscriptions/import`
+- `POST /v1/subscriptions/use`
+- `POST /v1/subscriptions/reload-active`
+- `POST /v1/subscriptions/update-all`
+- `POST /v1/subscriptions/active-config`
+- `GET /v1/providers/proxies`
+- `GET /v1/providers/rules`
+- `GET /v1/rules`
+- `GET /v1/traffic`
+- `GET /v1/traffic/subscriptions`
+- `GET /v1/smart-rules`
+- `POST /v1/smart-rules`
+- `POST /v1/smart-rules/enabled`
+- `POST /v1/smart-rules/delete`
+- `POST /v1/smart-rules/apply-recommendations`
+- `POST /v1/smart-rules/apply-recommendation`
+- `GET /v1/logs`
+- `GET /v1/config`
+- `POST /v1/config/reload`
+- `GET /v1/tun`
+- `GET /v1/doctor`
 
-`POST /supercore/probe/outbounds` accepts an optional JSON body:
+The control listener is restricted to loopback addresses. `GET`, `HEAD`, and `OPTIONS` are
+read-only operations. Every write request must send `Authorization: Bearer <token>`. The macOS App
+generates a fresh 256-bit token for each user-mode core process. The TUN LaunchDaemon reads its
+token from a root-owned `0600` file; the token is never embedded in the launchd plist.
+
+`POST /v1/probes` accepts an optional JSON body:
 
 ```json
 { "timeout_ms": 500, "url": "http://cp.cloudflare.com/generate_204" }
 ```
 
-`POST /supercore/probe/group` accepts a group name in JSON body and expands nested groups on the core side:
+`POST /v1/probes/group` accepts a group name in JSON body and expands nested groups on the core side:
 
 ```json
 {
@@ -164,14 +176,14 @@ is passed.
 }
 ```
 
-`POST /supercore/outbounds/use` switches the runtime default outbound and any `match` fallback rule
+`POST /v1/outbounds/use` switches the runtime default outbound and any `match` fallback rule
 to a concrete outbound or generated group:
 
 ```json
 { "name": "HK-01" }
 ```
 
-`POST /supercore/subscriptions/import` accepts either raw subscription text or a URL:
+`POST /v1/subscriptions/import` accepts either raw subscription text or a URL:
 
 ```json
 {
@@ -190,7 +202,7 @@ or:
 }
 ```
 
-`POST /supercore/subscriptions/active-config` returns the current runtime config with active
+`POST /v1/subscriptions/active-config` returns the current runtime config with active
 subscription nodes merged in. When `use_first_node` is true, the default outbound and fallback
 `match` rule are moved to the first supported subscription node.
 
@@ -209,24 +221,24 @@ When `geo.auto_update` and `geo.update_on_start` are enabled, Supercore download
 If `geoip_database` is not set and a cached `geoip.mmdb` exists, Supercore uses that cached file
 for native `GEOIP` matching.
 
-When `subscriptions.update_on_start` is enabled, `supercore run` refreshes saved URL subscriptions
-before merging the active subscription into the runtime config. When `subscriptions.auto_update` is
-enabled, refreshes continue in the background every `subscriptions.update_interval_secs` seconds.
+`supercore run` always starts from the saved local subscription cache and never downloads a
+subscription during proxy startup. When `subscriptions.auto_update` is enabled, refreshes run only
+after the configured `subscriptions.update_interval_secs` delay.
 Each update batch is bounded by `subscriptions.update_timeout_secs`,
 `subscriptions.update_retries`, and `subscriptions.update_concurrency`.
 
-`GET /supercore/groups` returns each proxy group, its members, health, measured latency, and current
-best member. `GET /supercore/countries` returns country buckets inferred from node names and server
-metadata. `POST /supercore/countries/use` selects a generated `country:<CODE>` url-test group:
+`GET /v1/groups` returns each proxy group, its members, health, measured latency, and current best
+member. `GET /v1/countries` returns country buckets inferred from node names and server metadata.
+`POST /v1/countries/use` selects a generated `country:<CODE>` url-test group:
 
 ```json
 { "code": "JP" }
 ```
 
-`GET /supercore/traffic/subscriptions` returns lifetime upload/download totals persisted per
+`GET /v1/traffic/subscriptions` returns lifetime upload/download totals persisted per
 subscription.
 
-`POST /supercore/smart-rules` inserts or replaces a smart override:
+`POST /v1/smart-rules` inserts or replaces a smart override:
 
 ```json
 {
@@ -237,19 +249,19 @@ subscription.
 }
 ```
 
-`POST /supercore/smart-rules/enabled` toggles one smart override:
+`POST /v1/smart-rules/enabled` toggles one smart override:
 
 ```json
 { "target": "domain-suffix", "value": "example.com", "enabled": false }
 ```
 
-`POST /supercore/smart-rules/delete` removes one smart override:
+`POST /v1/smart-rules/delete` removes one smart override:
 
 ```json
 { "target": "domain-suffix", "value": "example.com" }
 ```
 
-`POST /supercore/smart-rules/apply-recommendations` enables current recommendations as smart rules:
+`POST /v1/smart-rules/apply-recommendations` enables current recommendations as smart rules:
 
 ```json
 { "action": "direct" }
@@ -257,7 +269,7 @@ subscription.
 
 Omit the body to enable both direct and proxy recommendations.
 
-`POST /supercore/smart-rules/apply-recommendation` enables one recommendation:
+`POST /v1/smart-rules/apply-recommendation` enables one recommendation:
 
 ```json
 { "target": "domain-suffix", "value": "example.com" }
@@ -266,7 +278,7 @@ Omit the body to enable both direct and proxy recommendations.
 Route targets include `domain`, `domain-suffix`, `domain-keyword`, `ip`, `ip-cidr`,
 `app-name`, `app-path`, `app-bundle`, and `match`.
 
-`POST /supercore/route/decision` accepts a destination with optional app identity:
+`POST /v1/route/decision` accepts a destination with optional app identity:
 
 ```json
 {

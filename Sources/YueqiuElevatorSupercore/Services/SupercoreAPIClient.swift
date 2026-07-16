@@ -21,12 +21,11 @@ enum ProbeTimeoutCalculator {
 
 final class SupercoreAPIClient: @unchecked Sendable {
     private var baseURL: URL
+    private var controlToken: String?
     private let baseURLLock = DispatchQueue(label: "YueqiuElevatorSupercore.SupercoreAPIClient.baseURL")
-    private let decoder = JSONDecoder()
 
     init(baseURL: URL = URL(string: "http://127.0.0.1:9197")!) {
         self.baseURL = baseURL
-        decoder.dateDecodingStrategy = .iso8601
     }
 
     func setControlPort(_ port: Int) {
@@ -39,16 +38,22 @@ final class SupercoreAPIClient: @unchecked Sendable {
         }
     }
 
+    func setControlToken(_ token: String?) {
+        baseURLLock.sync {
+            controlToken = token?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
     func getVersion(timeoutInterval: TimeInterval? = nil) async throws -> SupercoreVersion {
-        try await request(path: "/supercore/version", timeoutInterval: timeoutInterval)
+        try await request(path: "/v1/version", timeoutInterval: timeoutInterval)
     }
 
     func getStatus() async throws -> SupercoreStatus {
-        try await request(path: "/supercore/status")
+        try await request(path: "/v1/status")
     }
 
     func getGroups() async throws -> [SupercoreProxyGroup] {
-        let response: SupercoreGroupsResponse = try await request(path: "/supercore/groups")
+        let response: SupercoreGroupsResponse = try await request(path: "/v1/groups")
         return response.groups
     }
 
@@ -67,14 +72,14 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getCountries() async throws -> [SupercoreCountryGroup] {
-        let response: SupercoreCountriesResponse = try await request(path: "/supercore/countries")
+        let response: SupercoreCountriesResponse = try await request(path: "/v1/countries")
         return response.countries
     }
 
     func useCountry(code: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["code": code])
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/countries/use",
+            path: "/v1/countries/use",
             method: "POST",
             body: body
         )
@@ -84,7 +89,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
     func useOutbound(name: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["name": name])
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/outbounds/use",
+            path: "/v1/outbounds/use",
             method: "POST",
             body: body
         )
@@ -122,7 +127,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
         payload["group"] = name
         let body = try JSONSerialization.data(withJSONObject: payload)
         let response: SupercoreProbeGroupResponse = try await request(
-            path: "/supercore/probe/group",
+            path: "/v1/probes/group",
             method: "POST",
             timeoutInterval: TimeInterval(timeoutMilliseconds) / 1000.0 + 10,
             body: body
@@ -171,7 +176,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
         )
         let body = try JSONSerialization.data(withJSONObject: payload)
         let response: SupercoreProbeResponse = try await request(
-            path: "/supercore/probe/outbounds",
+            path: "/v1/probes",
             method: "POST",
             timeoutInterval: requestTimeout,
             body: body
@@ -198,7 +203,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
         }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/subscriptions/import",
+            path: "/v1/subscriptions/import",
             method: "POST",
             timeoutInterval: 20,
             body: body
@@ -209,7 +214,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
     func useSubscription(id: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["id": id])
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/subscriptions/use",
+            path: "/v1/subscriptions/use",
             method: "POST",
             body: body
         )
@@ -218,7 +223,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
 
     func updateAllSubscriptions() async throws {
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/subscriptions/update-all",
+            path: "/v1/subscriptions/update-all",
             method: "POST",
             timeoutInterval: 60
         )
@@ -227,7 +232,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
 
     func reloadActiveSubscription() async throws {
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/subscriptions/reload-active",
+            path: "/v1/subscriptions/reload-active",
             method: "POST"
         )
         try response.throwIfNeeded()
@@ -236,7 +241,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
     func reloadConfig(path: URL) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["path": path.path])
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/config/reload",
+            path: "/v1/config/reload",
             method: "POST",
             body: body
         )
@@ -252,7 +257,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getConnectionObservations() async throws -> [SmartRuleObservation] {
-        let response: SupercoreConnectionsResponse = try await request(path: "/supercore/connections")
+        let response: SupercoreConnectionsResponse = try await request(path: "/v1/connections")
         return response.connections.compactMap { record in
             guard let endpoint = SmartRuleEndpointClassifier.classify(host: record.destination.host) else {
                 return nil
@@ -270,24 +275,24 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getLogs() async throws -> [String] {
-        let response: SupercoreLogsResponse = try await request(path: "/supercore/logs")
+        let response: SupercoreLogsResponse = try await request(path: "/v1/logs")
         return response.logs.map { "[supercore:\($0.level)] \($0.message)" }
     }
 
     func getSubscriptionTraffic() async throws -> [SupercoreSubscriptionTraffic] {
-        let response: SupercoreSubscriptionTrafficResponse = try await request(path: "/supercore/traffic/subscriptions")
+        let response: SupercoreSubscriptionTrafficResponse = try await request(path: "/v1/traffic/subscriptions")
         try response.throwIfNeeded()
         return response.subscriptions
     }
 
     func getSmartRules() async throws -> SupercoreSmartRulesSnapshot {
-        try await request(path: "/supercore/smart-rules")
+        try await request(path: "/v1/smart-rules")
     }
 
     func applySmartRecommendation(target: String, value: String) async throws {
         let body = try JSONSerialization.data(withJSONObject: ["target": target, "value": value])
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/smart-rules/apply-recommendation",
+            path: "/v1/smart-rules/apply-recommendation",
             method: "POST",
             body: body
         )
@@ -301,7 +306,7 @@ final class SupercoreAPIClient: @unchecked Sendable {
         }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let response: SupercoreOKResponse = try await request(
-            path: "/supercore/smart-rules/apply-recommendations",
+            path: "/v1/smart-rules/apply-recommendations",
             method: "POST",
             body: body
         )
@@ -314,9 +319,14 @@ final class SupercoreAPIClient: @unchecked Sendable {
         timeoutInterval: TimeInterval? = nil,
         body: Data? = nil
     ) async throws -> T {
-        let baseURL = baseURLLock.sync { self.baseURL }
+        let (baseURL, controlToken) = baseURLLock.sync {
+            (self.baseURL, self.controlToken)
+        }
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
         request.httpMethod = method
+        if let controlToken, !controlToken.isEmpty {
+            request.setValue("Bearer \(controlToken)", forHTTPHeaderField: "Authorization")
+        }
         if let timeoutInterval {
             request.timeoutInterval = timeoutInterval
         }
@@ -327,9 +337,42 @@ final class SupercoreAPIClient: @unchecked Sendable {
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw AppError.unexpectedResponse }
         guard (200..<300).contains(http.statusCode) else {
-            throw AppError.apiError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
+            let decoder = Self.makeDecoder()
+            if let apiError = try? decoder.decode(SupercoreAPIErrorEnvelope.self, from: data) {
+                let trace = apiError.traceID.map { "，trace \($0)" } ?? ""
+                throw AppError.apiError(
+                    http.statusCode,
+                    "\(apiError.message)（\(apiError.code)/\(apiError.kind)\(trace)）"
+                )
+            }
+            throw AppError.apiError(
+                http.statusCode,
+                String(data: data, encoding: .utf8) ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+            )
         }
-        return try decoder.decode(T.self, from: data)
+        return try Self.makeDecoder().decode(T.self, from: data)
+    }
+
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+}
+
+private struct SupercoreAPIErrorEnvelope: Decodable {
+    let code: String
+    let kind: String
+    let message: String
+    let retryable: Bool
+    let traceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case code
+        case kind
+        case message
+        case retryable
+        case traceID = "trace_id"
     }
 }
 

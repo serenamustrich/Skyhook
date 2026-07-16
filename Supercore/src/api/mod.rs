@@ -1,7 +1,11 @@
 use std::{collections::HashMap, collections::HashSet, path::PathBuf, sync::Arc};
 
+use anyhow::anyhow;
 use axum::{
-    extract::State,
+    extract::{Request, State},
+    http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -11,16 +15,36 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::{OutboundConfig, RuleTarget, SmartRouteRule, SuperConfig},
     core::{ProbeOptions, Runtime},
+    outbound::error::{classify_message, OutboundErrorKind},
     routing::Destination,
     smart::SmartRecommendationAction,
     subscription_store::SubscriptionStore,
 };
+
+const CONTROL_TOKEN_ENV: &str = "SKYHOOK_CONTROL_TOKEN";
+const CONTROL_TOKEN_FILE_ENV: &str = "SKYHOOK_CONTROL_TOKEN_FILE";
+const MIN_CONTROL_TOKEN_BYTES: usize = 32;
+
+#[derive(Clone)]
+struct ControlAuthState {
+    token: Option<Arc<str>>,
+}
 
 #[derive(Debug, Serialize)]
 struct VersionResponse {
     name: &'static str,
     version: &'static str,
     engine: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorResponse {
+    code: &'static str,
+    kind: &'static str,
+    message: String,
+    retryable: bool,
+    trace_id: String,
+    details: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -129,72 +153,236 @@ struct ConfigReloadRequest {
 
 pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     let control_listen = runtime.config().core.control_listen;
+    validate_control_listen(control_listen)?;
+    let auth = ControlAuthState {
+        token: load_control_token()?,
+    };
+    if auth.token.is_none() {
+        tracing::warn!(
+            "control API write operations are disabled because no control token was configured"
+        );
+    }
     let app = Router::new()
         .route("/health", get(health))
-        .route("/version", get(version))
-        .route("/traffic", get(traffic))
-        .route("/connections", get(connections))
-        .route("/logs", get(logs))
-        .route("/proxies", get(compat_proxies))
-        .route("/rules", get(compat_rules))
-        .route("/providers/proxies", get(compat_proxy_providers))
-        .route("/providers/rules", get(compat_rule_providers))
-        .route("/supercore/version", get(version))
-        .route("/supercore/status", get(status))
-        .route("/supercore/connections", get(connections))
+        .route("/v1/version", get(version))
+        .route("/v1/status", get(status))
+        .route("/v1/outbounds", get(outbounds))
+        .route("/v1/outbounds/use", post(use_outbound))
+        .route("/v1/groups", get(groups))
+        .route("/v1/countries", get(countries))
+        .route("/v1/countries/use", post(use_country))
+        .route("/v1/probes", post(probe_outbounds))
+        .route("/v1/probes/group", post(probe_group_body))
+        .route("/v1/route/decision", post(route_decision))
+        .route("/v1/subscriptions", get(subscriptions))
+        .route("/v1/subscriptions/import", post(import_subscription))
+        .route("/v1/subscriptions/use", post(use_subscription))
         .route(
-            "/supercore/traffic/subscriptions",
-            get(subscription_traffic),
-        )
-        .route("/supercore/outbounds", get(outbounds))
-        .route("/supercore/outbounds/use", post(use_outbound))
-        .route("/supercore/groups", get(groups))
-        .route("/supercore/countries", get(countries))
-        .route("/supercore/countries/use", post(use_country))
-        .route("/supercore/probe/outbounds", post(probe_outbounds))
-        .route("/supercore/probe/groups/{name}", post(probe_group))
-        .route("/supercore/probe/group", post(probe_group_body))
-        .route("/supercore/route/decision", post(route_decision))
-        .route("/supercore/subscriptions", get(subscriptions))
-        .route("/supercore/subscriptions/import", post(import_subscription))
-        .route("/supercore/subscriptions/use", post(use_subscription))
-        .route(
-            "/supercore/subscriptions/reload-active",
+            "/v1/subscriptions/reload-active",
             post(reload_active_subscription),
         )
         .route(
-            "/supercore/subscriptions/update-all",
+            "/v1/subscriptions/update-all",
             post(update_all_subscriptions),
         )
         .route(
-            "/supercore/subscriptions/active-config",
+            "/v1/subscriptions/active-config",
             post(active_subscription_config),
         )
+        .route("/v1/providers/proxies", get(proxy_providers))
+        .route("/v1/providers/rules", get(rule_providers))
+        .route("/v1/rules", get(rules_snapshot))
+        .route("/v1/smart-rules", get(smart_rules).post(upsert_smart_rule))
+        .route("/v1/smart-rules/enabled", post(set_smart_rule_enabled))
+        .route("/v1/smart-rules/delete", post(delete_smart_rule))
         .route(
-            "/supercore/smart-rules",
-            get(smart_rules).post(upsert_smart_rule),
-        )
-        .route(
-            "/supercore/smart-rules/enabled",
-            post(set_smart_rule_enabled),
-        )
-        .route("/supercore/smart-rules/delete", post(delete_smart_rule))
-        .route(
-            "/supercore/smart-rules/apply-recommendations",
+            "/v1/smart-rules/apply-recommendations",
             post(apply_smart_recommendations),
         )
         .route(
-            "/supercore/smart-rules/apply-recommendation",
+            "/v1/smart-rules/apply-recommendation",
             post(apply_smart_recommendation),
         )
-        .route("/supercore/logs", get(logs))
-        .route("/supercore/config", get(config))
-        .route("/supercore/config/reload", post(reload_config))
+        .route("/v1/traffic", get(traffic))
+        .route("/v1/traffic/subscriptions", get(subscription_traffic))
+        .route("/v1/connections", get(connections))
+        .route("/v1/logs", get(logs))
+        .route("/v1/config", get(config))
+        .route("/v1/config/reload", post(reload_config))
+        .route("/v1/tun", get(tun_status))
+        .route("/v1/doctor", get(doctor))
+        .layer(middleware::from_fn_with_state(auth, authorize_writes))
         .layer(TraceLayer::new_for_http())
         .with_state(runtime);
     let listener = tokio::net::TcpListener::bind(control_listen).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn validate_control_listen(control_listen: std::net::SocketAddr) -> anyhow::Result<()> {
+    if control_listen.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "control API must listen on loopback; configured address is {control_listen}"
+        ))
+    }
+}
+
+fn load_control_token() -> anyhow::Result<Option<Arc<str>>> {
+    if let Some(token) = normalized_control_token(std::env::var(CONTROL_TOKEN_ENV).ok())? {
+        return Ok(Some(token));
+    }
+    let Some(path) = std::env::var_os(CONTROL_TOKEN_FILE_ENV) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let token = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow!(
+            "failed to read control token file '{}': {error}",
+            path.display()
+        )
+    })?;
+    normalized_control_token(Some(token))
+}
+
+fn normalized_control_token(token: Option<String>) -> anyhow::Result<Option<Arc<str>>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if token.as_bytes().len() < MIN_CONTROL_TOKEN_BYTES {
+        return Err(anyhow!(
+            "control token must contain at least {MIN_CONTROL_TOKEN_BYTES} bytes"
+        ));
+    }
+    Ok(Some(Arc::from(token)))
+}
+
+async fn authorize_writes(
+    State(auth): State<ControlAuthState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !is_write_method(request.method()) {
+        return next.run(request).await;
+    }
+    if request_has_valid_token(request.headers(), auth.token.as_deref()) {
+        return next.run(request).await;
+    }
+
+    let trace_id = request
+        .headers()
+        .get("x-skyhook-trace-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let (code, message) = if auth.token.is_some() {
+        (
+            "control_auth_invalid",
+            "a valid bearer token is required for this control operation",
+        )
+    } else {
+        (
+            "control_auth_unconfigured",
+            "control API write operations are disabled until a control token is configured",
+        )
+    };
+    let body = ApiErrorResponse {
+        code,
+        kind: "authentication",
+        message: message.to_string(),
+        retryable: false,
+        trace_id,
+        details: serde_json::json!({}),
+    };
+    (StatusCode::UNAUTHORIZED, Json(body)).into_response()
+}
+
+fn is_write_method(method: &Method) -> bool {
+    method != Method::GET && method != Method::HEAD && method != Method::OPTIONS
+}
+
+fn request_has_valid_token(headers: &HeaderMap, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return false;
+    };
+    let Some(provided) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    constant_time_eq(provided.as_bytes(), expected.as_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+fn json_response(value: serde_json::Value) -> Response {
+    Json(value).into_response()
+}
+
+fn api_error_response(
+    status: StatusCode,
+    code: &'static str,
+    kind: OutboundErrorKind,
+    message: impl Into<String>,
+    details: serde_json::Value,
+) -> Response {
+    let body = ApiErrorResponse {
+        code,
+        kind: kind.as_str(),
+        message: message.into(),
+        retryable: kind.retryable(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        details,
+    };
+    (status, Json(body)).into_response()
+}
+
+fn classified_api_error(code: &'static str, error: impl std::fmt::Display) -> Response {
+    let message = error.to_string();
+    let kind = classify_message(&message);
+    let status = match kind {
+        OutboundErrorKind::Authentication => StatusCode::UNAUTHORIZED,
+        OutboundErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        OutboundErrorKind::Dns
+        | OutboundErrorKind::Tcp
+        | OutboundErrorKind::Tls
+        | OutboundErrorKind::HttpStatus
+        | OutboundErrorKind::EmptyResponse => StatusCode::BAD_GATEWAY,
+        OutboundErrorKind::Cancelled => StatusCode::CONFLICT,
+        OutboundErrorKind::Protocol | OutboundErrorKind::Unsupported => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        OutboundErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    api_error_response(status, code, kind, message, serde_json::json!({}))
+}
+
+fn invalid_request(code: &'static str, message: impl Into<String>) -> Response {
+    api_error_response(
+        StatusCode::BAD_REQUEST,
+        code,
+        OutboundErrorKind::Protocol,
+        message,
+        serde_json::json!({}),
+    )
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -220,6 +408,26 @@ async fn status(State(runtime): State<Arc<Runtime>>) -> Json<StatusResponse> {
     })
 }
 
+async fn tun_status(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    Json(serde_json::json!({
+        "tun": config.tun,
+        "dns": config.dns,
+    }))
+}
+
+async fn doctor(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+    let config = runtime.config();
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "summary": config.summary(),
+        "capabilities": runtime.outbound_capabilities(),
+        "outbound_health": runtime.telemetry().outbound_health().await,
+        "tun": config.tun,
+        "dns": config.dns,
+    }))
+}
+
 async fn connections(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "traffic": runtime.telemetry().traffic(),
@@ -231,9 +439,9 @@ async fn traffic(State(runtime): State<Arc<Runtime>>) -> Json<crate::telemetry::
     Json(runtime.telemetry().traffic())
 }
 
-async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) -> Response {
     match subscription_store(&runtime).index() {
-        Ok(index) => Json(serde_json::json!({
+        Ok(index) => json_response(serde_json::json!({
             "ok": true,
             "active_id": index.active_id,
             "subscriptions": index.subscriptions.into_iter().map(|item| {
@@ -246,10 +454,7 @@ async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) -> Json<serde
                 })
             }).collect::<Vec<_>>(),
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_traffic_read_failed", error),
     }
 }
 
@@ -261,64 +466,14 @@ async fn outbounds(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Valu
     }))
 }
 
-async fn compat_proxies(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
-    let config = runtime.config();
-    let groups = runtime.proxy_groups().await;
-    let capabilities = runtime
-        .outbound_capabilities()
-        .into_iter()
-        .map(|item| (item.name.clone(), item))
-        .collect::<std::collections::HashMap<_, _>>();
-    let health = runtime
-        .telemetry()
-        .outbound_health()
-        .await
-        .into_iter()
-        .map(|item| (item.name.clone(), item))
-        .collect::<std::collections::HashMap<_, _>>();
-    let group_map = groups
-        .iter()
-        .map(|group| (group.name.clone(), group))
-        .collect::<std::collections::HashMap<_, _>>();
-    let proxies = config
-        .outbounds
-        .iter()
-        .map(|outbound| {
-            let name = outbound.name().to_string();
-            let capability = capabilities.get(&name);
-            let health = health.get(&name);
-            let group = group_map.get(&name);
-            (
-                name.clone(),
-                serde_json::json!({
-                    "name": name,
-                    "type": outbound_api_kind(outbound),
-                    "udp": capability.map(|item| item.udp_supported).unwrap_or(false),
-                    "tcp": capability.map(|item| item.tcp_supported).unwrap_or(false),
-                    "now": group.and_then(|item| item.selected_member.clone()),
-                    "all": group.map(|item| item.members.iter().map(|member| member.name.clone()).collect::<Vec<_>>()).unwrap_or_default(),
-                    "history": health.and_then(|item| item.last_latency_ms).map(|latency| vec![serde_json::json!({ "time": item_time(), "delay": latency })]).unwrap_or_default(),
-                    "alive": health.map(|item| item.successes > 0 && item.last_error.is_none()).unwrap_or(false),
-                    "lastDelay": health.and_then(|item| item.last_latency_ms),
-                    "lastError": health.and_then(|item| item.last_error.clone()),
-                    "limitations": capability.map(|item| item.limitations.clone()).unwrap_or_default(),
-                }),
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    Json(serde_json::json!({
-        "proxies": proxies,
-    }))
-}
-
-async fn compat_rules(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn rules_snapshot(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "rules": runtime.config().rules,
         "smart": runtime.smart_snapshot(),
     }))
 }
 
-async fn compat_proxy_providers(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn proxy_providers(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     let subscriptions = subscription_store(&runtime)
         .index()
         .map(|index| index.subscriptions)
@@ -335,7 +490,7 @@ async fn compat_proxy_providers(State(runtime): State<Arc<Runtime>>) -> Json<ser
     }))
 }
 
-async fn compat_rule_providers(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn rule_providers(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     let providers = runtime
         .config()
         .rule_sets
@@ -373,9 +528,9 @@ async fn countries(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Valu
 async fn use_country(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<CountryUseRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     match runtime.use_country_group(&request.code).await {
-        Ok(config) => Json(serde_json::json!({
+        Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "runtime": {
                 "reloaded": true,
@@ -383,17 +538,14 @@ async fn use_country(
                 "default_outbound": config.core.default_outbound,
             },
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("country_selection_failed", error),
     }
 }
 
 async fn probe_outbounds(
     State(runtime): State<Arc<Runtime>>,
     request: Option<Json<ProbeRequest>>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let options = request
         .map(|Json(request)| ProbeOptions {
             url: request.url,
@@ -404,48 +556,7 @@ async fn probe_outbounds(
         .unwrap_or_default();
     let results = runtime.probe_all_outbounds_with(options).await;
     let failure_summary = build_probe_failure_summary(&results);
-    Json(serde_json::json!({
-        "results": results,
-        "failure_summary": failure_summary,
-    }))
-}
-
-async fn probe_group(
-    State(runtime): State<Arc<Runtime>>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    request: Option<Json<ProbeRequest>>,
-) -> Json<serde_json::Value> {
-    let config = runtime.config();
-    let member_names = collect_group_probe_members(&config, &name);
-    if member_names.is_empty() {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": format!("group '{}' has no probeable members", name),
-        }));
-    }
-    let request = request.map(|Json(request)| request);
-    let mut names = request
-        .as_ref()
-        .and_then(|request| request.names.clone())
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(Vec::new);
-    if names.is_empty() {
-        names = member_names;
-    }
-    let request_url = request.as_ref().and_then(|request| request.url.clone());
-    let request_timeout_ms = request.as_ref().and_then(|request| request.timeout_ms);
-    let request_concurrency = request.as_ref().and_then(|request| request.concurrency);
-    let options = ProbeOptions {
-        url: request_url,
-        timeout_ms: request_timeout_ms,
-        concurrency: request_concurrency,
-        names: Some(names),
-    };
-    let results = runtime.probe_all_outbounds_with(options).await;
-    let failure_summary = build_probe_failure_summary(&results);
-    Json(serde_json::json!({
-        "ok": true,
-        "group": name,
+    json_response(serde_json::json!({
         "results": results,
         "failure_summary": failure_summary,
     }))
@@ -454,14 +565,14 @@ async fn probe_group(
 async fn probe_group_body(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<ProbeGroupRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let config = runtime.config();
     let member_names = collect_group_probe_members(&config, &request.group);
     if member_names.is_empty() {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": format!("group '{}' has no probeable members", request.group),
-        }));
+        return invalid_request(
+            "probe_group_empty",
+            format!("group '{}' has no probeable members", request.group),
+        );
     }
     let options = ProbeOptions {
         url: request.url,
@@ -471,7 +582,7 @@ async fn probe_group_body(
     };
     let results = runtime.probe_all_outbounds_with(options).await;
     let failure_summary = build_probe_failure_summary(&results);
-    Json(serde_json::json!({
+    json_response(serde_json::json!({
         "ok": true,
         "group": request.group,
         "results": results,
@@ -551,8 +662,8 @@ fn collect_group_members(
 async fn route_decision(
     State(runtime): State<Arc<Runtime>>,
     Json(destination): Json<Destination>,
-) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+) -> Response {
+    json_response(serde_json::json!({
         "destination": destination,
         "decision": runtime.decide(&destination),
     }))
@@ -562,33 +673,27 @@ async fn smart_rules(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Va
     Json(serde_json::json!(runtime.smart_snapshot()))
 }
 
-async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Response {
     match subscription_store(&runtime).index() {
-        Ok(index) => Json(serde_json::json!({
+        Ok(index) => json_response(serde_json::json!({
             "ok": true,
             "index": index,
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_index_read_failed", error),
     }
 }
 
 async fn import_subscription(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SubscriptionImportRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let url = request.url.clone();
     let update_timeout_secs = runtime.config().subscriptions.update_timeout_secs;
     let text = match subscription_source_text(request.text, request.url, update_timeout_secs).await
     {
         Ok(text) => text,
         Err(error) => {
-            return Json(serde_json::json!({
-                "ok": false,
-                "error": error.to_string(),
-            }))
+            return classified_api_error("subscription_download_failed", error);
         }
     };
 
@@ -608,31 +713,30 @@ async fn import_subscription(
                 Ok(serde_json::json!({ "reloaded": false }))
             };
             match reload {
-                Ok(reload) => Json(serde_json::json!({
+                Ok(reload) => json_response(serde_json::json!({
                     "ok": true,
                     "result": result,
                     "runtime": reload,
                 })),
-                Err(error) => Json(serde_json::json!({
-                    "ok": false,
-                    "result": result,
-                    "error": error.to_string(),
-                })),
+                Err(error) => api_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "subscription_reload_failed",
+                    classify_message(&error.to_string()),
+                    error.to_string(),
+                    serde_json::json!({ "result": result }),
+                ),
             }
         }
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_import_failed", error),
     }
 }
 
 async fn use_outbound(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<OutboundUseRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     match runtime.use_outbound(&request.name) {
-        Ok(config) => Json(serde_json::json!({
+        Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "runtime": {
                 "reloaded": true,
@@ -640,20 +744,17 @@ async fn use_outbound(
                 "default_outbound": config.core.default_outbound,
             },
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("outbound_selection_failed", error),
     }
 }
 
 async fn use_subscription(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SubscriptionUseRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     match subscription_store(&runtime).set_active(&request.id) {
         Ok(meta) => match reload_active_subscription_config(&runtime) {
-            Ok(config) => Json(serde_json::json!({
+            Ok(config) => json_response(serde_json::json!({
                 "ok": true,
                 "subscription": meta,
                 "runtime": {
@@ -661,20 +762,19 @@ async fn use_subscription(
                     "summary": config.summary(),
                 },
             })),
-            Err(error) => Json(serde_json::json!({
-                "ok": false,
-                "subscription": meta,
-                "error": error.to_string(),
-            })),
+            Err(error) => api_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "subscription_reload_failed",
+                classify_message(&error.to_string()),
+                error.to_string(),
+                serde_json::json!({ "subscription": meta }),
+            ),
         },
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_selection_failed", error),
     }
 }
 
-async fn update_all_subscriptions(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
+async fn update_all_subscriptions(State(runtime): State<Arc<Runtime>>) -> Response {
     let store = subscription_store(&runtime);
     let options = (&runtime.config().subscriptions).into();
     match store.update_all_from_urls_with(options).await {
@@ -688,47 +788,41 @@ async fn update_all_subscriptions(State(runtime): State<Arc<Runtime>>) -> Json<s
                 Ok(serde_json::json!({ "reloaded": false }))
             };
             match reload {
-                Ok(reload) => Json(serde_json::json!({
+                Ok(reload) => json_response(serde_json::json!({
                     "ok": true,
                     "results": results,
                     "runtime": reload,
                 })),
-                Err(error) => Json(serde_json::json!({
-                    "ok": false,
-                    "results": results,
-                    "error": error.to_string(),
-                })),
+                Err(error) => api_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "subscription_reload_failed",
+                    classify_message(&error.to_string()),
+                    error.to_string(),
+                    serde_json::json!({ "results": results }),
+                ),
             }
         }
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_update_failed", error),
     }
 }
 
-async fn reload_active_subscription(
-    State(runtime): State<Arc<Runtime>>,
-) -> Json<serde_json::Value> {
+async fn reload_active_subscription(State(runtime): State<Arc<Runtime>>) -> Response {
     match reload_active_subscription_config(&runtime) {
-        Ok(config) => Json(serde_json::json!({
+        Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "runtime": {
                 "reloaded": true,
                 "summary": config.summary(),
             },
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_reload_failed", error),
     }
 }
 
 async fn active_subscription_config(
     State(runtime): State<Arc<Runtime>>,
     request: Option<Json<ActiveSubscriptionConfigRequest>>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let base_config = runtime.base_config();
     let use_first_node = request
         .and_then(|Json(request)| request.use_first_node)
@@ -736,21 +830,18 @@ async fn active_subscription_config(
     match SubscriptionStore::new(base_config.subscriptions.store_path.clone())
         .active_runtime_config(base_config, use_first_node)
     {
-        Ok(config) => Json(serde_json::json!({
+        Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "config": config,
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("subscription_config_failed", error),
     }
 }
 
 async fn upsert_smart_rule(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SmartRuleRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let result = runtime.upsert_smart_rule(SmartRouteRule {
         target: request.target,
         value: request.value,
@@ -759,56 +850,47 @@ async fn upsert_smart_rule(
         note: request.note,
     });
     match result {
-        Ok(rules) => Json(serde_json::json!({
+        Ok(rules) => json_response(serde_json::json!({
             "ok": true,
             "rules": rules,
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("smart_rule_upsert_failed", error),
     }
 }
 
 async fn set_smart_rule_enabled(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SmartRuleEnabledRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     match runtime.set_smart_rule_enabled(request.target, &request.value, request.enabled) {
-        Ok(rules) => Json(serde_json::json!({
+        Ok(rules) => json_response(serde_json::json!({
             "ok": true,
             "rules": rules,
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("smart_rule_update_failed", error),
     }
 }
 
 async fn delete_smart_rule(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<SmartRuleDeleteRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     match runtime.delete_smart_rule(request.target, &request.value) {
-        Ok(rules) => Json(serde_json::json!({
+        Ok(rules) => json_response(serde_json::json!({
             "ok": true,
             "rules": rules,
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("smart_rule_delete_failed", error),
     }
 }
 
 async fn apply_smart_recommendations(
     State(runtime): State<Arc<Runtime>>,
     request: Option<Json<ApplySmartRecommendationsRequest>>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let action = request.and_then(|Json(request)| request.action);
     let rules = runtime.apply_smart_recommendations(action);
-    Json(serde_json::json!({
+    json_response(serde_json::json!({
         "ok": true,
         "rules": rules,
     }))
@@ -817,16 +899,13 @@ async fn apply_smart_recommendations(
 async fn apply_smart_recommendation(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<ApplySmartRecommendationRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     match runtime.apply_smart_recommendation(request.target, &request.value) {
-        Ok(rules) => Json(serde_json::json!({
+        Ok(rules) => json_response(serde_json::json!({
             "ok": true,
             "rules": rules,
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("smart_recommendation_apply_failed", error),
     }
 }
 
@@ -852,7 +931,7 @@ async fn config(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> 
 async fn reload_config(
     State(runtime): State<Arc<Runtime>>,
     Json(request): Json<ConfigReloadRequest>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let base_config = match (request.path, request.yaml) {
         (Some(path), None) => SuperConfig::load(&path),
         (None, Some(yaml)) => serde_yaml::from_str(&yaml).map_err(Into::into),
@@ -862,20 +941,14 @@ async fn reload_config(
     let base_config = match base_config {
         Ok(config) => config,
         Err(error) => {
-            return Json(serde_json::json!({
-                "ok": false,
-                "error": error.to_string(),
-            }))
+            return invalid_request("config_load_failed", error.to_string());
         }
     };
     if let Err(error) = runtime.set_base_config(base_config) {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        }));
+        return invalid_request("config_validation_failed", error.to_string());
     }
     match reload_active_subscription_config(&runtime) {
-        Ok(config) => Json(serde_json::json!({
+        Ok(config) => json_response(serde_json::json!({
             "ok": true,
             "runtime": {
                 "reloaded": true,
@@ -883,10 +956,7 @@ async fn reload_config(
                 "default_outbound": config.core.default_outbound,
             },
         })),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "error": error.to_string(),
-        })),
+        Err(error) => classified_api_error("config_reload_failed", error),
     }
 }
 
@@ -908,39 +978,6 @@ fn reload_active_subscription_config(
         runtime.config().subscriptions.use_first_node_as_default,
     )?;
     runtime.reload_config(config)
-}
-
-fn outbound_api_kind(config: &OutboundConfig) -> String {
-    match config {
-        OutboundConfig::Direct { .. } => "Direct".to_string(),
-        OutboundConfig::Reject { .. } => "Reject".to_string(),
-        OutboundConfig::Http { .. } => "HTTP".to_string(),
-        OutboundConfig::Socks5 { .. } => "Socks5".to_string(),
-        OutboundConfig::Shadowsocks { .. } => "Shadowsocks".to_string(),
-        OutboundConfig::Ssr { .. } => "ShadowsocksR".to_string(),
-        OutboundConfig::Snell { .. } => "Snell".to_string(),
-        OutboundConfig::Trojan { .. } => "Trojan".to_string(),
-        OutboundConfig::Vmess { .. } => "VMess".to_string(),
-        OutboundConfig::Vless { .. } => "VLESS".to_string(),
-        OutboundConfig::Hysteria { .. } => "Hysteria".to_string(),
-        OutboundConfig::Hysteria2 { .. } => "Hysteria2".to_string(),
-        OutboundConfig::Tuic { .. } => "TUIC".to_string(),
-        OutboundConfig::WireGuard { .. } => "WireGuard".to_string(),
-        OutboundConfig::AnyTls { .. } => "AnyTLS".to_string(),
-        OutboundConfig::ShadowTls { .. } => "ShadowTLS".to_string(),
-        OutboundConfig::Naive { .. } => "Naive".to_string(),
-        OutboundConfig::Ssh { .. } => "SSH".to_string(),
-        OutboundConfig::Mieru { .. } => "Mieru".to_string(),
-        OutboundConfig::Juicity { .. } => "Juicity".to_string(),
-        OutboundConfig::Masque { .. } => "MASQUE".to_string(),
-        OutboundConfig::OpenVpn { .. } => "OpenVPN".to_string(),
-        OutboundConfig::Unknown { protocol, .. } => format!("Unknown:{protocol}"),
-        OutboundConfig::Group { kind, .. } => kind.clone(),
-    }
-}
-
-fn item_time() -> String {
-    chrono::Utc::now().to_rfc3339()
 }
 
 async fn subscription_source_text(
@@ -975,6 +1012,53 @@ async fn fetch_subscription_url(url: String, timeout_secs: u64) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn control_api_accepts_loopback_only() {
+        assert!(validate_control_listen("127.0.0.1:9197".parse().unwrap()).is_ok());
+        assert!(validate_control_listen("[::1]:9197".parse().unwrap()).is_ok());
+        assert!(validate_control_listen("0.0.0.0:9197".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn write_auth_requires_matching_bearer_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut headers = HeaderMap::new();
+        assert!(!request_has_valid_token(&headers, Some(token)));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer incorrect-token-value-000000"),
+        );
+        assert!(!request_has_valid_token(&headers, Some(token)));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer 0123456789abcdef0123456789abcdef"),
+        );
+        assert!(request_has_valid_token(&headers, Some(token)));
+        assert!(!request_has_valid_token(&headers, None));
+    }
+
+    #[test]
+    fn control_token_rejects_short_values() {
+        assert!(normalized_control_token(None).unwrap().is_none());
+        assert!(normalized_control_token(Some(" ".to_string()))
+            .unwrap()
+            .is_none());
+        assert!(normalized_control_token(Some("too-short".to_string())).is_err());
+        assert!(
+            normalized_control_token(Some("a".repeat(MIN_CONTROL_TOKEN_BYTES)))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn control_token_comparison_is_exact() {
+        assert!(constant_time_eq(b"same-value", b"same-value"));
+        assert!(!constant_time_eq(b"same-value", b"different!"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
 
     #[test]
     fn test_collect_group_probe_members_flattens_nested_groups() {

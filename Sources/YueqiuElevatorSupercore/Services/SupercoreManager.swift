@@ -8,6 +8,7 @@ final class SupercoreManager: @unchecked Sendable {
     private let paths: AppPaths
     private let apiClient: SupercoreAPIClient
     private var process: Process?
+    private var intentionallyStoppingPIDs: Set<Int32> = []
     private let queue = DispatchQueue(label: "YueqiuElevatorSupercore.SupercoreManager")
 
     init(paths: AppPaths, apiClient: SupercoreAPIClient) {
@@ -87,9 +88,15 @@ final class SupercoreManager: @unchecked Sendable {
         await stop()
 
         onStateChanged?(.starting)
+        let controlToken = try ControlToken.generate()
+        apiClient.setControlToken(controlToken)
         let proc = Process()
         proc.executableURL = paths.supercoreBinary
         proc.arguments = ["run", "-c", configPath.path]
+        var environment = ProcessInfo.processInfo.environment
+        environment["SKYHOOK_CONTROL_TOKEN"] = controlToken
+        environment.removeValue(forKey: "SKYHOOK_CONTROL_TOKEN_FILE")
+        proc.environment = environment
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -98,27 +105,54 @@ final class SupercoreManager: @unchecked Sendable {
         attachLog(pipe: stdout, prefix: "supercore")
         attachLog(pipe: stderr, prefix: "supercore-error")
         proc.terminationHandler = { [weak self] terminated in
+            guard let self else { return }
+            let (ownsTermination, intentionalStop) = self.queue.sync {
+                let intentionalStop = self.intentionallyStoppingPIDs.remove(terminated.processIdentifier) != nil
+                guard self.process === terminated else {
+                    return (false, intentionalStop)
+                }
+                self.process = nil
+                return (true, intentionalStop)
+            }
+            guard ownsTermination || intentionalStop else { return }
+            if ownsTermination {
+                self.apiClient.setControlToken(nil)
+            }
             let reason = "Supercore 已退出，exitCode=\(terminated.terminationStatus)"
-            self?.onLogLine?(reason)
-            if terminated.terminationStatus == 0 {
-                self?.onStateChanged?(.stopped)
+            self.onLogLine?(reason)
+            if intentionalStop || terminated.terminationStatus == 0 {
+                self.onStateChanged?(.stopped)
             } else {
-                self?.onStateChanged?(.crashed(reason: reason))
+                self.onStateChanged?(.crashed(reason: reason))
             }
         }
 
-        try proc.run()
+        do {
+            try proc.run()
+        } catch {
+            apiClient.setControlToken(nil)
+            throw error
+        }
         queue.sync { process = proc }
-        let version = try await waitForHealthyVersion(process: proc)
-        onStateChanged?(.running(version: version))
+        do {
+            let version = try await waitForHealthyVersion(process: proc)
+            onStateChanged?(.running(version: version))
+        } catch {
+            await stop()
+            throw error
+        }
     }
 
     func stop() async {
         let proc = queue.sync { process }
         guard let proc, proc.isRunning else {
             terminateOwnedCoreProcesses()
+            apiClient.setControlToken(nil)
             onStateChanged?(.stopped)
             return
+        }
+        _ = queue.sync {
+            intentionallyStoppingPIDs.insert(proc.processIdentifier)
         }
         proc.terminate()
         for _ in 0..<20 where proc.isRunning {
@@ -129,12 +163,16 @@ final class SupercoreManager: @unchecked Sendable {
         }
         queue.sync { process = nil }
         terminateOwnedCoreProcesses()
+        apiClient.setControlToken(nil)
         onStateChanged?(.stopped)
     }
 
     func stopSync() {
         let proc = queue.sync { process }
         if let proc, proc.isRunning {
+            _ = queue.sync {
+                intentionallyStoppingPIDs.insert(proc.processIdentifier)
+            }
             proc.terminate()
             Thread.sleep(forTimeInterval: 0.2)
             if proc.isRunning {
@@ -142,6 +180,8 @@ final class SupercoreManager: @unchecked Sendable {
             }
         }
         terminateOwnedCoreProcesses()
+        queue.sync { process = nil }
+        apiClient.setControlToken(nil)
     }
 
     func detectRunningVersion() async -> String? {
@@ -199,7 +239,7 @@ final class SupercoreManager: @unchecked Sendable {
                 try await Task.sleep(nanoseconds: 250_000_000)
             }
         }
-        throw lastError ?? AppError.processFailed("Supercore 启动后未响应 /supercore/version")
+        throw lastError ?? AppError.processFailed("Supercore 启动后未响应 /v1/version")
     }
 
     private func attachLog(pipe: Pipe, prefix: String) {

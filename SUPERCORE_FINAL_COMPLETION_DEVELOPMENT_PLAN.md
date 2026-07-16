@@ -19,6 +19,15 @@
 - Snell reuse 支持 10 条连接池、15 秒空闲淘汰、零帧半关闭、HTTP/TLS 混淆状态延续和陈旧连接自动重拨。
 - Swift 全量测试：89 passed、0 failed。
 - M0 的 Rust 与 Swift release build 均通过；Rust 完整 LTO release 构建耗时 15m39s。M4 reuse 改动后的 release 重验按统一门策略留到下一协议门。
+- M1 控制面已进入 `IMPLEMENTED`：Swift 全部迁移到独立 `/v1` API，旧根路径与
+  `/supercore/*` 兼容入口已删除，控制地址限制为 loopback，写请求使用启动级 Bearer
+  Token，错误返回包含稳定 code/kind/trace id。
+- 普通核心每次启动生成新的 256-bit Token；TUN LaunchDaemon 通过 root-only `0600`
+  文件读取 Token，plist 不包含明文凭据。
+- `supercore run` 已禁止启动时下载订阅；定时测速首次执行等待完整间隔，不再启动后
+  1 秒触发全局测速。
+- 当前 M1 回归：Rust lib 78 passed、Swift full 91 passed；完整 Rust integration 和
+  release 门留到 M1 模块拆分完成后统一执行。
 
 ## 0. 开发总原则
 

@@ -232,6 +232,11 @@ final class AppState: ObservableObject {
             userMessage = "检测到上次代理快照，可在设置中恢复网络"
         }
         refreshTunLaunchDaemonStatus()
+        if tunLaunchDaemonStatus.installed,
+           let controlToken = try? keychain.get(ControlToken.account),
+           !controlToken.isEmpty {
+            supercoreAPIClient.setControlToken(controlToken)
+        }
         loadCachedProviderNodesForActiveProfile()
         await attachExistingCoreIfNeeded()
         checkNetworkRecoveryNeeded()
@@ -412,6 +417,11 @@ final class AppState: ObservableObject {
                 resetRuntimeTrafficBaselineForActiveProfile(flushImmediately: true)
                 setOperation(.startingCore, "正在启动 Supercore...")
                 if shouldUseTunDaemon {
+                    guard let controlToken = try keychain.get(ControlToken.account),
+                          !controlToken.isEmpty else {
+                        throw AppError.processFailed("TUN 权限服务缺少控制凭据，请重新安装 TUN 权限服务")
+                    }
+                    supercoreAPIClient.setControlToken(controlToken)
                     try copyRuntimeToDaemonRuntime(profileID: profile.id)
                     setOperation(.startingCore, "正在热重载 TUN 权限服务...")
                     try await supercoreAPIClient.reloadConfig(path: paths.supercoreDaemonRuntimeProfile)
@@ -608,11 +618,27 @@ final class AppState: ObservableObject {
                     runtimeOptions: options
                 )
                 try copyRuntimeToDaemonRuntime(profileID: profile.id)
+                let previousControlToken = try keychain.get(ControlToken.account)
+                let controlToken = try ControlToken.generate()
+                try keychain.set(controlToken, for: ControlToken.account)
+                supercoreAPIClient.setControlToken(controlToken)
                 setOperation(.tunDaemon, "需要 macOS 管理员授权安装 LaunchDaemon...")
-                try tunLaunchDaemonManager.installOrUpdate(
-                    binaryURL: paths.supercoreBinary,
-                    configURL: paths.supercoreDaemonRuntimeProfile
-                )
+                do {
+                    try tunLaunchDaemonManager.installOrUpdate(
+                        binaryURL: paths.supercoreBinary,
+                        configURL: paths.supercoreDaemonRuntimeProfile,
+                        controlToken: controlToken
+                    )
+                } catch {
+                    if let previousControlToken {
+                        try? keychain.set(previousControlToken, for: ControlToken.account)
+                        supercoreAPIClient.setControlToken(previousControlToken)
+                    } else {
+                        try? keychain.delete(ControlToken.account)
+                        supercoreAPIClient.setControlToken(nil)
+                    }
+                    throw error
+                }
                 refreshTunLaunchDaemonStatus()
                 userMessage = "TUN 权限服务已安装，之后可免重复输密码"
             } catch {
@@ -629,6 +655,8 @@ final class AppState: ObservableObject {
             setOperation(.tunDaemon, "正在卸载 TUN 权限服务...")
             do {
                 try tunLaunchDaemonManager.uninstall()
+                try? keychain.delete(ControlToken.account)
+                supercoreAPIClient.setControlToken(nil)
                 usingTunLaunchDaemon = false
                 refreshTunLaunchDaemonStatus()
                 userMessage = "TUN 权限服务已卸载"

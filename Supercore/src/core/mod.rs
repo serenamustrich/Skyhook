@@ -20,7 +20,10 @@ use url::Url;
 use crate::{
     config::{OutboundConfig, SmartRouteRule, SuperConfig},
     inbound::fakeip::FakeIpStore,
-    outbound::{build_outbounds, BoxedStream, Outbound, OutboundMap},
+    outbound::{
+        build_outbounds, context::DialContext, error::classify_message, BoxedStream, Outbound,
+        OutboundMap,
+    },
     routing::{Destination, RouteDecision, Router},
     smart::{self, DirectProbeRequest, SmartRecommendationAction, SmartRuleEngine, SmartSnapshot},
     subscription_store::SubscriptionStore,
@@ -326,8 +329,16 @@ impl Runtime {
         };
         let outbound_name = outbound.name().to_string();
         let outbound_kind = outbound.kind().to_string();
+        let mut dial_context = DialContext::new(destination.clone(), connect_timeout_ms);
+        dial_context.matched_rule = decision.matched_rule.clone();
+        dial_context.app_id = destination.app.as_ref().and_then(|app| {
+            app.bundle_id
+                .clone()
+                .or_else(|| app.name.clone())
+                .or_else(|| app.path.clone())
+        });
         let started = Instant::now();
-        match outbound.connect(destination, connect_timeout_ms).await {
+        match outbound.connect_context(&dial_context).await {
             Ok(stream) => {
                 let latency_ms = started.elapsed().as_millis() as u64;
                 self.telemetry
@@ -343,7 +354,8 @@ impl Runtime {
                     .log(
                         "info",
                         format!(
-                            "route ok target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms",
+                            "route ok trace={} target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms",
+                            dial_context.trace_id,
                             destination.authority(),
                             decision.outbound,
                             outbound_name,
@@ -379,7 +391,8 @@ impl Runtime {
                     .log(
                         "warn",
                         format!(
-                            "route failed target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms error={}",
+                            "route failed trace={} target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms error={}",
+                            dial_context.trace_id,
                             destination.authority(),
                             decision.outbound,
                             outbound_name,
@@ -423,6 +436,14 @@ impl Runtime {
         };
         let outbound_name = outbound.name().to_string();
         let outbound_kind = outbound.kind().to_string();
+        let mut dial_context = DialContext::new(destination.clone(), connect_timeout_ms);
+        dial_context.matched_rule = decision.matched_rule.clone();
+        dial_context.app_id = destination.app.as_ref().and_then(|app| {
+            app.bundle_id
+                .clone()
+                .or_else(|| app.name.clone())
+                .or_else(|| app.path.clone())
+        });
         let id = self
             .open_connection_record(
                 inbound,
@@ -432,9 +453,7 @@ impl Runtime {
             )
             .await;
         let started = Instant::now();
-        let result = outbound
-            .udp_exchange(&destination, payload, connect_timeout_ms)
-            .await;
+        let result = outbound.udp_exchange_context(&dial_context, payload).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(response) => {
@@ -454,7 +473,8 @@ impl Runtime {
                     .log(
                         "info",
                         format!(
-                            "udp route ok target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms bytes_up={} bytes_down={}",
+                            "udp route ok trace={} target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms bytes_up={} bytes_down={}",
+                            dial_context.trace_id,
                             destination.authority(),
                             decision.outbound,
                             outbound_name,
@@ -485,7 +505,8 @@ impl Runtime {
                     .log(
                         "warn",
                         format!(
-                            "udp route failed target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms error={}",
+                            "udp route failed trace={} target={} outbound={} actual={} kind={} source={:?} rule={} latency={}ms error={}",
+                            dial_context.trace_id,
                             destination.authority(),
                             decision.outbound,
                             outbound_name,
@@ -778,8 +799,8 @@ impl Runtime {
             return;
         }
 
-        sleep(Duration::from_secs(1)).await;
         loop {
+            sleep(Duration::from_secs(interval_secs)).await;
             let results = self.probe_all_outbounds().await;
             let ok_count = results.iter().filter(|item| item.success).count();
             self.telemetry
@@ -791,7 +812,6 @@ impl Runtime {
                     ),
                 )
                 .await;
-            sleep(Duration::from_secs(interval_secs)).await;
         }
     }
 
@@ -1911,7 +1931,8 @@ async fn probe_one(
     let kind = outbound.kind().to_string();
     let started = Instant::now();
     let result = timeout(Duration::from_millis(timeout_ms), async {
-        let mut stream = outbound.connect(&target.destination, timeout_ms).await?;
+        let context = DialContext::new(target.destination.clone(), timeout_ms);
+        let mut stream = outbound.connect_context(&context).await?;
         if target.use_tls {
             let server_name = ServerName::try_from(target.server_name.clone())
                 .map_err(|_| anyhow!("invalid probe TLS server name {}", target.server_name))?;
@@ -1984,26 +2005,7 @@ async fn probe_one(
 }
 
 fn classify_probe_failure(error: &str) -> String {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        "timeout".to_string()
-    } else if lower.contains("connection refused") || lower.contains("connect failed") {
-        "dial_error".to_string()
-    } else if lower.contains("not implemented") {
-        "protocol_unsupported".to_string()
-    } else if lower.contains("tls") || lower.contains("ssl") || lower.contains("certificate") {
-        "tls_error".to_string()
-    } else if lower.contains("dns") || lower.contains("resolve") || lower.contains("lookup") {
-        "dns_error".to_string()
-    } else if lower.contains("empty response") || lower.contains("no data") {
-        "empty_response".to_string()
-    } else if lower.contains("unhealthy") || lower.contains("status") {
-        "http_status".to_string()
-    } else if lower.contains("unsupported") || lower.contains("not supported") {
-        "protocol_unsupported".to_string()
-    } else {
-        "dial_error".to_string()
-    }
+    classify_message(error).probe_failure_kind().to_string()
 }
 
 #[cfg(test)]

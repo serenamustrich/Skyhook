@@ -382,25 +382,6 @@ async fn load_runtime_config(path: &Path) -> anyhow::Result<SuperConfig> {
 
 async fn load_base_config_for_run(path: &Path) -> anyhow::Result<SuperConfig> {
     let config = SuperConfig::load(path)?;
-    if config.subscriptions.update_on_start {
-        let store = SubscriptionStore::new(config.subscriptions.store_path.clone());
-        match store
-            .update_all_from_urls_with((&config.subscriptions).into())
-            .await
-        {
-            Ok(results) => {
-                let updated = results.iter().filter(|item| item.updated).count();
-                tracing::info!(
-                    updated,
-                    total = results.len(),
-                    "startup subscription update complete"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "startup subscription update failed");
-            }
-        }
-    }
     Ok(maybe_prepare_geo_assets(config).await)
 }
 
@@ -773,6 +754,11 @@ mod doctor_summary_tests {
     use super::*;
     use std::collections::BTreeMap;
     use supercore::config::OutboundConfig;
+
+    #[test]
+    fn default_runtime_never_updates_subscriptions_during_startup() {
+        assert!(!SuperConfig::default().subscriptions.update_on_start);
+    }
 
     #[test]
     fn summarize_outbound_support_produces_protocol_level_counts() {

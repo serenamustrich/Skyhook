@@ -26,14 +26,12 @@ use ipnet::IpNet;
 use md5::{Digest, Md5};
 use russh::{client as ssh_client, ChannelMsg, Disconnect};
 use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     client::{DangerousClientHelloSessionIdProvider, Resumption},
     crypto::{aws_lc_rs, ActiveKeyExchange, SharedSecret, SupportedKxGroup},
     ffdhe_groups::FfdheGroup,
-    ClientConfig, DigitallySignedStruct, Error as RustlsError, NamedGroup, ProtocolVersion,
-    RootCertStore, SignatureScheme,
+    ClientConfig, Error as RustlsError, NamedGroup, ProtocolVersion, RootCertStore,
 };
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls_pki_types::ServerName;
 use sha1::Sha1;
 use sha2::{Sha224, Sha256};
 use sha3::{
@@ -60,6 +58,18 @@ use crate::{
     telemetry::Telemetry,
 };
 
+pub mod context;
+pub mod error;
+mod pool;
+mod transports;
+mod udp;
+
+use pool::IdlePool;
+use transports::{connect_tcp, tls_client_config, NoCertificateVerification};
+use udp::{resolve_udp_socket_addr, RoundRobinSessionPool};
+
+use self::context::DialContext;
+
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
@@ -76,6 +86,11 @@ pub trait Outbound: Send + Sync {
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream>;
 
+    async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
+        self.connect(&context.destination, context.timeout_ms())
+            .await
+    }
+
     async fn udp_exchange(
         &self,
         _destination: &Destination,
@@ -87,6 +102,15 @@ pub trait Outbound: Send + Sync {
             self.name(),
             self.kind()
         ))
+    }
+
+    async fn udp_exchange_context(
+        &self,
+        context: &DialContext,
+        payload: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        self.udp_exchange(&context.destination, payload, context.timeout_ms())
+            .await
     }
 }
 
@@ -534,11 +558,16 @@ impl Outbound for GroupOutbound {
         destination: &Destination,
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
+        let context = DialContext::new(destination.clone(), timeout_ms);
+        self.connect_context(&context).await
+    }
+
+    async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
         let members = self.ordered_members().await;
 
         let mut errors = Vec::new();
         for member in members {
-            match member.connect(destination, timeout_ms).await {
+            match member.connect_context(context).await {
                 Ok(stream) => return Ok(stream),
                 Err(error) => errors.push(format!("{}: {error}", member.name())),
             }
@@ -557,11 +586,20 @@ impl Outbound for GroupOutbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
+        let context = DialContext::new(destination.clone(), timeout_ms);
+        self.udp_exchange_context(&context, payload).await
+    }
+
+    async fn udp_exchange_context(
+        &self,
+        context: &DialContext,
+        payload: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
         let members = self.ordered_members().await;
 
         let mut errors = Vec::new();
         for member in members {
-            match member.udp_exchange(destination, payload, timeout_ms).await {
+            match member.udp_exchange_context(context, payload).await {
                 Ok(response) => return Ok(response),
                 Err(error) => errors.push(format!("{}: {error}", member.name())),
             }
@@ -3185,32 +3223,25 @@ struct SnellOutbound {
 const SNELL_V4_POOL_SIZE: usize = 10;
 const SNELL_V4_POOL_IDLE_AGE: Duration = Duration::from_secs(15);
 
-#[derive(Default)]
 struct SnellV4ConnectionPool {
-    idle: Vec<SnellV4IdleConnection>,
+    idle: IdlePool<SnellV4PooledConnection>,
 }
 
-struct SnellV4IdleConnection {
-    connection: SnellV4PooledConnection,
-    idle_since: Instant,
+impl Default for SnellV4ConnectionPool {
+    fn default() -> Self {
+        Self {
+            idle: IdlePool::new(SNELL_V4_POOL_SIZE, SNELL_V4_POOL_IDLE_AGE),
+        }
+    }
 }
 
 impl SnellV4ConnectionPool {
     fn take(&mut self) -> Option<SnellV4PooledConnection> {
-        let now = Instant::now();
-        self.idle
-            .retain(|entry| now.duration_since(entry.idle_since) <= SNELL_V4_POOL_IDLE_AGE);
-        self.idle.pop().map(|entry| entry.connection)
+        self.idle.take()
     }
 
     fn put(&mut self, connection: SnellV4PooledConnection) {
-        if self.idle.len() >= SNELL_V4_POOL_SIZE {
-            self.idle.remove(0);
-        }
-        self.idle.push(SnellV4IdleConnection {
-            connection,
-            idle_since: Instant::now(),
-        });
+        self.idle.put(connection);
     }
 }
 
@@ -4224,11 +4255,7 @@ struct Socks5Outbound {
     udp_sessions: TokioMutex<Socks5UdpPool>,
 }
 
-#[derive(Default)]
-struct Socks5UdpPool {
-    sessions: Vec<Arc<TokioMutex<Socks5UdpSession>>>,
-    next_index: usize,
-}
+type Socks5UdpPool = RoundRobinSessionPool<Socks5UdpSession>;
 
 struct Socks5UdpSession {
     _control: TcpStream,
@@ -4322,17 +4349,15 @@ impl Socks5Outbound {
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<Socks5UdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len() < UDP_SESSION_POOL_SIZE {
             let session = Arc::new(TokioMutex::new(
                 self.open_socks5_udp_session(timeout_ms).await?,
             ));
-            pool.sessions.push(session.clone());
-            pool.next_index = pool.sessions.len() % UDP_SESSION_POOL_SIZE;
+            pool.push(session.clone());
             return Ok(session);
         }
-        let index = pool.next_index % pool.sessions.len();
-        pool.next_index = (pool.next_index + 1) % pool.sessions.len();
-        Ok(pool.sessions[index].clone())
+        pool.next()
+            .ok_or_else(|| anyhow!("socks5 UDP session pool is unexpectedly empty"))
     }
 
     async fn open_socks5_udp_session(&self, timeout_ms: u64) -> anyhow::Result<Socks5UdpSession> {
@@ -4375,13 +4400,7 @@ impl Socks5Outbound {
 
     async fn remove_socks5_udp_session(&self, target: &Arc<TokioMutex<Socks5UdpSession>>) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !pool.sessions.is_empty() {
-            pool.next_index %= pool.sessions.len();
-        } else {
-            pool.next_index = 0;
-        }
+        pool.remove(target);
     }
 }
 
@@ -4395,11 +4414,7 @@ struct ShadowsocksOutbound {
     udp_sessions: TokioMutex<ShadowsocksUdpPool>,
 }
 
-#[derive(Default)]
-struct ShadowsocksUdpPool {
-    sessions: Vec<Arc<TokioMutex<ShadowsocksUdpSession>>>,
-    next_index: usize,
-}
+type ShadowsocksUdpPool = RoundRobinSessionPool<ShadowsocksUdpSession>;
 
 struct ShadowsocksUdpSession {
     udp: UdpSocket,
@@ -4526,11 +4541,7 @@ struct TrojanOutbound {
     udp_sessions: TokioMutex<TrojanUdpPool>,
 }
 
-#[derive(Default)]
-struct TrojanUdpPool {
-    sessions: Vec<Arc<TokioMutex<TrojanUdpSession>>>,
-    next_index: usize,
-}
+type TrojanUdpPool = RoundRobinSessionPool<TrojanUdpSession>;
 
 struct TrojanUdpSession {
     stream: BoxedStream,
@@ -4622,11 +4633,7 @@ struct Hysteria2Outbound {
     udp_sessions: TokioMutex<Hysteria2UdpPool>,
 }
 
-#[derive(Default)]
-struct Hysteria2UdpPool {
-    sessions: Vec<Arc<TokioMutex<Hysteria2UdpSession>>>,
-    next_index: usize,
-}
+type Hysteria2UdpPool = RoundRobinSessionPool<Hysteria2UdpSession>;
 
 struct Hysteria2UdpSession {
     _endpoint: quinn::Endpoint,
@@ -4673,8 +4680,7 @@ struct TuicOutbound {
 #[derive(Default)]
 struct TuicUdpPool {
     mode: Option<String>,
-    sessions: Vec<Arc<TokioMutex<TuicUdpSession>>>,
-    next_index: usize,
+    sessions: RoundRobinSessionPool<TuicUdpSession>,
 }
 
 struct TuicUdpSession {
@@ -5322,7 +5328,7 @@ impl Hysteria2Outbound {
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<Hysteria2UdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len() < UDP_SESSION_POOL_SIZE {
             let connection = open_hysteria2_connection(
                 &self.server,
                 self.port,
@@ -5348,24 +5354,16 @@ impl Hysteria2Outbound {
                 session_id: random_u32()?,
                 next_packet_id: random_u16()?,
             }));
-            pool.sessions.push(session.clone());
-            pool.next_index = pool.sessions.len() % UDP_SESSION_POOL_SIZE;
+            pool.push(session.clone());
             return Ok(session);
         }
-        let index = pool.next_index % pool.sessions.len();
-        pool.next_index = (pool.next_index + 1) % pool.sessions.len();
-        Ok(pool.sessions[index].clone())
+        pool.next()
+            .ok_or_else(|| anyhow!("hysteria2 UDP session pool is unexpectedly empty"))
     }
 
     async fn remove_hysteria2_udp_session(&self, target: &Arc<TokioMutex<Hysteria2UdpSession>>) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !pool.sessions.is_empty() {
-            pool.next_index %= pool.sessions.len();
-        } else {
-            pool.next_index = 0;
-        }
+        pool.remove(target);
     }
 }
 
@@ -6323,7 +6321,6 @@ impl TuicOutbound {
         let mut pool = self.udp_sessions.lock().await;
         if pool.mode.as_deref() != Some(mode) {
             pool.sessions.clear();
-            pool.next_index = 0;
             pool.mode = Some(mode.to_string());
         }
         if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
@@ -6348,23 +6345,16 @@ impl TuicOutbound {
                 next_packet_id: random_u16()?,
             }));
             pool.sessions.push(session.clone());
-            pool.next_index = pool.sessions.len() % UDP_SESSION_POOL_SIZE;
             return Ok(session);
         }
-        let index = pool.next_index % pool.sessions.len();
-        pool.next_index = (pool.next_index + 1) % pool.sessions.len();
-        Ok(pool.sessions[index].clone())
+        pool.sessions
+            .next()
+            .ok_or_else(|| anyhow!("tuic UDP session pool is unexpectedly empty"))
     }
 
     async fn remove_tuic_udp_session(&self, target: &Arc<TokioMutex<TuicUdpSession>>) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !pool.sessions.is_empty() {
-            pool.next_index %= pool.sessions.len();
-        } else {
-            pool.next_index = 0;
-        }
+        pool.sessions.remove(target);
     }
 }
 
@@ -6834,17 +6824,15 @@ impl TrojanOutbound {
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<TrojanUdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len() < UDP_SESSION_POOL_SIZE {
             let session = Arc::new(TokioMutex::new(
                 self.open_trojan_udp_session(timeout_ms).await?,
             ));
-            pool.sessions.push(session.clone());
-            pool.next_index = pool.sessions.len() % UDP_SESSION_POOL_SIZE;
+            pool.push(session.clone());
             return Ok(session);
         }
-        let index = pool.next_index % pool.sessions.len();
-        pool.next_index = (pool.next_index + 1) % pool.sessions.len();
-        Ok(pool.sessions[index].clone())
+        pool.next()
+            .ok_or_else(|| anyhow!("trojan UDP session pool is unexpectedly empty"))
     }
 
     async fn open_trojan_udp_session(&self, timeout_ms: u64) -> anyhow::Result<TrojanUdpSession> {
@@ -6861,13 +6849,7 @@ impl TrojanOutbound {
 
     async fn remove_trojan_udp_session(&self, target: &Arc<TokioMutex<TrojanUdpSession>>) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !pool.sessions.is_empty() {
-            pool.next_index %= pool.sessions.len();
-        } else {
-            pool.next_index = 0;
-        }
+        pool.remove(target);
     }
 }
 
@@ -7085,7 +7067,7 @@ impl ShadowsocksOutbound {
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<ShadowsocksUdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len() < UDP_SESSION_POOL_SIZE {
             let server = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
             let bind_addr = match server {
                 SocketAddr::V4(_) => "0.0.0.0:0",
@@ -7104,13 +7086,11 @@ impl ShadowsocksOutbound {
                 server,
                 ss2022,
             }));
-            pool.sessions.push(session.clone());
-            pool.next_index = pool.sessions.len() % UDP_SESSION_POOL_SIZE;
+            pool.push(session.clone());
             return Ok(session);
         }
-        let index = pool.next_index % pool.sessions.len();
-        pool.next_index = (pool.next_index + 1) % pool.sessions.len();
-        Ok(pool.sessions[index].clone())
+        pool.next()
+            .ok_or_else(|| anyhow!("shadowsocks UDP session pool is unexpectedly empty"))
     }
 
     async fn remove_shadowsocks_udp_session(
@@ -7118,35 +7098,8 @@ impl ShadowsocksOutbound {
         target: &Arc<TokioMutex<ShadowsocksUdpSession>>,
     ) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.sessions
-            .retain(|session| !Arc::ptr_eq(session, target));
-        if !pool.sessions.is_empty() {
-            pool.next_index %= pool.sessions.len();
-        } else {
-            pool.next_index = 0;
-        }
+        pool.remove(target);
     }
-}
-
-async fn connect_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<TcpStream> {
-    timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr))
-        .await
-        .context("tcp connect timed out")?
-        .with_context(|| format!("failed to connect {addr}"))
-}
-
-async fn resolve_udp_socket_addr(
-    host: &str,
-    port: u16,
-    timeout_ms: u64,
-) -> anyhow::Result<SocketAddr> {
-    let mut resolved = timeout(Duration::from_millis(timeout_ms), lookup_host((host, port)))
-        .await
-        .context("udp target resolve timed out")?
-        .with_context(|| format!("failed to resolve udp target {host}:{port}"))?;
-    resolved
-        .next()
-        .ok_or_else(|| anyhow!("udp target {host}:{port} resolved to no addresses"))
 }
 
 fn destination_socket_addr(destination: &Destination) -> String {
@@ -7155,24 +7108,6 @@ fn destination_socket_addr(destination: &Destination) -> String {
     } else {
         destination.authority()
     }
-}
-
-fn tls_client_config(skip_cert_verify: bool) -> anyhow::Result<ClientConfig> {
-    let provider = aws_lc_rs::default_provider();
-    let builder = ClientConfig::builder_with_provider(provider.into())
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?;
-    let mut config = if skip_cert_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
-    } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
-    config.alpn_protocols.clear();
-    Ok(config)
 }
 
 fn reality_tls_client_config(
@@ -9215,54 +9150,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
     output
-}
-
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-        ]
-    }
 }
 
 async fn authenticate_socks5(
@@ -12109,6 +11996,61 @@ mod tests {
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use tokio::net::TcpListener;
     use tokio_rustls::TlsAcceptor;
+
+    struct ContextRecordingOutbound {
+        trace_id: Arc<StdMutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl Outbound for ContextRecordingOutbound {
+        fn name(&self) -> &str {
+            "context-recorder"
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+
+        async fn connect(
+            &self,
+            _destination: &Destination,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<BoxedStream> {
+            let (stream, peer) = tokio::io::duplex(64);
+            drop(peer);
+            Ok(Box::new(stream))
+        }
+
+        async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
+            *self.trace_id.lock().expect("trace lock") = Some(context.trace_id.clone());
+            self.connect(&context.destination, context.timeout_ms())
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn group_propagates_dial_context_to_selected_member() {
+        let recorded = Arc::new(StdMutex::new(None));
+        let member: Arc<dyn Outbound> = Arc::new(ContextRecordingOutbound {
+            trace_id: Arc::clone(&recorded),
+        });
+        let group = GroupOutbound {
+            name: "group".to_string(),
+            kind: "select".to_string(),
+            members: vec![member],
+            telemetry: None,
+        };
+        let context = DialContext::new(Destination::new("example.com", 443), 500);
+        let expected = context.trace_id.clone();
+        group
+            .connect_context(&context)
+            .await
+            .expect("group connect");
+        assert_eq!(
+            recorded.lock().expect("trace lock").as_deref(),
+            Some(expected.as_str())
+        );
+    }
 
     #[tokio::test]
     async fn shadowsocks_outbound_encrypts_tcp_stream() {

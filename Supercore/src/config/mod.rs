@@ -1086,7 +1086,7 @@ fn default_subscription_use_first_node() -> bool {
 }
 
 fn default_subscription_update_on_start() -> bool {
-    true
+    false
 }
 
 fn default_subscription_auto_update() -> bool {

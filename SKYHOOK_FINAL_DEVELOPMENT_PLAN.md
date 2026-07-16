@@ -15,7 +15,12 @@
   - 测速 runtime、Fake-IP filter、系统 DNS resolver、TUN 配置校验和 SSR/Snell 扩展均已进入统一回归。
   - 当前目录已建立独立 Git 工作区，可回滚基线提交为 `a8a55e0`。
 - M1：`IN_PROGRESS`
-  - WS、gRPC、H2、HTTPUpgrade 已形成可复用传输函数。
+  - TCP/TLS、UDP resolver/session pool、DialContext、结构化 OutboundError 已开始拆分。
+  - Swift 已全部迁移到独立 `/v1` API；旧根路径与 `/supercore/*` 入口已删除。
+  - 控制 API 仅监听 loopback，写请求使用启动级 Bearer Token，错误响应包含稳定
+    code/kind/trace id。
+  - `supercore run` 不再在启动时下载订阅，定时测速首次执行等待完整配置间隔。
+  - 当前回归：Rust lib 78 passed、Swift full 91 passed。
   - `outbound/mod.rs` 尚未完成模块拆分。
 - M2：`VERIFIED`
   - VMess gRPC、H2、UDP 的 3 个 ignored 测试已取消 ignore。
