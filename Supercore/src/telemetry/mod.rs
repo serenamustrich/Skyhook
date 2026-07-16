@@ -4,15 +4,19 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex as StdMutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio::sync::RwLock;
+use serde_json::Value;
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 use crate::routing::Destination;
+
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
+const LIVE_EVENT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ConnectionRecord {
@@ -42,7 +46,7 @@ pub struct LogEvent {
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct TrafficSnapshot {
     pub upload_total: u64,
     pub download_total: u64,
@@ -50,6 +54,15 @@ pub struct TrafficSnapshot {
     pub upload_rate: u64,
     pub download_rate: u64,
     pub total_rate: u64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TelemetryEvent {
+    pub schema_version: u8,
+    pub id: String,
+    pub event: String,
+    pub timestamp: DateTime<Utc>,
+    pub data: Value,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -73,6 +86,8 @@ pub struct Telemetry {
     connections: RwLock<Vec<ConnectionRecord>>,
     logs: RwLock<VecDeque<LogEvent>>,
     outbound_health: RwLock<HashMap<String, OutboundHealth>>,
+    events: broadcast::Sender<TelemetryEvent>,
+    event_throttle: StdMutex<EventThrottleState>,
 }
 
 #[derive(Debug)]
@@ -84,8 +99,15 @@ struct TrafficRateState {
     download_rate: u64,
 }
 
+#[derive(Debug)]
+struct EventThrottleState {
+    last_traffic: Instant,
+    connection_updates: HashMap<Uuid, Instant>,
+}
+
 impl Default for Telemetry {
     fn default() -> Self {
+        let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             upload_total: AtomicU64::new(0),
             download_total: AtomicU64::new(0),
@@ -99,6 +121,11 @@ impl Default for Telemetry {
             connections: RwLock::new(Vec::new()),
             logs: RwLock::new(VecDeque::new()),
             outbound_health: RwLock::new(HashMap::new()),
+            events,
+            event_throttle: StdMutex::new(EventThrottleState {
+                last_traffic: Instant::now() - LIVE_EVENT_INTERVAL,
+                connection_updates: HashMap::new(),
+            }),
         }
     }
 }
@@ -113,7 +140,7 @@ impl Telemetry {
         matched_rule: Option<String>,
     ) -> Uuid {
         let id = Uuid::new_v4();
-        self.connections.write().await.push(ConnectionRecord {
+        let record = ConnectionRecord {
             id,
             inbound: inbound.into(),
             destination,
@@ -124,7 +151,9 @@ impl Telemetry {
             downloaded: 0,
             started_at: Utc::now(),
             closed_at: None,
-        });
+        };
+        self.connections.write().await.push(record.clone());
+        self.publish_serializable("connection_opened", &record);
         id
     }
 
@@ -135,10 +164,25 @@ impl Telemetry {
         if downloaded > 0 {
             self.download_total.fetch_add(downloaded, Ordering::Relaxed);
         }
-        let mut connections = self.connections.write().await;
-        if let Some(record) = connections.iter_mut().find(|item| item.id == id) {
-            record.uploaded = record.uploaded.saturating_add(uploaded);
-            record.downloaded = record.downloaded.saturating_add(downloaded);
+        let updated = {
+            let mut connections = self.connections.write().await;
+            connections
+                .iter_mut()
+                .find(|item| item.id == id)
+                .map(|record| {
+                    record.uploaded = record.uploaded.saturating_add(uploaded);
+                    record.downloaded = record.downloaded.saturating_add(downloaded);
+                    record.clone()
+                })
+        };
+        let (publish_connection, publish_traffic) = self.live_event_decision(id);
+        if publish_connection {
+            if let Some(record) = updated {
+                self.publish_serializable("connection_updated", &record);
+            }
+        }
+        if publish_traffic {
+            self.publish_serializable("traffic_sample", &self.traffic());
         }
     }
 
@@ -155,19 +199,28 @@ impl Telemetry {
                 .map(|time| time > remove_before)
                 .unwrap_or(true)
         });
+        if let Ok(mut throttle) = self.event_throttle.lock() {
+            throttle.connection_updates.remove(&id);
+        }
+        if let Some(record) = closed.as_ref() {
+            self.publish_serializable("connection_closed", record);
+        }
         closed
     }
 
     pub async fn log(&self, level: impl Into<String>, message: impl Into<String>) {
-        let mut logs = self.logs.write().await;
-        logs.push_back(LogEvent {
+        let event = LogEvent {
             time: Utc::now(),
             level: level.into(),
             message: message.into(),
-        });
+        };
+        let mut logs = self.logs.write().await;
+        logs.push_back(event.clone());
         while logs.len() > 1000 {
             logs.pop_front();
         }
+        drop(logs);
+        self.publish_serializable("log_appended", &event);
     }
 
     pub async fn record_outbound_result(
@@ -179,32 +232,36 @@ impl Telemetry {
         error: Option<String>,
     ) {
         let name = name.into();
-        let mut health = self.outbound_health.write().await;
-        let item = health
-            .entry(name.clone())
-            .or_insert_with(|| OutboundHealth {
-                name,
-                kind: kind.into(),
-                attempts: 0,
-                successes: 0,
-                failures: 0,
-                last_latency_ms: None,
-                last_error: None,
-                score: 100,
-                updated_at: Utc::now(),
-            });
-        item.attempts = item.attempts.saturating_add(1);
-        if success {
-            item.successes = item.successes.saturating_add(1);
-            item.last_error = None;
-            item.last_latency_ms = latency_ms;
-        } else {
-            item.failures = item.failures.saturating_add(1);
-            item.last_error = error;
-            item.last_latency_ms = latency_ms;
-        }
-        item.score = outbound_score(item.successes, item.failures, item.last_latency_ms);
-        item.updated_at = Utc::now();
+        let updated = {
+            let mut health = self.outbound_health.write().await;
+            let item = health
+                .entry(name.clone())
+                .or_insert_with(|| OutboundHealth {
+                    name,
+                    kind: kind.into(),
+                    attempts: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_latency_ms: None,
+                    last_error: None,
+                    score: 100,
+                    updated_at: Utc::now(),
+                });
+            item.attempts = item.attempts.saturating_add(1);
+            if success {
+                item.successes = item.successes.saturating_add(1);
+                item.last_error = None;
+                item.last_latency_ms = latency_ms;
+            } else {
+                item.failures = item.failures.saturating_add(1);
+                item.last_error = error;
+                item.last_latency_ms = latency_ms;
+            }
+            item.score = outbound_score(item.successes, item.failures, item.last_latency_ms);
+            item.updated_at = Utc::now();
+            item.clone()
+        };
+        self.publish_serializable("outbound_health_updated", &updated);
     }
 
     pub fn traffic(&self) -> TrafficSnapshot {
@@ -257,6 +314,52 @@ impl Telemetry {
         items.sort_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
         items
     }
+
+    pub fn subscribe_events(&self) -> broadcast::Receiver<TelemetryEvent> {
+        self.events.subscribe()
+    }
+
+    pub fn publish_event(&self, event: impl Into<String>, data: Value) {
+        let _ = self.events.send(TelemetryEvent {
+            schema_version: 1,
+            id: Uuid::new_v4().to_string(),
+            event: event.into(),
+            timestamp: Utc::now(),
+            data,
+        });
+    }
+
+    fn publish_serializable(&self, event: &str, data: &impl Serialize) {
+        match serde_json::to_value(data) {
+            Ok(data) => self.publish_event(event, data),
+            Err(error) => self.publish_event(
+                "event_serialization_failed",
+                serde_json::json!({
+                    "source_event": event,
+                    "message": error.to_string(),
+                }),
+            ),
+        }
+    }
+
+    fn live_event_decision(&self, id: Uuid) -> (bool, bool) {
+        let Ok(mut throttle) = self.event_throttle.lock() else {
+            return (false, false);
+        };
+        let now = Instant::now();
+        let publish_connection = throttle
+            .connection_updates
+            .get(&id)
+            .is_none_or(|last| now.duration_since(*last) >= LIVE_EVENT_INTERVAL);
+        if publish_connection {
+            throttle.connection_updates.insert(id, now);
+        }
+        let publish_traffic = now.duration_since(throttle.last_traffic) >= LIVE_EVENT_INTERVAL;
+        if publish_traffic {
+            throttle.last_traffic = now;
+        }
+        (publish_connection, publish_traffic)
+    }
 }
 
 fn outbound_score(successes: u64, failures: u64, latency_ms: Option<u64>) -> u8 {
@@ -269,4 +372,59 @@ fn outbound_score(successes: u64, failures: u64, latency_ms: Option<u64>) -> u8 
         .map(|latency| (latency.saturating_sub(50).min(950) as f64 / 950.0) * 30.0)
         .unwrap_or(0.0);
     ((success_rate * 100.0 - latency_penalty).clamp(0.0, 100.0)).round() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::routing::Destination;
+
+    use super::Telemetry;
+
+    #[tokio::test]
+    async fn publishes_connection_traffic_log_and_close_events() {
+        let telemetry = Telemetry::default();
+        let mut events = telemetry.subscribe_events();
+        let id = telemetry
+            .open_connection(
+                "mixed",
+                Destination::new("example.com", 443),
+                "proxy",
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(events.recv().await.unwrap().event, "connection_opened");
+
+        telemetry.add_transfer(id, 64, 128).await;
+        assert_eq!(events.recv().await.unwrap().event, "connection_updated");
+        assert_eq!(events.recv().await.unwrap().event, "traffic_sample");
+
+        telemetry.log("info", "connected").await;
+        assert_eq!(events.recv().await.unwrap().event, "log_appended");
+
+        telemetry.close_connection(id).await.unwrap();
+        assert_eq!(events.recv().await.unwrap().event, "connection_closed");
+    }
+
+    #[tokio::test]
+    async fn live_transfer_events_are_throttled() {
+        let telemetry = Telemetry::default();
+        let mut events = telemetry.subscribe_events();
+        let id = telemetry
+            .open_connection(
+                "mixed",
+                Destination::new("example.com", 443),
+                "proxy",
+                None,
+                None,
+            )
+            .await;
+        let _ = events.recv().await.unwrap();
+
+        telemetry.add_transfer(id, 1, 0).await;
+        let _ = events.recv().await.unwrap();
+        let _ = events.recv().await.unwrap();
+        telemetry.add_transfer(id, 1, 0).await;
+        assert!(events.try_recv().is_err());
+    }
 }

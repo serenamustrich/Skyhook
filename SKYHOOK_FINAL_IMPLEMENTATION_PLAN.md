@@ -159,8 +159,19 @@
 - Rust lib：87 passed、0 failed、0 ignored。
 - Swift full：93 passed、0 failed。
 
-当前 `/v1/events` 只推送 task 事件。流量、日志、连接、订阅和运行状态事件仍需接入
-统一 telemetry event bus，因此 M0 继续保持 `IN_PROGRESS`，不提前标记 `VERIFIED`。
+后续提交已将 Rust lib 基线提升为 90 passed，并完成统一 telemetry event bus：
+
+- task。
+- probe progress。
+- status。
+- subscription。
+- connection opened/updated/closed。
+- traffic sample。
+- log。
+- outbound health。
+
+高频连接/流量事件按 250ms 节流，事件通道有界。Swift SSE 自动重连/快照恢复以及
+Provider、Geo、TUN、Doctor 长任务迁移仍未完成，因此 M0 继续保持 `IN_PROGRESS`。
 
 ### 5.3 当前结构债务
 

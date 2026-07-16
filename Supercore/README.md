@@ -172,9 +172,10 @@ Full and group probes, subscription imports, and update-all requests return HTTP
 `task_id`. Clients read `/v1/tasks/{id}` for bounded progress, structured failures, and results, or
 cancel the underlying operation through `/v1/tasks/{id}/cancel`. Terminal task records are retained
 for up to 24 hours with a default maximum of 512 records, without evicting active work.
-`/v1/events` currently streams versioned task updates over SSE with event IDs and timestamps. The
-same event surface will carry traffic, connection, and log events after the telemetry event bus is
-completed.
+`/v1/events` streams versioned task, probe progress, runtime status, subscription, connection,
+traffic, log, and outbound-health events over SSE with event IDs and timestamps. Live connection
+updates and traffic samples are throttled to a 250ms interval, and the bounded event channel never
+blocks the proxy data plane on a slow consumer.
 
 `POST /v1/probes` accepts an optional JSON body:
 

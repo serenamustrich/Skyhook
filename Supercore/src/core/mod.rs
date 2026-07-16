@@ -153,6 +153,15 @@ impl Runtime {
             .state
             .write()
             .map_err(|_| anyhow!("runtime state lock poisoned"))? = state;
+        self.telemetry.publish_event(
+            "status_changed",
+            serde_json::json!({
+                "summary": config.summary(),
+                "default_outbound": config.core.default_outbound,
+                "outbounds": config.outbounds.len(),
+                "rules": config.rules.len(),
+            }),
+        );
         Ok(config)
     }
 

@@ -493,33 +493,86 @@ async fn cancel_task(State(tasks): State<TaskManager>, AxumPath(id): AxumPath<St
 }
 
 async fn task_events(
-    State(tasks): State<TaskManager>,
+    State(state): State<ApiState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(tasks.subscribe()).filter_map(|item| match item {
+    let task_stream = BroadcastStream::new(state.tasks.subscribe()).map(|item| match item {
         Ok(event) => {
             let id = event.id.clone();
             let name = event.event;
             serde_json::to_string(&event)
                 .ok()
-                .map(|data| Ok(Event::default().id(id).event(name).data(data)))
+                .map(|data| Event::default().id(id).event(name).data(data))
+                .map(Ok)
+                .unwrap_or_else(|| serialization_error_event("task_updated"))
         }
-        Err(error) => {
-            let id = uuid::Uuid::new_v4().to_string();
-            Some(Ok(Event::default().id(id).event("lagged").data(
-                serde_json::json!({
-                    "schema_version": 1,
-                    "timestamp": chrono::Utc::now(),
-                    "message": error.to_string(),
-                })
-                .to_string(),
-            )))
-        }
+        Err(error) => lagged_event("tasks", error),
     });
+    let telemetry_stream =
+        BroadcastStream::new(state.runtime.telemetry().subscribe_events()).map(|item| match item {
+            Ok(event) => {
+                let id = event.id.clone();
+                let name = event.event.clone();
+                serde_json::to_string(&event)
+                    .ok()
+                    .map(|data| Event::default().id(id).event(name).data(data))
+                    .map(Ok)
+                    .unwrap_or_else(|| serialization_error_event("telemetry"))
+            }
+            Err(error) => lagged_event("telemetry", error),
+        });
+    let stream = task_stream.merge(telemetry_stream);
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     )
+}
+
+fn lagged_event(source: &str, error: impl std::fmt::Display) -> Result<Event, Infallible> {
+    let id = uuid::Uuid::new_v4().to_string();
+    Ok(Event::default().id(id).event("lagged").data(
+        serde_json::json!({
+            "schema_version": 1,
+            "timestamp": chrono::Utc::now(),
+            "source": source,
+            "message": error.to_string(),
+        })
+        .to_string(),
+    ))
+}
+
+fn serialization_error_event(source: &str) -> Result<Event, Infallible> {
+    let id = uuid::Uuid::new_v4().to_string();
+    Ok(Event::default().id(id).event("serialization_error").data(
+        serde_json::json!({
+            "schema_version": 1,
+            "timestamp": chrono::Utc::now(),
+            "source": source,
+        })
+        .to_string(),
+    ))
+}
+
+fn publish_probe_progress_event(runtime: &Runtime, task_id: &str, progress: &ProbeProgress) {
+    runtime.telemetry().publish_event(
+        "probe_progress",
+        serde_json::json!({
+            "task_id": task_id,
+            "completed": progress.completed,
+            "total": progress.total,
+            "node": progress.name,
+        }),
+    );
+}
+
+fn publish_subscription_event(runtime: &Runtime, kind: &str, data: serde_json::Value) {
+    runtime.telemetry().publish_event(
+        "subscription_updated",
+        serde_json::json!({
+            "kind": kind,
+            "data": data,
+        }),
+    );
 }
 
 async fn version() -> Json<VersionResponse> {
@@ -700,8 +753,10 @@ async fn probe_outbounds(
             tokio::sync::mpsc::unbounded_channel::<ProbeProgress>();
         let progress_tasks = tasks.clone();
         let progress_task_id = task_id.clone();
+        let progress_runtime = runtime.clone();
         let progress_handle = tokio::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
+                publish_probe_progress_event(&progress_runtime, &progress_task_id, &progress);
                 progress_tasks
                     .progress(
                         &progress_task_id,
@@ -767,8 +822,10 @@ async fn probe_group_body(
             tokio::sync::mpsc::unbounded_channel::<ProbeProgress>();
         let progress_tasks = tasks.clone();
         let progress_task_id = task_id.clone();
+        let progress_runtime = runtime.clone();
         let progress_handle = tokio::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
+                publish_probe_progress_event(&progress_runtime, &progress_task_id, &progress);
                 progress_tasks
                     .progress(
                         &progress_task_id,
@@ -940,6 +997,13 @@ async fn import_subscription(
             result = operation => {
                 match result {
                     Ok(result) => {
+                        publish_subscription_event(
+                            &runtime,
+                            "import",
+                            serde_json::json!({
+                                "active_changed": result["result"]["active_changed"],
+                            }),
+                        );
                         tasks.progress(&task_id, 1, Some(1), "saving subscription").await;
                         tasks.succeed(&task_id, result).await;
                     }
@@ -1037,6 +1101,14 @@ async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
             result = operation => {
                 match result {
                     Ok(result) => {
+                        publish_subscription_event(
+                            &runtime,
+                            "update_all",
+                            serde_json::json!({
+                                "count": total,
+                                "reloaded": result["runtime"]["reloaded"],
+                            }),
+                        );
                         tasks.progress(
                             &task_id,
                             total,
@@ -1516,6 +1588,39 @@ mod tests {
             tasks.get(&record.id).await.unwrap().status,
             tasks::TaskStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn event_stream_forwards_versioned_telemetry_events() {
+        let runtime = Arc::new(Runtime::new(SuperConfig::default()).unwrap());
+        let app = build_router(
+            runtime.clone(),
+            ControlAuthState {
+                token: Some(Arc::from("0123456789abcdef0123456789abcdef")),
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut stream = response.into_body().into_data_stream();
+
+        runtime.telemetry().log("info", "event test").await;
+        let chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("SSE should produce a telemetry event")
+            .expect("SSE stream should stay open")
+            .expect("SSE event body should be readable");
+        let text = String::from_utf8(chunk.to_vec()).unwrap();
+        assert!(text.contains("event: log_appended"));
+        assert!(text.contains("id:"));
+        assert!(text.contains("\"schema_version\":1"));
+        assert!(text.contains("\"message\":\"event test\""));
     }
 
     #[test]

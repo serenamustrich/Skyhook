@@ -33,9 +33,12 @@
   进度。
 - TaskManager 终态默认保留 24 小时、最多 512 条，活跃任务不被清理；invalid probe
   URL 也会为每个 requested node 返回真实终态，不再遗漏未找到节点。
-- 本批次回归：Rust lib 87 passed、Swift full 93 passed。`/v1/events` 当前只推送
-  task 事件；流量、日志、连接和运行状态事件仍待统一 telemetry event bus，不能
-  标记完整事件面已完成。
+- 本批次回归：Rust lib 90 passed、Swift full 93 passed。统一 telemetry event bus
+  已接入 task、测速进度、运行状态、订阅更新、连接、流量、日志和节点健康事件，
+  高频连接/流量事件按 250ms 节流。
+- Swift 目前仍以 task polling 读取长任务结果，尚未接入 SSE 自动重连和快照恢复；
+  Provider、Geo、TUN 和深度 Doctor 等长任务也尚未全部迁移，因此 M0 继续保持
+  `IN_PROGRESS`。
 
 ## 0. 开发总原则
 
