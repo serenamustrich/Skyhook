@@ -128,6 +128,7 @@ is passed.
 
 - `GET /health`
 - `GET /v1/version`
+- `GET /v1/schema`
 - `GET /v1/status`
 - `GET /v1/connections`
 - `GET /v1/outbounds`
@@ -175,6 +176,9 @@ The control listener is restricted to loopback addresses. `GET`, `HEAD`, and `OP
 read-only operations. Every write request must send `Authorization: Bearer <token>`. The macOS App
 generates a fresh 256-bit token for each user-mode core process. The TUN LaunchDaemon reads its
 token from a root-owned `0600` file; the token is never embedded in the launchd plist.
+`GET /v1/schema` exposes the current OpenAPI 3.1 control-plane contract. A compatibility test
+checks every declared operation against the registered route paths so route-domain refactors cannot
+silently remove an endpoint.
 
 Full and group probes, subscription imports, single/all subscription updates, provider updates,
 Geo updates, deep Doctor runs, and diagnostic exports return HTTP `202` with a `task_id` and

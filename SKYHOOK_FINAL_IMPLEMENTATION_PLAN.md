@@ -8,7 +8,11 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 执行方式：本计划由 Codex 直接实施，不作为交接说明，不依赖 Mihomo 二进制、双核心或运行时兼容回退。
+> 计划版本：v1.1（按 2026-07-17 当前工作区重新核对）
+>
+> 执行者：Codex 直接开发、验证、提交和发布，不交接给其他模型或开发者。
+>
+> 执行方式：本计划不是交接说明；Skyhook 独立演进，不依赖 Mihomo 二进制、双核心或运行时兼容回退。
 
 ## 1. 文档地位
 
@@ -19,6 +23,7 @@
 3. “完成”只按本文档的固定范围和验收门判断，不因后续重复讨论而临时增加完成条件。
 4. 本计划全部达到 `VERIFIED` 后，当前版本即视为开发完成；之后提出的新平台、新协议或新产品功能进入下一版本。
 5. README 只描述已经交付的功能，不写开发过程、剩余计划和未经验证的能力。
+6. 当前回合只冻结计划，不继续修改业务代码；用户确认继续开发后，从本文档记录的当前断点直接接续。
 
 ## 2. 最终产品定义
 
@@ -189,10 +194,13 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 - `Supercore/src/outbound/mod.rs`：约 12,446 行。
 - `Supercore/src/core/mod.rs`：约 2,234 行。
-- `Supercore/src/api/mod.rs`：约 1,938 行；鉴权、错误、schema、SSE、路由表和测速
-  handler 已迁出，订阅、Provider、系统和规则 handler 仍待拆分。
+- `Supercore/src/api/mod.rs`：当前约 732 行，其中生产装配代码约 75 行，其余为现有
+  API 回归测试；所有业务 handler 已迁出。
+- `Supercore/src/api/routes/`：当前已有 `probes.rs`、`providers.rs`、
+  `routing.rs`、`subscriptions.rs`、`system.rs`、`tasks.rs`，路由按领域拆分完成。
 - `AppState.swift`：约 3,046 行。
 - `SettingsWindow.swift`：约 1,614 行。
+- `SupercoreAPIClient.swift`：约 1,264 行。
 - 协议实现仍大量集中在 `outbound/mod.rs`。
 - API、核心协调和 UI 状态职责仍过度集中。
 - 当前代码中 Hysteria v1、Mieru、Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
@@ -226,18 +234,37 @@ M1 第一批已完成：
 - `api/routes/probes.rs`：全部/代理组测速 handler、组展开和失败汇总。
 - Rust lib 92 passed、0 failed；M1 继续保持 `IN_PROGRESS`。
 
+M1 第二批已实现并验证，等待本批提交：
+
+- 新增：
+  - `api/routes/subscriptions.rs`
+  - `api/routes/providers.rs`
+  - `api/routes/tasks.rs`
+  - `api/routes/system.rs`
+  - `api/routes/routing.rs`
+- `api/routes/mod.rs` 已接入全部领域路由。
+- `api/mod.rs` 已删除业务 handler 和重复 system handler，只保留服务装配、state 和测试。
+- `GET /v1/schema` 已提供 OpenAPI 3.1 控制面文档。
+- schema compatibility test 覆盖全部声明路径与 router 注册路径。
+- `cargo check --lib`：通过且无 warning。
+- Rust lib：93 passed、0 failed、0 ignored。
+- 本批在创建独立提交前仍属于工作区修改；提交完成后进入 Core 拆分。
+
 ### 5.5 当前直接执行队列
 
-接下来由 Codex 严格按以下顺序直接开发，不交接给其他开发者或模型：
+接下来由 Codex 严格按以下顺序直接开发：
 
-1. 进入 M1，依次拆分 API、Core、Outbound，并统一错误、DialContext、transport、UDP 和 cancellation。
-2. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
-3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
-4. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、日志和 Doctor。
-5. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
-6. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
+1. 提交已经验证的 API 路由域拆分。
+2. 继续 M1：依次拆分 Core、Outbound，并统一错误、DialContext、transport、UDP 和
+   cancellation。
+3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
+4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
+5. 按 M6-M9 完成独立测速、自动择优、多订阅、Provider、代理组、智能规则、流量、
+   日志和 Doctor。
+6. 按 M10-M11 完成 App 架构、最终 UI、性能、安全、CI 和开源治理。
+7. 按 M12 完成真实订阅验收、长稳、签名、公证、DMG 和 GitHub Release。
 
-在第 6 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
+在第 7 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
 
 ## 6. 不可违反的开发规则
 
@@ -391,6 +418,27 @@ Sources/YueqiuElevatorSupercore/
 
 M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过公共 transport、错误和取消基础。M10 不在 API schema 稳定前进行大规模页面绑定。
 
+### 8.1 当前断点后的首批提交顺序
+
+恢复开发后，先完成以下连续批次：
+
+1. [x] `Core: split control API route domains`
+   - 新增 `routes/routing.rs`，迁移节点、代理组、国家、规则和智能规则 handler。
+   - 删除 `api/mod.rs` 中已经迁移到 `system.rs` 的重复 handler。
+   - `api/mod.rs` 最终只保留模块声明、`ApiState`、`serve`、router 组合和测试入口。
+   - 清理无用 import，执行 API 定向测试和 Rust lib 回归。
+2. [ ] `Core: modularize runtime lifecycle and selection`
+   - 拆分 runtime、reload、selection、probe、background jobs 和 subscription merge。
+   - reload 改为构建、校验、原子替换；失败继续使用旧 runtime。
+3. [ ] `Core: modularize outbound protocol registry`
+   - 先迁移 registry、capability、target、公共模型和错误，再逐协议迁移。
+   - 不在同一个提交中同时重写协议 wire format。
+4. [ ] `Network: complete shared TCP TLS transports and UDP`
+   - 完成 cancellation、deadline、Happy Eyeballs、TLS、transport 和 UDP session 基础。
+   - 到此才允许进入 M2/M3 的协议补齐。
+
+这四批全部通过 M1 验收门后，M1 才能从 `IN_PROGRESS` 变为 `VERIFIED`。
+
 ## 9. M0：收口当前 task/SSE 工作区
 
 状态：`VERIFIED`
@@ -491,8 +539,14 @@ M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 
 ### 10.1 API 拆分
 
-当前进度：auth、error、schema、events、路由表和 probes 路由已拆出；下一批迁移
-subscriptions、providers、system、rules 和 telemetry handler。
+当前进度：
+
+- 已提交：auth、error、schema 基础、events、路由表和 probes。
+- 已实现并验证：subscriptions、providers、tasks、system、routing/selection、
+  smart-rules 路由拆分，重复 handler/import 清理，OpenAPI 3.1 endpoint 和 schema
+  compatibility test。
+- 当前结构批次验证：Rust lib 93 passed、`cargo check --lib` 无 warning。
+- M1 API 剩余功能门：读接口分页/过滤/稳定排序的统一约定，以及 API state 边界复核。
 
 - 从 `api/mod.rs` 拆出：
   - auth
