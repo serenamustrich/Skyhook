@@ -1,4 +1,4 @@
-# Skyhook（玥球核心）最终版直接开发计划
+# Skyhook（玥球核心）最终版完整开发计划
 
 > 项目根目录：`/Users/chency/Downloads/clash/YueqiuElevatorSupercore`
 >
@@ -8,11 +8,12 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.1（按 2026-07-17 当前工作区重新核对）
+> 计划版本：v1.2（按 2026-07-17 `bf0fb62` 当前工作区重新核对）
 >
-> 执行者：Codex 直接开发、验证、提交和发布，不交接给其他模型或开发者。
+> 当前文档状态：`PLAN_FROZEN`。本轮只列计划，不继续修改核心或 App 业务代码。
 >
-> 执行方式：本计划不是交接说明；Skyhook 独立演进，不依赖 Mihomo 二进制、双核心或运行时兼容回退。
+> 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
+> 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
 
 ## 1. 文档地位
 
@@ -23,7 +24,8 @@
 3. “完成”只按本文档的固定范围和验收门判断，不因后续重复讨论而临时增加完成条件。
 4. 本计划全部达到 `VERIFIED` 后，当前版本即视为开发完成；之后提出的新平台、新协议或新产品功能进入下一版本。
 5. README 只描述已经交付的功能，不写开发过程、剩余计划和未经验证的能力。
-6. 当前回合只冻结计划，不继续修改业务代码；用户确认继续开发后，从本文档记录的当前断点直接接续。
+6. 当前回合只冻结计划，不继续修改业务代码；后续收到继续开发指令后，从本文档记录的
+   `NEXT-001` 直接接续。
 
 ## 2. 最终产品定义
 
@@ -137,6 +139,11 @@
 - `a14623b Document the final Skyhook execution plan`
 - `422579e Stream unified control telemetry events`
 - `76bf497 Drive the macOS client from control events`
+- `d22c2f6 Control: migrate remaining long operations to tasks`
+- `b0ea7a1 Core: modularize control API foundations`
+- `9585296 Core: split control API route domains`
+- `5c4dd89 Core: modularize runtime lifecycle and selection`
+- `bf0fb62 Core: make outbound capabilities explicit`
 
 已经完成的基础：
 
@@ -192,12 +199,13 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 
 ### 5.3 当前结构债务
 
-- `Supercore/src/outbound/mod.rs`：当前约 11,790 行；公共 trait、factory、错误上下文、
-  SSH 和 WireGuard 已迁出，其余协议实现继续拆分。
-- `Supercore/src/core/mod.rs`：当前 17 行，只保留模块声明和公共导出；运行时职责已迁移
-  到 `capability.rs`、`connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、
-  `reload.rs`、`runtime.rs`、`selection.rs` 和 `subscription.rs`。
-- `Supercore/src/api/mod.rs`：当前约 732 行，其中生产装配代码约 75 行，其余为现有
+- `Supercore/src/outbound/mod.rs`：当前约 10,646 行；公共 trait、factory、错误上下文、
+  target、SOCKS5、AnyTLS、ShadowTLS、SSH 和 WireGuard 已迁出，其余协议实现继续拆分。
+- `Supercore/src/core/mod.rs`：当前 16 行，只保留模块声明和公共导出；运行时职责已迁移
+  到 `connection.rs`、`dns.rs`、`lifecycle.rs`、`probe.rs`、`reload.rs`、
+  `runtime.rs`、`selection.rs` 和 `subscription.rs`。协议能力由 Outbound 实现显式声明，
+  已删除核心侧按协议名推断的 `capability.rs`。
+- `Supercore/src/api/mod.rs`：当前约 737 行，其中生产装配代码约 75 行，其余为现有
   API 回归测试；所有业务 handler 已迁出。
 - `Supercore/src/api/routes/`：当前已有 `probes.rs`、`providers.rs`、
   `routing.rs`、`subscriptions.rs`、`system.rs`、`tasks.rs`，路由按领域拆分完成。
@@ -253,9 +261,9 @@ M1 API 第二批已提交：
 - Rust lib：93 passed、0 failed、0 ignored。
 - 提交：`9585296 Core: split control API route domains`。
 
-M1 Core 拆分已实现并验证，等待本批提交：
+M1 Core 拆分已实现、验证并提交：
 
-- `core/mod.rs` 从约 2,234 行缩减为 17 行公共入口。
+- `core/mod.rs` 从约 2,234 行缩减为 16 行公共入口。
 - 拆分 runtime state、lifecycle、reload、subscription merge、selection、capability、
   probe、connection relay 和 DNS exchange。
 - reload 在构建和校验新 state 成功后才替换当前 state；失败保留旧 runtime。
@@ -272,8 +280,9 @@ M1 Core 拆分已实现并验证，等待本批提交：
 - Rust lib：95 passed、0 failed、0 ignored。
 - `config_and_runtime`：20 passed。
 - `plan_behavior`：21 passed。
+- 提交：`5c4dd89 Core: modularize runtime lifecycle and selection`。
 
-M1 Outbound 第一批已实现，等待本批提交：
+M1 Outbound 第一批已实现、验证并提交：
 
 - `outbound/traits.rs`：`Outbound`、`ProxyStream`、`OutboundMap` 和显式能力模型。
 - `outbound/factory.rs`：leaf 构造分派和代理组装配入口。
@@ -285,16 +294,51 @@ M1 Outbound 第一批已实现，等待本批提交：
 - Runtime capability 汇总直接读取实现声明，删除核心侧协议名能力推断矩阵。
 - SSH 和 WireGuard 已迁入独立协议模块。
 - `cargo check --all-targets`：通过且无 warning。
+- Rust lib：97 passed、0 failed、0 ignored。
 - `config_and_runtime`：20 passed。
 - `remaining_protocols`：29 passed。
+- 提交：`bf0fb62 Core: make outbound capabilities explicit`。
 - Outbound 仍为 `IN_PROGRESS`；其余协议迁出和公共 transport/UDP 收口完成前，不关闭 M1。
 
-### 5.5 当前直接执行队列
+### 5.5 本次计划审计结论
 
-接下来由 Codex 严格按以下顺序直接开发：
+2026-07-17 在 `bf0fb62` 上重新核对：
 
-1. 提交已经验证的 Core runtime/lifecycle/selection 拆分。
-2. 继续 M1：拆分 Outbound，并统一错误、DialContext、transport、UDP 和
+- 工作区干净，`main` 没有未提交业务代码。
+- `outbound/mod.rs` 仍有约 11,790 行。
+- 仍集中在该文件的协议实现：
+  - AnyTLS
+  - ShadowTLS
+  - ShadowsocksR
+  - Snell
+  - SOCKS5
+  - Shadowsocks
+  - Trojan
+  - VMess
+  - VLESS
+  - Hysteria2
+  - TUIC
+- `UnsupportedProtocolOutbound` 仍承载：
+  - Hysteria v1
+  - Mieru
+  - Juicity
+  - MASQUE
+  - OpenVPN
+- API 读接口尚未形成统一分页、过滤、游标和稳定排序模型。
+- 当前 TUN backend 会明确拒绝 `strict_route`、`auto_detect_interface`、
+  `auto_redirect`、GSO、自定义 route/address 和进程过滤等能力，尚不满足最终目标。
+- Swift 三个集中职责文件仍分别约为：
+  - `AppState.swift`：3,046 行。
+  - `SettingsWindow.swift`：1,614 行。
+  - `SupercoreAPIClient.swift`：1,264 行。
+- 因此当前只能确认 M0 为 `VERIFIED`，M1 为 `IN_PROGRESS`，M2-M12 均未达到完成门。
+
+### 5.6 当前直接执行队列
+
+收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
+
+1. 从 `NEXT-001` 开始完成共享目标地址编解码和 SOCKS5 独立模块。
+2. 继续 M1：拆分其余 Outbound，并统一错误、DialContext、transport、UDP 和
    cancellation。
 3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号和互操作证据。
 4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN、权限服务、事务回滚和异常恢复。
@@ -470,13 +514,35 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
    - 拆分 runtime、reload、selection、probe、background jobs 和 subscription merge。
    - reload 改为构建、校验、原子替换；失败继续使用旧 runtime。
 3. [ ] `Core: modularize outbound protocol registry`
-   - 先迁移 registry、capability、target、公共模型和错误，再逐协议迁移。
+   - 已完成 trait、registry/factory 基础、显式 capability、错误上下文、SSH 和
+     WireGuard 迁移。
+   - 剩余先迁移 target 和 SOCKS5，再按公共依赖关系逐协议迁移。
    - 不在同一个提交中同时重写协议 wire format。
 4. [ ] `Network: complete shared TCP TLS transports and UDP`
    - 完成 cancellation、deadline、Happy Eyeballs、TLS、transport 和 UDP session 基础。
    - 到此才允许进入 M2/M3 的协议补齐。
 
 这四批全部通过 M1 验收门后，M1 才能从 `IN_PROGRESS` 变为 `VERIFIED`。
+
+### 8.2 总体执行看板
+
+| 阶段 | 当前状态 | 前置依赖 | 阶段交付物 | 完成证据 |
+|---|---|---|---|---|
+| M0 控制面 | `VERIFIED` | 无 | task、SSE、取消、进度、telemetry | 已提交代码和 Rust/Swift 回归 |
+| M1 基础设施 | `IN_PROGRESS` | M0 | 模块化 Core/API/Outbound、公共 transport/UDP | `NEXT-001` 至 `NEXT-009` 全部通过 |
+| M2 现有协议 | `NOT_STARTED` | M1 | 当前 partial 协议真实 TCP/UDP 拨号 | 每协议 mock E2E + 独立互操作 |
+| M3 缺失协议 | `NOT_STARTED` | M1 | 冻结基线协议和内置出站补齐 | 无已知协议落入永久 unsupported |
+| M4 DNS/Fake-IP | `NOT_STARTED` | M1 | 独立 resolver、policy、cache、Fake-IP | DNS 泄漏/循环/恢复测试 |
+| M5 macOS TUN | `NOT_STARTED` | M1、M4 | 虚拟网卡、helper、网络事务和恢复 | 真机异常退出矩阵 |
+| M6 测速择优 | `NOT_STARTED` | M1、M2 | 未启动代理测速、500ms、后台择优 | 与 Sparkle/Mihomo 固定基准对比 |
+| M7 订阅/Provider | `NOT_STARTED` | M1、M2 | 多订阅、本地缓存、Provider、代理组 | 两套脱敏真实订阅验收 |
+| M8 智能规则 | `NOT_STARTED` | M4、M5、M7 | 域名/IP/App 识别、学习和指定节点 | 决策可解释、可撤销、可复现 |
+| M9 可观测性 | `NOT_STARTED` | M1、M5 | 实时/累计流量、连接、日志、Doctor | 跨重启统计和故障诊断 |
+| M10 App/UI | `NOT_STARTED` | M6-M9 API 稳定 | 架构拆分、完整页面和交互 | Swift/UI/性能验收 |
+| M11 质量治理 | `NOT_STARTED` | M2-M10 | benchmark、安全、fuzz、CI、许可证 | 干净 checkout 全门禁 |
+| M12 发布 | `NOT_STARTED` | M0-M11 | 签名、公证、DMG、GitHub Release | 干净机器安装和 24h 长稳 |
+
+阶段状态按验收证据推进，不按代码行数、提交数量或“看起来完成”推进。
 
 ## 9. M0：收口当前 task/SSE 工作区
 
@@ -606,7 +672,7 @@ M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 
 当前进度：结构拆分、失败 reload 保留旧状态、subscription merge 下沉和 cancellation
 tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 21 项测试；
-本批等待独立提交。
+已提交为 `5c4dd89 Core: modularize runtime lifecycle and selection`。
 
 - 从 `core/mod.rs` 拆出：
   - runtime lifecycle
@@ -621,7 +687,54 @@ tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 
 ### 10.3 Outbound 统一接口
 
 当前进度：trait/factory 已拆分，结构化错误上下文和显式 capability 已接入全部实现，
-SSH/WireGuard 已迁为独立模块；其余协议实现仍在 `outbound/mod.rs`，本项保持进行中。
+SSH/WireGuard 已迁为独立模块并提交为
+`bf0fb62 Core: make outbound capabilities explicit`；其余协议实现仍在
+`outbound/mod.rs`，本项保持进行中。
+
+恢复开发后的精确拆分顺序：
+
+1. [x] `NEXT-001`：新增 `outbound/target.rs`。
+   - 迁移 SOCKS5 地址编码、解码、前缀解析和目标类型校验。
+   - 对仍被外部测试使用的函数保留稳定 re-export。
+   - 域名长度、IPv4、IPv6、非法 ATYP、截断帧分别测试。
+2. [x] `NEXT-002`：新增 `outbound/socks5.rs`。
+   - 迁移 TCP CONNECT、认证、UDP ASSOCIATE、UDP session/pool 和 bound address。
+   - factory 通过构造函数创建实例，不暴露协议内部字段。
+   - 结构迁移阶段不改变 wire format 和既有超时语义。
+3. [x] `NEXT-003`：迁移 AnyTLS 和 ShadowTLS。
+   - 抽取其共享 TLS/padding/target 依赖。
+   - 保持 capability 限制文本和现有行为不变。
+4. [ ] `NEXT-004`：迁移 Shadowsocks、ShadowsocksR 和 Snell。
+   - 先建立协议私有 crypto/framing 子模块。
+   - 共享代码必须有明确协议边界，不能继续依赖 `use super::*`。
+   - 迁移后运行 SS、SSR、Snell 真实拨号定向回归。
+5. [ ] `NEXT-005`：迁移 Trojan、VMess 和 VLESS。
+   - transport 组合只依赖公共 transport 接口。
+   - Reality/Vision 保持独立状态机，不塞回公共 TLS 模块。
+6. [ ] `NEXT-006`：迁移 Hysteria2 和 TUIC。
+   - 公共 QUIC endpoint/session 生命周期下沉到 transport。
+   - 协议帧、认证和 UDP association 保留在各自协议模块。
+7. [ ] `NEXT-007`：清空巨型 `outbound/mod.rs`。
+   - 只保留模块声明、公共 re-export 和 registry/factory 入口。
+   - 删除跨协议隐式 import、重复 target helper 和字符串错误分类。
+8. [ ] `NEXT-008`：完成公共 TCP/TLS、transport、UDP 和通用代理字段。
+   - cancellation/deadline 必须传播到 DNS、connect、TLS、协议握手和 relay。
+   - 补齐 Happy Eyeballs、IP preference、interface bind、TFO/MPTCP 能力边界。
+   - 完成 bounded UDP association、idle eviction、backpressure 和流量统计。
+9. [ ] `NEXT-009`：执行 M1 集中验收。
+   - `cargo check --all-targets`。
+   - Rust lib、协议定向 integration、config/runtime、plan behavior。
+   - transport/UDP mock tests。
+   - Swift `/v1` API 回归。
+   - 更新协议矩阵和 API 文档后提交 M1 收口。
+
+`NEXT-001` 至 `NEXT-003` 验证记录：
+
+- `cargo check --all-targets`：通过且无 warning。
+- `cargo test --lib outbound::`：43 passed。
+- `cargo test --test remaining_protocols`：29 passed。
+- `cargo test --test config_and_runtime`：20 passed。
+- `outbound/mod.rs`：11,790 行降至 10,646 行。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。
@@ -1339,6 +1452,9 @@ Skyhook 的 TUN 优势不靠增加无效开关，而靠以下可验证能力：
 - “所有节点”包含历史超时和不可用节点。
 - 支持只显示本轮有延迟结果的节点。
 - 历史结果不覆盖本轮未测试节点。
+- App 启动先立即显示本地缓存节点，再异步启动可取消的后台测速。
+- App 启动后台测速不得阻塞页面、切换订阅或启动代理。
+- “启动代理”动作本身永远不触发全量测速；仅在上次节点实拨失败时进入定向 fallback。
 
 ### 15.5 自动择优
 
@@ -1448,6 +1564,9 @@ Skyhook 的 TUN 优势不靠增加无效开关，而靠以下可验证能力：
 - “更新全部”更新所有订阅。
 - 每个订阅提供独立更新。
 - 后台定时更新。
+- App 启动时先加载全部本地缓存并立即显示，再通过直连通道异步更新全部订阅。
+- 启动时更新失败只记录 task 错误并继续使用旧缓存，不能让节点页为空。
+- “启动代理”动作不触发订阅同步；订阅更新与代理生命周期彻底解耦。
 - 更新不自动切换当前订阅。
 - 当前订阅更新成功后原子 reload。
 - 非当前订阅只更新本地缓存。
