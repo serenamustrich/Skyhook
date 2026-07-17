@@ -8,10 +8,11 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.26（完成 `NEXT-011G` 与 M2 集中验收，进入 M3 Hysteria v1）
+> 计划版本：v1.27（完成 M3 Hysteria v1，进入 Mieru）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 已验证，当前直接执行点为 M3 Hysteria v1。
+> M2 已验证，M3 Hysteria v1 已完成，当前直接执行点为 M3 Mieru。按固定范围估算，
+> 当前整体实现进度约 62%。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -225,7 +226,7 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 - Outbound 生产模块中的 `use super::*` 已清零；factory、SSH、WireGuard、Snell 和 SSR
   已改为显式依赖，公共十六进制工具和 UDP session pool 容量常量已归入所属模块。
 - API、核心协调和 UI 状态职责仍过度集中。
-- 当前代码中 Hysteria v1、Mieru、Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
+- 当前代码中 Mieru、Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
 - Mihomo 当前官方协议列表中的 Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch 尚未进入 Skyhook 正式模型。
 - TUN 当前依赖 `tun2proxy 0.8.1`，不具备最终要求的完整事务恢复能力。
 
@@ -367,8 +368,13 @@ M1 Outbound 第一批已实现、验证并提交：
   Swift 98 项回归、OpenAPI/router compatibility、协议矩阵/API 文档和私密订阅扫描均通过；
   API 测试专用 `Router` import 清理以 `ae7b0df` 提交，分页 API 和公共 UDP 文档以
   `dae0e55` 提交。
+- M3 Hysteria v1 已完成原生官方 v3 wire、auth/auth-str、上下行带宽协商、速率感知拥塞
+  控制、TCP、QUIC datagram UDP、服务端 UDP session ID、fragmentation/reassembly、
+  单飞连接池、UDP 会话复用、fast-open、xplus、wechat-video、窗口/MTU/keepalive/timeout；
+  4 项真实 QUIC 集成、6 项协议单元、订阅/config/capability 回归通过，并已与官方 `hy1`
+  分支 `ac56271` 服务端完成 TCP/UDP 互通。`faketcp` 依赖 Linux packet backend，在 macOS
+  上明确拒绝。
 - `UnsupportedProtocolOutbound` 仍承载：
-  - Hysteria v1
   - Mieru
   - Juicity
   - MASQUE
@@ -386,8 +392,8 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收；继续执行 M3 Hysteria v1，
-   然后依次完成 Mieru、Juicity、MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch。
+1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收，M3 Hysteria v1 已完成；
+   继续依次完成 Mieru、Juicity、MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch。
 2. 按 M3 完成所有 parse-only/缺失协议的真实 TCP/UDP 拨号、认证、传输组合、错误映射和
    互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1423,7 +1429,6 @@ Naive：
 
 当前已有配置但不能拨号：
 
-- Hysteria v1。
 - Mieru。
 - Juicity。
 - MASQUE。
@@ -1446,14 +1451,22 @@ Mihomo 冻结基线有、当前 Skyhook 正式模型缺失：
 
 ### 12.2 Hysteria v1
 
-- QUIC transport。
-- auth。
-- up/down bandwidth。
-- obfs。
-- TCP stream。
-- UDP。
-- MTU、keepalive、timeout。
-- 本地服务端 E2E。
+- [x] QUIC transport。
+- [x] auth/auth-str 与官方 v3 ClientHello/ServerHello。
+- [x] up/down bandwidth 协商与速率感知拥塞控制。
+- [x] xplus 与 wechat-video obfs；`faketcp` 在 macOS 明确报告 Linux packet backend 边界。
+- [x] TCP stream 与真实 fast-open。
+- [x] QUIC datagram UDP、服务端 session ID、fragmentation/reassembly 和有界会话复用。
+- [x] receive window、MTU discovery、keepalive、timeout 和 cancellation。
+- [x] 本地真实 QUIC E2E、错误鉴权、静默认证超时，以及官方 `hy1` 分支 `ac56271`
+  服务端 TCP/UDP 互操作。
+
+实现与证据：
+
+- `Supercore/src/outbound/hysteria.rs`
+- `Supercore/tests/hysteria_v1_real_dial.rs`
+- `Supercore/tests/remaining_protocols.rs`
+- `Supercore/src/subscription/mod.rs`
 
 ### 12.3 Mieru
 

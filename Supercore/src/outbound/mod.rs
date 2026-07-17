@@ -6,6 +6,7 @@ pub mod error;
 mod factory;
 mod group;
 mod http_proxy;
+mod hysteria;
 mod hysteria2;
 mod io;
 mod mux;

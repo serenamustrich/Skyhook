@@ -68,6 +68,9 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   standard `vmess://` JSON, custom transport headers, ALPN, multi-destination UDP associations,
   authenticated EOF, and stale-session eviction have independent real-dial coverage. XHTTP is an
   explicit pre-dial unsupported boundary rather than a false timeout.
+- Hysteria v1 native QUIC TCP and UDP with v3 wire authentication, upload/download negotiation,
+  rate-aware congestion control, connection/session reuse, fragmentation, fast-open, xplus, and
+  wechat-video packet transport. TCP and UDP interoperate with the official `hy1` server.
 - Hysteria2 and TUIC native QUIC TCP outbounds with strict authentication and complete local QUIC
   server end-to-end coverage.
 - Hysteria2 HTTP/3 auth, TCP, QUIC datagram UDP, session reuse, fragmentation, bandwidth-aware
@@ -130,9 +133,9 @@ Supercore no longer treats protocol support as a single boolean.
 
 Current matrix details are in `docs/protocol-matrix.md`:
 
-- **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
+- **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria2, TUIC,
+- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria v1, Hysteria2, TUIC,
   WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, SOCKS5, and SSH
 
 The current tun2proxy-backed TUN capability boundary is documented in
@@ -463,6 +466,29 @@ Supported transports are `tcp`, `ws`, `grpc`, `h2`, `http`, and `httpupgrade`; s
 ciphers are `auto`, `aes-128-gcm`, `chacha20-poly1305`, and `none`. Command-UDP uses a bounded
 per-destination session pool. `xhttp` is rejected before network dialing with a precise unsupported
 error.
+
+Basic Hysteria v1 outbound:
+
+```yaml
+outbounds:
+  - type: hysteria
+    name: hy1-01
+    server: hy1.example.com
+    port: 443
+    auth-str: secret
+    up: 100 Mbps
+    down: 100 Mbps
+    sni: cdn.example.com
+    protocol: udp
+    skip_cert_verify: false
+```
+
+Hysteria v1 accepts `hysteria://` subscriptions and numeric or unit-bearing bandwidth values. It
+implements the official v3 ClientHello/ServerHello and TCP/UDP framing, server-assigned UDP session
+IDs, endpoint-independent sessions, fragmentation/reassembly, connection single-flight, fast-open,
+rate-aware congestion control, and `xplus`/`wechat-video` packet modes. The native TCP and UDP path
+interoperates with the official Hysteria `hy1` server. `faketcp` requires a supported Linux packet
+backend and is rejected explicitly on macOS.
 
 Basic Hysteria2 outbound:
 

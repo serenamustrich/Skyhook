@@ -17,6 +17,16 @@ use crate::outbound::context::active_dial_context;
 use super::{order_addresses, tls::NoCertificateVerification};
 use crate::outbound::udp::create_bound_std_udp;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QuicTransportTuning {
+    pub(crate) stream_receive_window: Option<u64>,
+    pub(crate) receive_window: Option<u64>,
+    pub(crate) max_idle_timeout: Option<Duration>,
+    pub(crate) keep_alive_interval: Option<Duration>,
+    pub(crate) initial_mtu: Option<u16>,
+    pub(crate) disable_mtu_discovery: bool,
+}
+
 #[cfg(test)]
 pub(crate) fn quic_client_config(
     skip_cert_verify: bool,
@@ -39,6 +49,25 @@ pub(crate) fn quic_client_config_with_controller(
         None,
         false,
         Some(controller),
+        None,
+    )
+}
+
+pub(crate) fn quic_client_config_with_controller_and_tuning(
+    skip_cert_verify: bool,
+    alpn: Option<&str>,
+    congestion_control: Option<&str>,
+    controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+    tuning: QuicTransportTuning,
+) -> anyhow::Result<quinn::ClientConfig> {
+    quic_client_config_advanced(
+        skip_cert_verify,
+        alpn,
+        congestion_control,
+        None,
+        false,
+        Some(controller),
+        Some(tuning),
     )
 }
 
@@ -56,6 +85,7 @@ pub(crate) fn quic_client_config_with_resumption(
         session_store,
         enable_early_data,
         None,
+        None,
     )
 }
 
@@ -66,6 +96,7 @@ fn quic_client_config_advanced(
     session_store: Option<Arc<dyn ClientSessionStore>>,
     enable_early_data: bool,
     controller: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    tuning: Option<QuicTransportTuning>,
 ) -> anyhow::Result<quinn::ClientConfig> {
     let provider = aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(provider.into())
@@ -124,6 +155,35 @@ fn quic_client_config_advanced(
                 ));
             }
             value => return Err(anyhow!("unsupported QUIC congestion controller {value}")),
+        }
+    }
+    if let Some(tuning) = tuning {
+        if let Some(window) = tuning.stream_receive_window {
+            transport_config.stream_receive_window(
+                quinn::VarInt::from_u64(window)
+                    .map_err(|_| anyhow!("QUIC stream receive window is too large"))?,
+            );
+        }
+        if let Some(window) = tuning.receive_window {
+            transport_config.receive_window(
+                quinn::VarInt::from_u64(window)
+                    .map_err(|_| anyhow!("QUIC connection receive window is too large"))?,
+            );
+        }
+        if let Some(idle_timeout) = tuning.max_idle_timeout {
+            transport_config.max_idle_timeout(Some(
+                idle_timeout
+                    .try_into()
+                    .map_err(|_| anyhow!("QUIC idle timeout is too large"))?,
+            ));
+        }
+        transport_config.keep_alive_interval(tuning.keep_alive_interval);
+        if let Some(mtu) = tuning.initial_mtu {
+            let mtu = mtu.clamp(1_200, 65_527);
+            transport_config.initial_mtu(mtu).min_mtu(mtu.min(1_200));
+        }
+        if tuning.disable_mtu_discovery {
+            transport_config.mtu_discovery_config(None);
         }
     }
     if let Some(context) = active {

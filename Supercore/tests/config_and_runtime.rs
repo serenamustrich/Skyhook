@@ -34,6 +34,29 @@ fn example_config_parses() {
     assert_eq!(config.smart_rules.rules.len(), 1);
 }
 
+#[test]
+fn hysteria_v1_accepts_numeric_and_unit_bandwidth_values() {
+    let config: SuperConfig = serde_yaml::from_str(
+        r#"
+outbounds:
+  - type: hysteria
+    name: hy1
+    server: hy1.example.com
+    port: 443
+    auth-str: token
+    up: 100
+    down: 1.5 Gbps
+"#,
+    )
+    .expect("numeric Hysteria v1 bandwidth should parse");
+
+    let OutboundConfig::Hysteria { up, down, .. } = &config.outbounds[0] else {
+        panic!("expected Hysteria v1 outbound");
+    };
+    assert_eq!(up.as_deref(), Some("100"));
+    assert_eq!(down.as_deref(), Some("1.5 Gbps"));
+}
+
 #[tokio::test]
 async fn reject_outbound_refuses_connections() {
     let mut config = SuperConfig::default();

@@ -659,9 +659,9 @@ pub enum OutboundConfig {
         auth_str: Option<String>,
         #[serde(default)]
         protocol: Option<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_optional_scalar_string")]
         up: Option<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_optional_scalar_string")]
         down: Option<String>,
         #[serde(default)]
         sni: Option<String>,
@@ -669,6 +669,20 @@ pub enum OutboundConfig {
         skip_cert_verify: bool,
         #[serde(default)]
         obfs: Option<String>,
+        #[serde(default)]
+        alpn: Option<String>,
+        #[serde(default, alias = "recv-window-conn", alias = "recv_window_conn")]
+        receive_window_conn: Option<u64>,
+        #[serde(default, alias = "recv-window", alias = "recv_window")]
+        receive_window: Option<u64>,
+        #[serde(
+            default,
+            alias = "disable-mtu-discovery",
+            alias = "disable_mtu_discovery"
+        )]
+        disable_mtu_discovery: bool,
+        #[serde(default, alias = "fast-open", alias = "fast_open")]
+        fast_open: bool,
     },
     AnyTls {
         name: String,
@@ -863,6 +877,29 @@ where
                 .map_err(D::Error::custom)
         }
     }
+}
+
+fn deserialize_optional_scalar_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ScalarString {
+        Text(String),
+        Unsigned(u64),
+        Signed(i64),
+        Float(f64),
+    }
+
+    Ok(
+        Option::<ScalarString>::deserialize(deserializer)?.map(|value| match value {
+            ScalarString::Text(value) => value,
+            ScalarString::Unsigned(value) => value.to_string(),
+            ScalarString::Signed(value) => value.to_string(),
+            ScalarString::Float(value) => value.to_string(),
+        }),
+    )
 }
 
 fn default_shadowsocks_udp_over_tcp_version() -> u8 {

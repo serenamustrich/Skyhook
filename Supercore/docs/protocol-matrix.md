@@ -18,7 +18,7 @@
 | Trojan | full | full | full | full | tcp/ws/grpc/h2/httpupgrade | full | TLS+TCP、UDP、WS、gRPC、H2、HTTPUpgrade 均有 `build_outbounds` 真实 mock 拨号；支持自定义 transport headers、显式/默认 ALPN、UDP over WS/gRPC、gRPC trailer 与 HTTPUpgrade 状态；覆盖 96KB 双向流、半关闭、错误密码、TLS/transport 超时、空密码/未知 network 拨号前拒绝、8192 字节 UDP 边界、空闲 UDP 隧道复用和超时会话淘汰 |
 | VMess | full | full | full | full | tcp/ws/grpc/h2/http/httpupgrade | full | alterId=0 AEAD 与 legacy alterId 均为真实 wire 实现；TCP、UDP、WS、gRPC、H2、HTTP camouflage、HTTPUpgrade、自定义 headers、ALPN、AES-128-GCM/ChaCha20-Poly1305/none 均有独立 mock 对端实拨；覆盖 96KB 多帧双向流、认证 EOF、时钟窗口、错误 UUID/响应认证、8192 字节 UDP 边界、多目的 association 和超时会话淘汰；XHTTP 在拨号前明确返回 unsupported，属于冻结配置边界 |
 | VLESS | full | full | full | full | tcp/ws/grpc/h2/http/httpupgrade/reality/vision | full | TCP/command-UDP、TLS/无 TLS、WS、gRPC、H2、HTTP camouflage、HTTPUpgrade、自定义 headers 和 ALPN 均有真实拨号；Reality 实现 X25519/HKDF/AES-GCM ClientHello 认证、short ID、时间戳、临时证书 HMAC 校验和 fingerprint profile；Vision 实现双向 padding、TLS record 状态机与独立 direct copy 边界；覆盖 96KB 双向半关闭、多目的 UDP、会话复用和超时淘汰恢复 |
-| Hysteria v1 | parse-only | parse-only | none | none | quic | parse-only | `outbound` 走 `UnsupportedProtocolOutbound`（见 `src/outbound/mod.rs:377-380`），native 拨号当前未实现；doctor `classify_outbound_with_capability` 在 `core/mod.rs:1300-1301` 返回 ParseOnly（`tcp_supported=false`, `udp_supported=false`, `limitations` 包含 `hysteria is recognized in config/subscriptions but native dialing is not implemented yet`）。测试断言：`tests/remaining_protocols.rs::hysteria_v1_dial_returns_unsupported_error` + `hysteria_v1_capability_marks_unsupported` + `hysteria_v1_routes_through_runtime_to_unsupported`。 |
+| Hysteria v1 | full | full | full | full | quic/xplus/wechat-video | full | 原生实现官方 v3 ClientHello/ServerHello、auth/auth-str、上下行带宽协商、速率感知拥塞控制、TCP、QUIC datagram UDP、服务端 session ID、fragmentation/reassembly、单飞连接池、UDP 会话复用、fast-open、窗口/MTU/keepalive/timeout；已与官方 `hy1` 分支 `ac56271` 服务端完成 TCP/UDP 互通。`faketcp` 依赖 Linux packet backend，在 macOS 上拨号前明确拒绝 |
 | Hysteria2 | full | full | full | full | quic/h3/salamander/gecko | full | 严格 H3 auth、TCP、QUIC datagram UDP、fragmentation/reassembly、连接与会话复用、上下行带宽协商、速率感知拥塞控制均已实现；普通 QUIC、Salamander、Gecko 具有本地真实 QUIC/H3 服务端往返，错误状态/缺失头/错误混淆密码均有拒绝证据 |
 | TUIC | full | full | full | full | quic | full | v5 TLS exporter 认证、TCP、native datagram/QUIC 单向流 UDP、fragmentation/reassembly、association 隔离、heartbeat、Dissociate、max packet 和持久 TLS 恢复均有本地真实服务端验证；恢复确认前不发送认证或业务数据，避免 0-RTT replay |
 | Snell | full | full | full | full | tcp/http/tls | full | 默认 v1；v1-v5 TCP、v3-v5 UDP-over-TCP、独立响应 salt 与 HTTP/TLS obfs 均有真实拨号测试；v5 使用公开的 v4 兼容 wire format；v4/v5 支持 `reuse: true`、10 条连接池、15 秒空闲淘汰、零帧半关闭、并发流和陈旧连接自动重拨；空 PSK 在拨号前拒绝，v1/v2 UDP 为协议自身不适用边界 |
@@ -44,7 +44,7 @@
 | HTTP/2 | full | host/path |
 | HTTP/3 CONNECT | full | Naive 显式 H3 传输支持 Basic Auth、padding 和多流复用 |
 | HTTPUpgrade | full | Trojan、VMess 与 VLESS 均有真实拨号、自定义 headers 和非 101 状态校验 |
-| QUIC | full | Hysteria2/TUIC 具有普通、Salamander、Gecko、native datagram、单向流 UDP 和 TLS 恢复的本地真实服务端 E2E |
+| QUIC | full | Hysteria v1 具有官方服务端 TCP/UDP 互通及 xplus/wechat-video 包装验证；Hysteria2/TUIC 具有普通、Salamander、Gecko、native datagram、单向流 UDP 和 TLS 恢复的本地真实服务端 E2E |
 | XTLS Vision | full | VLESS 双向 padding、TLS 1.3 ServerHello 判定、方向独立切换和 direct copy 均有真实 mock 拨号 |
 | Reality | full | X25519/HKDF/AES-GCM ClientHello、short ID、时间窗口、临时证书认证、失败拒绝和 fingerprint profile 均有真实 mock 拨号 |
 | 公共 UDP runtime | full | 有界 association/session、两种 NAT keying、队列背压、空闲淘汰、重放/重组保护与每出站统计；具体协议是否支持 UDP 仍以协议行能力为准 |
@@ -66,6 +66,8 @@
   padding、TLS record 与 direct copy 状态机位于 `src/outbound/vless_vision.rs`。
 - VMess/VLESS 按目标隔离的 session 轮转能力由
   `src/outbound/udp/session_pool.rs` 提供。
+- Hysteria v1 的 v3 auth、TCP/UDP framing、fast-open、xplus/wechat-video、会话复用和
+  fragmentation/reassembly 位于 `src/outbound/hysteria.rs`。
 - Hysteria2 的 H3 auth、TCP/UDP framing、Salamander/Gecko obfs 和 reassembly 位于
   `src/outbound/hysteria2.rs`。
 - TUIC v5 auth、TCP stream、native/QUIC UDP relay 和 reassembly 位于
@@ -89,10 +91,11 @@
 - 跨协议精确读取 helper 位于 `src/outbound/io.rs`；协议私有 crypto/framing 不进入
   公共 outbound 根模块。
 
-## 与 Mihomo 差距
+## 未完成协议边界
 
-1. **Hysteria v1**: Mihomo 完整支持，Supercore 仍为 `parse-only`
-2. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
+1. **Mieru / Juicity / MASQUE / OpenVPN**: 当前仍为 `parse-only`
+2. **DNS outbound / Rematch / Sudoku / Tailscale / TrustTunnel**: 尚未进入正式出站模型
+3. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
 
 ## 已有测试
 
@@ -101,6 +104,9 @@
 - Snell: `tests/snell_real_dial.rs`
 - Trojan / VMess: `tests/trojan_vmess_real_dial.rs`
 - VLESS/Reality/Vision: `src/outbound/tests.rs`、`tests/vless_hy2_tuic.rs`
+- Hysteria v1: `tests/hysteria_v1_real_dial.rs`，覆盖真实 QUIC TCP/UDP、错误鉴权、
+  fast-open 和认证超时；`src/outbound/hysteria.rs` 覆盖官方 wire、xplus、wechat-video、
+  UDP fragmentation/reassembly；另有官方 `hy1` 服务端 TCP/UDP 互通验证
 - Hysteria2 / TUIC: `src/outbound/tests.rs`、`tests/vless_hy2_tuic.rs`
 - WireGuard: `src/outbound/wireguard.rs` 的本地双端 E2E，覆盖 IPv4/IPv6、TCP/UDP、
   DNS、96KB 数据、多 Peer、最长前缀、保活、reserved 和重放拒绝
@@ -115,4 +121,4 @@
 - SOCKS5: `tests/socks5_real_dial.rs`，覆盖域名/IPv4/IPv6、96KB、认证拒绝、UDP ASSOCIATE
   和会话池复用
 - SSH: `tests/ssh_real_dial.rs`，覆盖密码/私钥、host key 拒绝、96KB、并发会话复用和断线重连
-- SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / Hysteria v1: `tests/remaining_protocols.rs`
+- SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / Hysteria v1 capability: `tests/remaining_protocols.rs`

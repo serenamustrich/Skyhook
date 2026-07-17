@@ -829,17 +829,22 @@ mod doctor_summary_tests {
                 obfs_param: None,
             },
             OutboundConfig::Hysteria {
-                name: "hy2-node".to_string(),
+                name: "hy1-node".to_string(),
                 server: "hysteria.example".to_string(),
                 port: 443,
                 auth: None,
-                auth_str: None,
+                auth_str: Some("token".to_string()),
                 protocol: None,
-                up: None,
-                down: None,
+                up: Some("100 Mbps".to_string()),
+                down: Some("100 Mbps".to_string()),
                 sni: None,
                 skip_cert_verify: false,
                 obfs: None,
+                alpn: None,
+                receive_window_conn: None,
+                receive_window: None,
+                disable_mtu_discovery: false,
+                fast_open: false,
             },
             OutboundConfig::OpenVpn {
                 name: "ovpn-node".to_string(),
@@ -861,9 +866,9 @@ mod doctor_summary_tests {
         });
 
         let summary = summarize_outbound_support(&config);
-        assert_eq!(summary.full_count, 4);
+        assert_eq!(summary.full_count, 5);
         assert_eq!(summary.partial_count, 0);
-        assert_eq!(summary.parse_only_count, 3);
+        assert_eq!(summary.parse_only_count, 2);
         assert_eq!(summary.unsupported_count, 1);
         assert_eq!(summary.group_count, 1);
 
@@ -914,9 +919,9 @@ mod doctor_summary_tests {
         assert_eq!(
             summary.by_protocol.get("hysteria").copied(),
             Some(ProtocolSupportSummary {
-                full_count: 0,
+                full_count: 1,
                 partial_count: 0,
-                parse_only_count: 1,
+                parse_only_count: 0,
                 unsupported_count: 0,
             })
         );

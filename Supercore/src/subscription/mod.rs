@@ -409,12 +409,30 @@ impl SubscriptionNode {
                 protocol: first_param(&self.params, &["protocol"]),
                 up: first_param(&self.params, &["up", "upmbps"]),
                 down: first_param(&self.params, &["down", "downmbps"]),
-                sni: first_param(&self.params, &["sni", "servername"]),
+                sni: first_param(&self.params, &["sni", "servername", "peer"]),
                 skip_cert_verify: bool_param_any(
                     &self.params,
                     &["skip-cert-verify", "allowInsecure", "insecure"],
                 ),
-                obfs: first_param(&self.params, &["obfs"]),
+                obfs: first_param(&self.params, &["obfs-param", "obfsParam", "obfs_param"])
+                    .or_else(|| {
+                        first_param(&self.params, &["obfs"]).filter(|value| {
+                            !matches!(value.trim().to_ascii_lowercase().as_str(), "xplus" | "none")
+                        })
+                    }),
+                alpn: first_param(&self.params, &["alpn"]),
+                receive_window_conn: first_param(
+                    &self.params,
+                    &["recv-window-conn", "recv_window_conn"],
+                )
+                .and_then(|value| value.parse().ok()),
+                receive_window: first_param(&self.params, &["recv-window", "recv_window"])
+                    .and_then(|value| value.parse().ok()),
+                disable_mtu_discovery: bool_param_any(
+                    &self.params,
+                    &["disable-mtu-discovery", "disable_mtu_discovery"],
+                ),
+                fast_open: bool_param_any(&self.params, &["fast-open", "fast_open"]),
             }),
             NodeProtocol::Tuic => {
                 let uuid = self
@@ -3156,6 +3174,95 @@ proxies:
                 assert!(skip_cert_verify);
                 assert_eq!(obfs.as_deref(), Some("salamander"));
                 assert_eq!(obfs_password.as_deref(), Some("mask"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria_v1_uri_with_official_xplus_and_transport_fields() {
+        let uri = "hysteria://hy.example.com:443?protocol=wechat-video&auth=secret&peer=cdn.example.com&insecure=1&upmbps=100&downmbps=200&alpn=hysteria&obfs=xplus&obfsParam=mask#HY1";
+
+        let doc = parse_subscription(uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Hysteria {
+                name,
+                server,
+                port,
+                auth,
+                protocol,
+                up,
+                down,
+                sni,
+                skip_cert_verify,
+                obfs,
+                alpn,
+                ..
+            } => {
+                assert_eq!(name, "HY1");
+                assert_eq!(server, "hy.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(auth.as_deref(), Some("secret"));
+                assert_eq!(protocol.as_deref(), Some("wechat-video"));
+                assert_eq!(up.as_deref(), Some("100"));
+                assert_eq!(down.as_deref(), Some("200"));
+                assert_eq!(sni.as_deref(), Some("cdn.example.com"));
+                assert!(skip_cert_verify);
+                assert_eq!(obfs.as_deref(), Some("mask"));
+                assert_eq!(alpn.as_deref(), Some("hysteria"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hysteria_v1_clash_yaml_windows_mtu_and_fast_open() {
+        let text = r#"
+proxies:
+  - name: HY1-YAML
+    type: hysteria
+    server: hy.example.com
+    port: 443
+    auth-str: secret
+    protocol: udp
+    up: 100
+    down: 200
+    sni: cdn.example.com
+    skip-cert-verify: true
+    obfs: mask
+    alpn: [hysteria]
+    recv-window-conn: 16777216
+    recv-window: 41943040
+    disable-mtu-discovery: true
+    fast-open: true
+"#;
+
+        let document = parse_subscription(text).unwrap();
+        let outbound = document.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Hysteria {
+                auth_str,
+                up,
+                down,
+                obfs,
+                alpn,
+                receive_window_conn,
+                receive_window,
+                disable_mtu_discovery,
+                fast_open,
+                ..
+            } => {
+                assert_eq!(auth_str.as_deref(), Some("secret"));
+                assert_eq!(up.as_deref(), Some("100"));
+                assert_eq!(down.as_deref(), Some("200"));
+                assert_eq!(obfs.as_deref(), Some("mask"));
+                assert_eq!(alpn.as_deref(), Some("hysteria"));
+                assert_eq!(receive_window_conn, Some(16_777_216));
+                assert_eq!(receive_window, Some(41_943_040));
+                assert!(disable_mtu_discovery);
+                assert!(fast_open);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

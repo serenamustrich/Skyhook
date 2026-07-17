@@ -1,7 +1,7 @@
 //! 6.4.7-11 protocol coverage tests
 //!
 //! Covers: SSR (obfs/UDP), Snell (obfs), WireGuard (allowed_ips/reserved/mtu),
-//! AnyTLS, ShadowTLS, Naive, Hysteria v1 (decision: parse-only / unsupported).
+//! AnyTLS, ShadowTLS, Naive, and Hysteria v1 capability boundaries.
 //!
 //! The tests exercise the public builder (`build_outbounds`) + the runtime
 //! capability snapshot (`Runtime::outbound_capabilities`) plus lightweight
@@ -824,12 +824,11 @@ fn naive_capability_reports_no_udp() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Hysteria v1: decision = parse-only / unsupported native dial
+// 7. Hysteria v1: native QUIC/TCP/UDP runtime
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hysteria_v1_capability_marks_unsupported() {
-    // Decision: Hysteria v1 stays parse-only / unsupported native dial.
+fn hysteria_v1_capability_reports_native_tcp_udp() {
     let config = config_with_default(
         "hy-01",
         OutboundConfig::Hysteria {
@@ -839,37 +838,37 @@ fn hysteria_v1_capability_marks_unsupported() {
             auth: Some("auth".to_string()),
             auth_str: None,
             protocol: Some("udp".to_string()),
-            up: None,
-            down: None,
+            up: Some("100 Mbps".to_string()),
+            down: Some("200 Mbps".to_string()),
             sni: Some("hy.example.com".to_string()),
             skip_cert_verify: false,
             obfs: None,
+            alpn: None,
+            receive_window_conn: None,
+            receive_window: None,
+            disable_mtu_discovery: false,
+            fast_open: false,
         },
     );
     let runtime = Runtime::new(config).expect("runtime");
     let snapshot = find_snapshot(&runtime, "hy-01");
 
+    assert!(snapshot.tcp_supported, "hysteria v1 must advertise TCP");
+    assert!(snapshot.udp_supported, "hysteria v1 must advertise UDP");
     assert!(
-        !snapshot.tcp_supported,
-        "hysteria v1 must not advertise TCP"
+        snapshot.limitations.is_empty(),
+        "got {:?}",
+        snapshot.limitations
     );
-    assert!(
-        !snapshot.udp_supported,
-        "hysteria v1 must not advertise UDP"
-    );
-    assert!(
-        snapshot
-            .limitations
-            .iter()
-            .any(|item| item.contains("not implemented yet")),
-        "hysteria v1 must include 'not implemented yet', got {:?}",
-        snapshot.limitations,
+    assert_eq!(
+        snapshot.udp_mode.as_deref(),
+        Some("quic-datagram-session-pool")
     );
     assert_eq!(snapshot.kind, "hysteria");
 }
 
 #[tokio::test]
-async fn hysteria_v1_dial_returns_unsupported_error() {
+async fn hysteria_v1_dial_uses_native_runtime_and_real_network_errors() {
     let outbounds = build_outbounds(
         &[OutboundConfig::Hysteria {
             name: "hy-dial".to_string(),
@@ -878,36 +877,36 @@ async fn hysteria_v1_dial_returns_unsupported_error() {
             auth: Some("auth".to_string()),
             auth_str: None,
             protocol: Some("udp".to_string()),
-            up: None,
-            down: None,
+            up: Some("100 Mbps".to_string()),
+            down: Some("200 Mbps".to_string()),
             sni: Some("hy.example.com".to_string()),
             skip_cert_verify: false,
             obfs: None,
+            alpn: None,
+            receive_window_conn: None,
+            receive_window: None,
+            disable_mtu_discovery: false,
+            fast_open: false,
         }],
         None,
     )
     .expect("build");
     let outbound = outbounds.get("hy-dial").expect("outbound");
-    assert_eq!(outbound.kind(), "unsupported-protocol");
+    assert_eq!(outbound.kind(), "hysteria");
 
     let error = outbound
         .connect(&Destination::new("1.1.1.1", 80), 500)
         .await
         .err()
-        .expect("hysteria v1 must fail to dial");
+        .expect("closed local port must fail to dial");
     assert!(
-        error
-            .to_string()
-            .contains("native dialing is not implemented yet"),
+        !error.to_string().contains("not implemented"),
         "got {error}"
     );
 }
 
 #[tokio::test]
-async fn hysteria_v1_routes_through_runtime_to_unsupported() {
-    // End-to-end: build a SuperConfig with a Hysteria v1 outbound, route the
-    // default traffic to it via Match rule, and confirm the runtime returns
-    // Err with the same unsupported message.
+async fn hysteria_v1_routes_through_runtime_to_native_outbound() {
     let mut config = SuperConfig {
         outbounds: vec![
             OutboundConfig::Direct {
@@ -920,11 +919,16 @@ async fn hysteria_v1_routes_through_runtime_to_unsupported() {
                 auth: Some("auth".to_string()),
                 auth_str: None,
                 protocol: Some("udp".to_string()),
-                up: None,
-                down: None,
+                up: Some("100 Mbps".to_string()),
+                down: Some("200 Mbps".to_string()),
                 sni: Some("hy.example.com".to_string()),
                 skip_cert_verify: false,
                 obfs: None,
+                alpn: None,
+                receive_window_conn: None,
+                receive_window: None,
+                disable_mtu_discovery: false,
+                fast_open: false,
             },
         ],
         ..SuperConfig::default()
@@ -944,7 +948,10 @@ async fn hysteria_v1_routes_through_runtime_to_unsupported() {
         ))
         .await
         .err()
-        .expect("hysteria v1 connect must fail");
+        .expect("closed local port must fail");
+    let snapshot = find_snapshot(&runtime, "hy");
+    assert!(snapshot.tcp_supported);
+    assert!(snapshot.udp_supported);
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,14 +1040,19 @@ fn capability_report_covers_all_partial_protocols() {
             name: "hy".to_string(),
             server: "h".to_string(),
             port: 1,
-            auth: None,
+            auth: Some("auth".to_string()),
             auth_str: None,
             protocol: None,
-            up: None,
-            down: None,
+            up: Some("100 Mbps".to_string()),
+            down: Some("200 Mbps".to_string()),
             sni: None,
             skip_cert_verify: false,
             obfs: None,
+            alpn: None,
+            receive_window_conn: None,
+            receive_window: None,
+            disable_mtu_discovery: false,
+            fast_open: false,
         },
     ];
     let mut config = SuperConfig {
@@ -1059,8 +1071,8 @@ fn capability_report_covers_all_partial_protocols() {
     }
     for snap in &snapshots {
         if snap.name == "hy" {
-            assert!(!snap.tcp_supported);
-            assert!(!snap.udp_supported);
+            assert!(snap.tcp_supported);
+            assert!(snap.udp_supported);
         }
     }
 }
