@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -7,7 +7,6 @@ use sha2::{Digest, Sha224};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::Mutex as TokioMutex,
-    time::timeout,
 };
 use tokio_rustls::TlsConnector;
 
@@ -57,13 +56,8 @@ impl Outbound for TrojanOutbound {
     }
 
     fn capability(&self) -> OutboundCapability {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .trim()
-            .to_ascii_lowercase();
-        match trojan_alpn_protocols(&network, &self.alpn) {
+        let network = normalized_trojan_network(self.network.as_deref());
+        match validate_trojan_configuration(&self.password, &network, &self.alpn) {
             Ok(_) => OutboundCapability::tcp_udp("trojan-udp-associate-stream-pool"),
             Err(error) => OutboundCapability::unsupported(error.to_string()),
         }
@@ -84,8 +78,11 @@ impl Outbound for TrojanOutbound {
     ) -> anyhow::Result<BoxedStream> {
         let mut stream = self.open_transport(timeout_ms).await?;
         let request = build_trojan_request(&self.password, destination)?;
-        stream.write_all(&request).await?;
-        stream.flush().await?;
+        run_dial_phase(timeout_ms, "trojan request write", async {
+            stream.write_all(&request).await?;
+            stream.flush().await
+        })
+        .await??;
         Ok(stream)
     }
 
@@ -95,6 +92,7 @@ impl Outbound for TrojanOutbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
+        let packet = encode_trojan_udp_packet(destination, payload)?;
         let key = udp_session_key(
             self.kind(),
             self.name(),
@@ -103,21 +101,20 @@ impl Outbound for TrojanOutbound {
         );
         let session_handle = self.trojan_udp_session(&key, timeout_ms).await?;
         let mut session = session_handle.lock().await;
-        let packet = encode_trojan_udp_packet(destination, payload)?;
-        let exchange = timeout(Duration::from_millis(timeout_ms), async {
+        let exchange = run_dial_phase(timeout_ms, "trojan udp exchange", async {
             session.stream.write_all(&packet).await?;
             session.stream.flush().await?;
             let (_response_destination, response) =
                 read_trojan_udp_packet(&mut session.stream).await?;
             anyhow::Ok(response)
         })
-        .await
-        .context("trojan udp exchange timed out")?;
-        if exchange.is_err() {
+        .await;
+        let failed = !matches!(&exchange, Ok(Ok(_)));
+        if failed {
             drop(session);
             self.remove_trojan_udp_session(&key, &session_handle).await;
         }
-        exchange
+        exchange?
     }
 }
 
@@ -155,23 +152,19 @@ impl TrojanOutbound {
     }
 
     async fn open_transport(&self, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .trim()
-            .to_ascii_lowercase();
-        if !matches!(
-            network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http" | "httpupgrade" | "http-upgrade"
-        ) {
-            return Err(anyhow!("unsupported trojan network {network}"));
-        }
+        let network = normalized_trojan_network(self.network.as_deref());
+        let alpn_protocols = validate_trojan_configuration(&self.password, &network, &self.alpn)?;
 
         let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let server_name = self.sni.as_deref().unwrap_or(&self.server).to_string();
+        let server_name = self
+            .sni
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&self.server)
+            .to_string();
         let mut tls_config = tls_client_config(self.skip_cert_verify)?;
-        tls_config.alpn_protocols = trojan_alpn_protocols(&network, &self.alpn)?;
+        tls_config.alpn_protocols = alpn_protocols;
         let connector = TlsConnector::from(Arc::new(tls_config));
         let tls_server_name = ServerName::try_from(server_name.clone())
             .map_err(|error| anyhow!("invalid trojan server name: {error}"))?;
@@ -188,7 +181,7 @@ impl TrojanOutbound {
             "ws" | "websocket" => {
                 open_websocket_transport(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
+                    nonempty_or(self.ws_host.as_deref(), &server_name),
                     self.ws_path.as_deref().unwrap_or("/"),
                     &self.transport_headers,
                     timeout_ms,
@@ -197,7 +190,7 @@ impl TrojanOutbound {
             }
             "grpc" => open_grpc_tunnel(
                 stream,
-                self.ws_host.as_deref().unwrap_or(&server_name),
+                nonempty_or(self.ws_host.as_deref(), &server_name),
                 self.grpc_service_name.as_deref(),
                 timeout_ms,
             )
@@ -205,7 +198,7 @@ impl TrojanOutbound {
             .map(|stream| Box::new(stream) as BoxedStream),
             "h2" | "http" => open_h2_tunnel(
                 stream,
-                self.ws_host.as_deref().unwrap_or(&server_name),
+                nonempty_or(self.ws_host.as_deref(), &server_name),
                 self.ws_path.as_deref().unwrap_or("/"),
                 timeout_ms,
             )
@@ -213,7 +206,7 @@ impl TrojanOutbound {
             .map(|stream| Box::new(stream) as BoxedStream),
             "httpupgrade" | "http-upgrade" => open_http_upgrade_tunnel(
                 stream,
-                self.ws_host.as_deref().unwrap_or(&server_name),
+                nonempty_or(self.ws_host.as_deref(), &server_name),
                 self.ws_path.as_deref().unwrap_or("/"),
                 &self.transport_headers,
                 timeout_ms,
@@ -229,12 +222,23 @@ impl TrojanOutbound {
         key: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<TrojanUdpSession>>> {
+        {
+            let mut pool = self.udp_sessions.lock().await;
+            let session_count = pool.len(key);
+            if let Some(session) = pool.next(key) {
+                let available = session.try_lock().is_ok();
+                if available || session_count >= UDP_SESSION_POOL_SIZE {
+                    return Ok(session);
+                }
+            }
+        }
+
+        let session = Arc::new(TokioMutex::new(
+            self.open_trojan_udp_session(timeout_ms).await?,
+        ));
         let mut pool = self.udp_sessions.lock().await;
         if pool.len(key) < UDP_SESSION_POOL_SIZE {
-            let session = Arc::new(TokioMutex::new(
-                self.open_trojan_udp_session(timeout_ms).await?,
-            ));
-            pool.push(key.to_string(), session.clone());
+            pool.push(key.to_string(), Arc::clone(&session));
             return Ok(session);
         }
         pool.next(key)
@@ -248,8 +252,11 @@ impl TrojanOutbound {
             &Destination::new("0.0.0.0", 0),
             TROJAN_CMD_UDP_ASSOCIATE,
         )?;
-        stream.write_all(&request).await?;
-        stream.flush().await?;
+        run_dial_phase(timeout_ms, "trojan udp associate write", async {
+            stream.write_all(&request).await?;
+            stream.flush().await
+        })
+        .await??;
         Ok(TrojanUdpSession { stream })
     }
 
@@ -260,6 +267,44 @@ impl TrojanOutbound {
     ) {
         let mut pool = self.udp_sessions.lock().await;
         pool.remove(key, target);
+    }
+}
+
+fn nonempty_or<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+}
+
+fn normalized_trojan_network(network: Option<&str>) -> String {
+    network
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tcp")
+        .to_ascii_lowercase()
+}
+
+fn validate_trojan_configuration(
+    password: &str,
+    network: &str,
+    alpn: &[String],
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    validate_trojan_password(password)?;
+    if !matches!(
+        network,
+        "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http" | "httpupgrade" | "http-upgrade"
+    ) {
+        return Err(anyhow!("unsupported trojan network {network}"));
+    }
+    trojan_alpn_protocols(network, alpn)
+}
+
+fn validate_trojan_password(password: &str) -> anyhow::Result<()> {
+    if password.is_empty() {
+        Err(anyhow!("trojan password must not be empty"))
+    } else {
+        Ok(())
     }
 }
 
@@ -292,7 +337,7 @@ pub(super) fn trojan_alpn_protocols(
             "ws" | "websocket" | "httpupgrade" | "http-upgrade" => {
                 vec![b"http/1.1".to_vec()]
             }
-            _ => Vec::new(),
+            _ => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         });
     }
     if matches!(network, "grpc" | "h2" | "http")
@@ -312,6 +357,7 @@ pub(super) fn trojan_alpn_protocols(
 
 const TROJAN_CMD_CONNECT: u8 = 0x01;
 const TROJAN_CMD_UDP_ASSOCIATE: u8 = 0x03;
+const TROJAN_MAX_UDP_PAYLOAD: usize = 8192;
 
 pub(super) fn build_trojan_request(
     password: &str,
@@ -325,6 +371,7 @@ fn build_trojan_request_with_command(
     destination: &Destination,
     command: u8,
 ) -> anyhow::Result<Vec<u8>> {
+    validate_trojan_password(password)?;
     let mut hasher = Sha224::new();
     hasher.update(password.as_bytes());
     let password_hash = hasher.finalize();
@@ -337,8 +384,12 @@ fn build_trojan_request_with_command(
 }
 
 fn encode_trojan_udp_packet(destination: &Destination, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if payload.len() > u16::MAX as usize {
-        return Err(anyhow!("trojan udp payload is too large"));
+    if payload.len() > TROJAN_MAX_UDP_PAYLOAD {
+        return Err(anyhow!(
+            "trojan udp payload is too large: {} bytes exceeds {}",
+            payload.len(),
+            TROJAN_MAX_UDP_PAYLOAD
+        ));
     }
     let mut packet = Vec::with_capacity(1 + 255 + 2 + 2 + 2 + payload.len());
     encode_socks5_destination(destination, &mut packet)?;
@@ -358,6 +409,11 @@ where
     let mut length = [0u8; 2];
     reader.read_exact(&mut length).await?;
     let payload_len = u16::from_be_bytes(length) as usize;
+    if payload_len > TROJAN_MAX_UDP_PAYLOAD {
+        return Err(anyhow!(
+            "invalid trojan udp payload length {payload_len}; maximum is {TROJAN_MAX_UDP_PAYLOAD}"
+        ));
+    }
     let mut crlf = [0u8; 2];
     reader.read_exact(&mut crlf).await?;
     if crlf != *b"\r\n" {

@@ -9,9 +9,9 @@
   - 协议能力基线来源：`Supercore/docs/protocol-matrix.md`
   - 仅当 matrix 标注为 `full` 时，才对外宣称“完整可用”。
   - `partial` / `parse-only` / `unsupported` 仅作功能边界说明，不作为“完整支持”承诺。
-- full：Shadowsocks、ShadowsocksR、Snell、SOCKS5。其他协议按具体路径提供能力，但尚未满足整个协议标记为 full 的证据标准。
-- partial：Trojan、VMess、VLESS、Hysteria2、TUIC、WireGuard（用户态）、AnyTLS、ShadowTLS、Naive、HTTP、SSH。
-- Trojan 已完成 TLS+TCP、UDP、WebSocket、gRPC、HTTP/2、HTTPUpgrade、自定义请求头、显式 ALPN、UDP over WS/gRPC 真实拨号；VMess 已完成 alterId=0 的 TCP、UDP、WebSocket、gRPC、HTTP/2 真实拨号。两者仍因更广泛的服务端兼容边界保守标记为 partial。
+- full：Shadowsocks、ShadowsocksR、Snell、Trojan、SOCKS5。其他协议按具体路径提供能力，但尚未满足整个协议标记为 full 的证据标准。
+- partial：VMess、VLESS、Hysteria2、TUIC、WireGuard（用户态）、AnyTLS、ShadowTLS、Naive、HTTP、SSH。
+- Trojan 支持 TLS+TCP、UDP、WebSocket、gRPC、HTTP/2、HTTPUpgrade、自定义请求头、ALPN 和 UDP over WS/gRPC，并处理 gRPC trailer、HTTPUpgrade 状态、半关闭、UDP 隧道复用、超时会话淘汰与 8192 字节 UDP 兼容边界。VMess 已完成 alterId=0 的 TCP、UDP、WebSocket、gRPC、HTTP/2 真实拨号，仍因 legacy alterId 与更广泛的服务端兼容边界保守标记为 partial。
 - Shadowsocks 支持 legacy stream、stream、AEAD、扩展 AEAD 与 Shadowsocks 2022 方法，完成 TCP/UDP 双向真实拨号、SIP022/SIP023 多用户 EIH、重放保护、simple-obfs HTTP/TLS、v2ray-plugin WebSocket/TLS 和 UoT v1/v2；SIP003 TCP plugin 的 UDP 通过 UoT 承载。
 - ShadowsocksR 覆盖 `none/dummy`、AES-CTR/CFB、RC4-MD5、ChaCha20/IETF、XChaCha20 共 11 种 stream cipher，支持 origin、verify/auth、auth_aes、auth_chain a-f、TCP/UDP、多用户、random_head、HTTP simple/post 与 TLS ticket auth/fastauth；auth_sha1_v4 的 UDP 是协议自身不适用边界。
 - Snell 默认使用 v1，支持 v1-v5 TCP、独立响应 salt、HTTP/TLS 混淆和 v3-v5 UDP-over-TCP；v5 使用公开的 v4 兼容 wire format，v4/v5 支持 `reuse: true`、10 条连接池、15 秒空闲淘汰、零帧半关闭、并发流和陈旧连接自动重拨；空 PSK 会在拨号前拒绝，v1/v2 UDP 是协议本身的明确边界。

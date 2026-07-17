@@ -771,6 +771,28 @@ fn build_trojan_udp_test_packet(
 // Trojan tests
 // ============================================================
 
+fn trojan_test_config(
+    name: &str,
+    port: u16,
+    password: &str,
+    network: Option<&str>,
+) -> OutboundConfig {
+    OutboundConfig::Trojan {
+        name: name.to_string(),
+        server: "127.0.0.1".to_string(),
+        port,
+        password: password.to_string(),
+        sni: Some("localhost".to_string()),
+        skip_cert_verify: true,
+        network: network.map(ToString::to_string),
+        ws_path: None,
+        ws_host: None,
+        grpc_service_name: None,
+        transport_headers: BTreeMap::new(),
+        alpn: Vec::new(),
+    }
+}
+
 /// Trojan TCP real dial: mock TLS server 接收 client 请求，验证 hex(SHA224) 头解析正确。
 #[tokio::test]
 async fn trojan_tcp_real_dial() -> anyhow::Result<()> {
@@ -852,6 +874,161 @@ async fn trojan_tcp_real_dial() -> anyhow::Result<()> {
     timeout(Duration::from_secs(3), stream.read_exact(&mut response)).await??;
     assert_eq!(&response, b"pong");
     let _ = timeout(Duration::from_secs(3), server).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trojan_tcp_relays_large_stream_and_propagates_half_close() -> anyhow::Result<()> {
+    const PAYLOAD_LEN: usize = 96 * 1024;
+
+    let acceptor = make_tls_acceptor_with_alpn(&[b"h2", b"http/1.1"])?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let password = "trojan-large-stream-pass";
+    let destination = Destination::new("large.example", 443);
+    let payload = (0..PAYLOAD_LEN)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let response = payload.iter().map(|byte| byte ^ 0x5a).collect::<Vec<_>>();
+    let server_payload = payload.clone();
+    let server_response = response.clone();
+    let server_destination = destination.clone();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut stream = acceptor.accept(stream).await?;
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        read_and_assert_trojan_connect(&mut stream, password, &server_destination).await?;
+
+        let mut upload = vec![0u8; PAYLOAD_LEN];
+        stream.read_exact(&mut upload).await?;
+        assert_eq!(upload, server_payload);
+        for chunk in server_response.chunks(12 * 1024) {
+            stream.write_all(chunk).await?;
+        }
+        stream.flush().await?;
+
+        let mut after_close = [0u8; 1];
+        assert_eq!(stream.read(&mut after_close).await?, 0);
+        anyhow::Ok(())
+    });
+
+    let mut config = trojan_test_config(
+        "trojan-large-stream",
+        listen_addr.port(),
+        password,
+        Some("   "),
+    );
+    if let OutboundConfig::Trojan { sni, .. } = &mut config {
+        *sni = Some("   ".to_string());
+    }
+    let outbounds = build_outbounds(&[config], None)?;
+    let mut stream = outbounds
+        .get("trojan-large-stream")
+        .ok_or_else(|| anyhow!("large-stream Trojan outbound not built"))?
+        .connect(&destination, 3000)
+        .await?;
+    stream.write_all(&payload).await?;
+    stream.flush().await?;
+    let mut actual = vec![0u8; PAYLOAD_LEN];
+    timeout(Duration::from_secs(3), stream.read_exact(&mut actual)).await??;
+    assert_eq!(actual, response);
+    stream.shutdown().await?;
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trojan_wrong_password_is_rejected_by_server() -> anyhow::Result<()> {
+    let acceptor = make_tls_acceptor()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let expected_password = "trojan-correct-password";
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut stream = acceptor.accept(stream).await?;
+        let mut password_hash = [0u8; 56];
+        stream.read_exact(&mut password_hash).await?;
+        let expected_hash = hex_lower(&Sha224::digest(expected_password.as_bytes()));
+        assert_ne!(password_hash.as_slice(), expected_hash.as_bytes());
+        stream.shutdown().await?;
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[trojan_test_config(
+            "trojan-wrong-password",
+            listen_addr.port(),
+            "trojan-wrong-password",
+            None,
+        )],
+        None,
+    )?;
+    let mut stream = outbounds
+        .get("trojan-wrong-password")
+        .ok_or_else(|| anyhow!("wrong-password Trojan outbound not built"))?
+        .connect(&Destination::new("target.example", 443), 3000)
+        .await?;
+    let mut response = [0u8; 1];
+    let count = timeout(Duration::from_secs(3), stream.read(&mut response)).await??;
+    assert_eq!(count, 0);
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trojan_invalid_configuration_is_rejected_before_dial() -> anyhow::Result<()> {
+    for (name, password, network, expected) in [
+        (
+            "trojan-empty-password",
+            "",
+            None,
+            "password must not be empty",
+        ),
+        (
+            "trojan-unknown-network",
+            "password",
+            Some("not-a-network"),
+            "unsupported trojan network",
+        ),
+    ] {
+        let outbounds = build_outbounds(&[trojan_test_config(name, 1, password, network)], None)?;
+        let outbound = outbounds
+            .get(name)
+            .ok_or_else(|| anyhow!("invalid-config Trojan outbound not built"))?;
+        let capability = outbound.capability();
+        assert!(!capability.tcp_supported);
+        assert!(!capability.udp_supported);
+        assert!(capability
+            .limitations
+            .iter()
+            .any(|value| value.contains(expected)));
+        let error = match outbound
+            .connect(&Destination::new("target.example", 443), 100)
+            .await
+        {
+            Ok(_) => return Err(anyhow!("invalid Trojan configuration dialed")),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(expected));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn trojan_oversized_udp_is_rejected_before_dial() -> anyhow::Result<()> {
+    let outbounds = build_outbounds(
+        &[trojan_test_config("trojan-large-udp", 1, "password", None)],
+        None,
+    )?;
+    let error = outbounds
+        .get("trojan-large-udp")
+        .ok_or_else(|| anyhow!("large-UDP Trojan outbound not built"))?
+        .udp_exchange(&Destination::new("udp.example", 443), &[0u8; 8193], 100)
+        .await
+        .expect_err("oversized Trojan UDP unexpectedly dialed");
+    assert!(error.to_string().contains("exceeds 8192"));
     Ok(())
 }
 
@@ -1486,6 +1663,108 @@ async fn trojan_udp_real_dial() -> anyhow::Result<()> {
     .await??;
     assert_eq!(response, b"hello-udp");
     let _ = timeout(Duration::from_secs(3), server).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trojan_udp_reuses_idle_tls_session() -> anyhow::Result<()> {
+    let acceptor = make_tls_acceptor()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let password = "udp-session-reuse-secret";
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut stream = acceptor.accept(stream).await?;
+        let mut associate = [0u8; 68];
+        stream.read_exact(&mut associate).await?;
+        assert_trojan_udp_associate_request(&associate, password)?;
+
+        for expected in [b"first".as_slice(), b"second".as_slice()] {
+            let (destination, payload) = read_trojan_udp_test_packet(&mut stream).await?;
+            assert_eq!(payload, expected);
+            let reply = build_trojan_udp_test_packet(&destination, &payload)?;
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+        }
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[trojan_test_config(
+            "trojan-udp-session-reuse",
+            listen_addr.port(),
+            password,
+            None,
+        )],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("trojan-udp-session-reuse")
+        .ok_or_else(|| anyhow!("session-reuse Trojan outbound not built"))?;
+    let destination = Destination::new("echo.example", 7777);
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        let response = outbound.udp_exchange(&destination, payload, 3000).await?;
+        assert_eq!(response, payload);
+    }
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn trojan_udp_timeout_evicts_stale_session() -> anyhow::Result<()> {
+    let acceptor = make_tls_acceptor()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let password = "udp-timeout-eviction-secret";
+
+    let server = tokio::spawn(async move {
+        let mut stalled = Vec::new();
+        for index in 0..5 {
+            let (stream, _) = listener.accept().await?;
+            let mut stream = acceptor.accept(stream).await?;
+            let mut associate = [0u8; 68];
+            stream.read_exact(&mut associate).await?;
+            assert_trojan_udp_associate_request(&associate, password)?;
+            let (destination, payload) = read_trojan_udp_test_packet(&mut stream).await?;
+            if index < 4 {
+                stalled.push(stream);
+                continue;
+            }
+
+            let reply = build_trojan_udp_test_packet(&destination, &payload)?;
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+        }
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[trojan_test_config(
+            "trojan-udp-timeout-eviction",
+            listen_addr.port(),
+            password,
+            None,
+        )],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("trojan-udp-timeout-eviction")
+        .ok_or_else(|| anyhow!("timeout-eviction Trojan outbound not built"))?;
+    let destination = Destination::new("echo.example", 7777);
+    for _ in 0..4 {
+        let error = outbound
+            .udp_exchange(&destination, b"timeout", 30)
+            .await
+            .expect_err("stalled Trojan UDP exchange unexpectedly succeeded");
+        assert!(error.to_string().contains("trojan udp exchange timed out"));
+    }
+
+    let response = outbound
+        .udp_exchange(&destination, b"recovered", 3000)
+        .await?;
+    assert_eq!(response, b"recovered");
+    timeout(Duration::from_secs(3), server).await???;
     Ok(())
 }
 

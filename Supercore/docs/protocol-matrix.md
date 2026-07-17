@@ -15,7 +15,7 @@
 |------|-----------|----------|----------|----------|--------|------|------|
 | Shadowsocks | full | full | full | full | tcp/simple-obfs/v2ray-ws/UoT | full | 覆盖 legacy stream、stream、AEAD、扩展 AEAD 与 Shadowsocks 2022 方法；TCP/UDP、SIP022、SIP023 多用户 EIH、response salt、session/replay protection、simple-obfs HTTP/TLS、v2ray-plugin WebSocket/TLS 和 UoT v1/v2 均有真实拨号；SIP003 TCP plugin 的 UDP 通过 UoT 承载 |
 | ShadowsocksR | full | full | full | full | tcp/random_head/http_simple/http_post/tls1.2_ticket | full | `none/dummy`、AES-CTR/CFB、RC4-MD5、ChaCha20/IETF、XChaCha20 共 11 种 stream cipher；origin、verify_simple、auth_simple、auth_sha1/v2/v4、auth_aes128_md5/sha1、auth_chain_a-f、TCP/UDP、多用户、random_head、HTTP simple/post、TLS ticket auth/fastauth 均有真实拨号；auth_sha1_v4 的 UDP 为协议自身不适用边界 |
-| Trojan | full | full | full | full | tcp/ws/grpc/h2/httpupgrade | partial | TLS+TCP、UDP、WS、gRPC、H2、HTTPUpgrade 均有 `build_outbounds` 真实 mock 拨号；支持自定义 transport headers、显式 ALPN、UDP over WS/gRPC 和明确失败分类，其他边界组合仍持续验证 |
+| Trojan | full | full | full | full | tcp/ws/grpc/h2/httpupgrade | full | TLS+TCP、UDP、WS、gRPC、H2、HTTPUpgrade 均有 `build_outbounds` 真实 mock 拨号；支持自定义 transport headers、显式/默认 ALPN、UDP over WS/gRPC、gRPC trailer 与 HTTPUpgrade 状态；覆盖 96KB 双向流、半关闭、错误密码、TLS/transport 超时、空密码/未知 network 拨号前拒绝、8192 字节 UDP 边界、空闲 UDP 隧道复用和超时会话淘汰 |
 | VMess | full | full | full | full | tcp/ws/grpc/h2 | partial | alterId=0 AEAD 的 TCP、WS、gRPC、H2、per-destination UDP 均有 `build_outbounds` 真实集成测试；legacy alterId 和更广泛兼容组合未覆盖 |
 | VLESS | full | full | full | partial | tcp/ws/grpc/h2/httpupgrade | partial | Reality/Vision 字段兼容；Vision/Reality 边界字段仍有既定限制 |
 | Hysteria v1 | parse-only | parse-only | none | none | quic | parse-only | `outbound` 走 `UnsupportedProtocolOutbound`（见 `src/outbound/mod.rs:377-380`），native 拨号当前未实现；doctor `classify_outbound_with_capability` 在 `core/mod.rs:1300-1301` 返回 ParseOnly（`tcp_supported=false`, `udp_supported=false`, `limitations` 包含 `hysteria is recognized in config/subscriptions but native dialing is not implemented yet`）。测试断言：`tests/remaining_protocols.rs::hysteria_v1_dial_returns_unsupported_error` + `hysteria_v1_capability_marks_unsupported` + `hysteria_v1_routes_through_runtime_to_unsupported`。 |
@@ -82,9 +82,8 @@
 2. **Hysteria v1**: Mihomo 完整支持，Supercore 仍为 `parse-only`
 3. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
 4. **Reality/Vision**: Mihomo 完整支持，Supercore 部分支持
-5. **Trojan compatibility edges**: WS/gRPC/H2/HTTPUpgrade、自定义 headers、ALPN、UDP over WS/gRPC 已实拨，更多服务端差异组合仍需兼容验证
-6. **VMess compatibility**: alterId=0 的 TCP/WS/gRPC/H2/UDP 已实拨，legacy alterId 与更多边界组合待补
-7. **QUIC E2E**: Hysteria2/TUIC 缺完整本地服务端端到端验证
+5. **VMess compatibility**: alterId=0 的 TCP/WS/gRPC/H2/UDP 已实拨，legacy alterId 与更多边界组合待补
+6. **QUIC E2E**: Hysteria2/TUIC 缺完整本地服务端端到端验证
 
 ## 已有测试
 
