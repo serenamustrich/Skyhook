@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.24（完成 `NEXT-011F` 的 AnyTLS 与 ShadowTLS，继续 Naive 收口）
+> 计划版本：v1.25（完成 `NEXT-011F` 的 AnyTLS、ShadowTLS 与 Naive，进入 `NEXT-011G`）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-011F`。
+> M2 进行中，当前直接执行点为 `NEXT-011G`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -387,7 +387,7 @@ M1 Outbound 第一批已实现、验证并提交：
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
 1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`、
-   `NEXT-011E`、`NEXT-011F` 的 AnyTLS 与 ShadowTLS 已完成；继续执行 `NEXT-011F` 的 Naive 收口。
+   `NEXT-011E`、`NEXT-011F` 已完成；继续执行 `NEXT-011G` 的 HTTP、SOCKS5、SSH 与 M2 集中验收。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1217,7 +1217,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - 本地双端 E2E 覆盖 IPv4/IPv6 TCP、96KB 数据、UDP 会话复用、远程 DNS、双 Peer、
        最长前缀、DNS UDP-to-TCP fallback、保活和重复密文拒绝；`cargo check --all-targets`、192 项 lib、21 项
        plan behavior 和 29 项 remaining protocols 回归通过。
-   - [ ] `NEXT-011F`：AnyTLS/ShadowTLS/Naive 完整能力收口。
+   - [x] `NEXT-011F`：AnyTLS/ShadowTLS/Naive 完整能力收口。
      - [x] AnyTLS v2：TLS auth、官方/动态 padding、SYNACK、心跳、会话复用与空闲回收、
        TCP 和 sing-box UoT v2 UDP 均已实现；独立 TLS 服务端覆盖 96KB 数据、并发流、
        UDP、单会话复用和超时淘汰。
@@ -1226,7 +1226,11 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        `shadow-tls` plugin 已完成；错密码与证书错误会明确拒绝。独立 E2E 覆盖 96KB TCP、
        plugin 往返和 camouflage；`cargo check --all-targets`、198 项 lib、28 项 remaining
        protocols、29 项 SS 实拨和 4 项 ShadowTLS 实拨回归通过。
-     - [ ] Naive：等待 HTTP/2、按配置 HTTP/3、Basic auth、padding 和协议适用边界收口。
+     - [x] Naive：默认 HTTP/2、显式 HTTP/3、HTTP/1.1 兼容、Basic Auth、官方 header/payload
+       padding、H2/H3 会话复用和 IPv6 target 均已实现；协议没有 CONNECT-UDP，H3 与仅 TCP
+       dialer-proxy 组合会明确拒绝。独立服务端 E2E 覆盖 H2/H3 单连接双流、每流 96KB、
+       认证与 407 不重拨；`cargo check --all-targets`、203 项 lib、28 项 remaining protocols
+       和 3 项 Naive 实拨回归通过。本批没有新增 Clippy 错误，全仓历史 Clippy 债务留在 M11。
    - [ ] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
 
 ### 11.1 协议完成标准

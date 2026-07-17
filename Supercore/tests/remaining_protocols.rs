@@ -754,6 +754,11 @@ async fn naive_outbound_sends_connect_to_mock() {
                     text.starts_with("CONNECT target.example:443 HTTP/1.1\r\n"),
                     "expected naive CONNECT, got {text}"
                 );
+                assert!(
+                    text.contains("Padding-Type-Request: 1, 0\r\n"),
+                    "missing Naive padding negotiation: {text}"
+                );
+                assert!(text.contains("Padding: "), "missing Naive padding: {text}");
                 let _ = stream
                     .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                     .await;
@@ -783,7 +788,9 @@ async fn naive_outbound_sends_connect_to_mock() {
     )
     .await
     .expect("naive connect should not hang");
-    let _ = result;
+    if let Err(error) = result {
+        panic!("naive HTTP/1.1 CONNECT failed: {error:#}");
+    }
     let _ = server.await;
 }
 
@@ -809,11 +816,11 @@ fn naive_capability_reports_no_udp() {
         snapshot
             .limitations
             .iter()
-            .any(|item| item.contains("naive udp is not supported")),
+            .any(|item| item.contains("CONNECT-UDP is not part of the protocol")),
         "got {:?}",
         snapshot.limitations,
     );
-    assert_eq!(snapshot.udp_mode.as_deref(), Some("tls-http-connect"));
+    assert_eq!(snapshot.udp_mode, None);
 }
 
 // ---------------------------------------------------------------------------

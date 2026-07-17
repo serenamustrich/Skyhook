@@ -579,19 +579,36 @@ impl SubscriptionNode {
                     &["skip-cert-verify", "allowInsecure", "insecure"],
                 ),
             }),
-            NodeProtocol::Naive => Ok(OutboundConfig::Naive {
-                name: self.name.clone(),
-                server: self.server.clone(),
-                port: self.port,
-                username: first_param(&self.params, &["username"]),
-                password: first_param(&self.params, &["password"]),
-                sni: first_param(&self.params, &["sni", "servername", "host"]),
-                skip_cert_verify: bool_param_any(
-                    &self.params,
-                    &["skip-cert-verify", "allowInsecure", "insecure"],
-                ),
-                alpn: string_list_param(&self.params, &["alpn"]),
-            }),
+            NodeProtocol::Naive => {
+                let mut alpn = string_list_param(&self.params, &["alpn"]);
+                if alpn.is_empty() {
+                    if let Some(transport) =
+                        first_param(&self.params, &["network", "transport", "protocol"])
+                    {
+                        alpn = match transport.trim().to_ascii_lowercase().as_str() {
+                            "h3" | "http3" | "http/3" | "quic" => vec!["h3".to_string()],
+                            "h2" | "http2" | "http/2" | "https" => vec!["h2".to_string()],
+                            "h1" | "http1" | "http/1" | "http/1.1" => {
+                                vec!["http/1.1".to_string()]
+                            }
+                            _ => Vec::new(),
+                        };
+                    }
+                }
+                Ok(OutboundConfig::Naive {
+                    name: self.name.clone(),
+                    server: self.server.clone(),
+                    port: self.port,
+                    username: first_param(&self.params, &["username"]),
+                    password: first_param(&self.params, &["password"]),
+                    sni: first_param(&self.params, &["sni", "servername", "host"]),
+                    skip_cert_verify: bool_param_any(
+                        &self.params,
+                        &["skip-cert-verify", "allowInsecure", "insecure"],
+                    ),
+                    alpn,
+                })
+            }
             NodeProtocol::Ssh => Ok(OutboundConfig::Ssh {
                 name: self.name.clone(),
                 server: self.server.clone(),
@@ -3138,6 +3155,63 @@ proxies:
                 assert_eq!(sni.as_deref(), Some("cdn.example.com"));
                 assert_eq!(congestion_control.as_deref(), Some("bbr"));
                 assert_eq!(udp_relay_mode.as_deref(), Some("native"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_naive_yaml_h3_transport_and_credentials() {
+        let text = r#"
+proxies:
+  - name: Naive-H3
+    type: naive
+    server: naive.example.com
+    port: 443
+    username: alice
+    password: secret
+    sni: edge.example.com
+    network: quic
+    skip-cert-verify: true
+"#;
+        let document = parse_subscription(text).unwrap();
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Naive {
+                username,
+                password,
+                sni,
+                skip_cert_verify,
+                alpn,
+                ..
+            } => {
+                assert_eq!(username.as_deref(), Some("alice"));
+                assert_eq!(password.as_deref(), Some("secret"));
+                assert_eq!(sni.as_deref(), Some("edge.example.com"));
+                assert!(skip_cert_verify);
+                assert_eq!(alpn, vec!["h3"]);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_naive_uri_h2_alpn_and_percent_encoded_auth() {
+        let uri = "naive://alice%40team:p%40ss@naive.example.com:443?alpn=h2&sni=edge.example.com#Naive-H2";
+        let document = parse_subscription(uri).unwrap();
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Naive {
+                name,
+                username,
+                password,
+                sni,
+                alpn,
+                ..
+            } => {
+                assert_eq!(name, "Naive-H2");
+                assert_eq!(username.as_deref(), Some("alice@team"));
+                assert_eq!(password.as_deref(), Some("p@ss"));
+                assert_eq!(sni.as_deref(), Some("edge.example.com"));
+                assert_eq!(alpn, vec!["h2"]);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

@@ -25,7 +25,7 @@
 | WireGuard | full | full | full | full | udp/userspace-netstack | full | BoringTun Noise 握手与计数器、真实用户态 TCP/UDP、IPv4/IPv6、隧道内 DNS（UDP 截断后回退 TCP）、MTU、reserved、pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由；配置错误在拨号前明确拒绝 |
 | AnyTLS | full | full | full | full | tcp/UoT-v2 | full | v2 TLS auth、官方 padding 与服务端动态更新、SYNACK、心跳、会话复用、空闲回收、TCP 和 sing-box UoT v2 UDP；独立 TLS 服务端覆盖 96KB TCP、并发流、UDP、单会话复用和超时淘汰 |
 | ShadowTLS | full | full | full | not-applicable | tcp/ss-plugin/dialer-proxy | full | 严格 v3 TLS 1.3 ClientHello HMAC、握手 ApplicationData 校验/XOR 还原、HelloRetryRequest、TLS camouflage、证书与密码错误边界均已实现；独立 SOCKS5 data backend、dialer-proxy 和 Shadowsocks `shadow-tls` SIP003 plugin 有真实拨号。ShadowTLS 原生是 TCP transport，Shadowsocks UDP 通过 UoT 承载 |
-| Naive | full | full | partial | none | tcp | partial | HTTP/1.1 CONNECT，UDP 与扩展能力未完成 |
+| Naive | full | full | full | not-applicable | h1/h2/h3 | full | 默认 HTTP/2 CONNECT，支持显式 HTTP/3 CONNECT 和 HTTP/1.1 兼容路径；Basic Auth、官方 16-32 字节非索引 header padding、双向前 8 帧 payload padding、H2/H3 单连接多流复用、IPv6 authority、407/证书/状态错误边界均已实现。NaiveProxy 只承载 TCP 流，协议没有 CONNECT-UDP；H3 与仅 TCP 的 dialer-proxy 组合会在拨号前明确拒绝，避免静默直连泄漏 |
 | HTTP | full | full | partial | none | tcp | partial | UDP not implemented |
 | SOCKS5 | full | full | full | full | tcp | full | - |
 | SSH | full | full | partial | none | tcp | partial | SSH-ASSOC/tcp stream path 已支持，UDP 未实现 |
@@ -42,6 +42,7 @@
 | WebSocket | full | path/headers/early-data |
 | gRPC | full | serviceName/multi-mode |
 | HTTP/2 | full | host/path |
+| HTTP/3 CONNECT | full | Naive 显式 H3 传输支持 Basic Auth、padding 和多流复用 |
 | HTTPUpgrade | full | Trojan、VMess 与 VLESS 均有真实拨号、自定义 headers 和非 101 状态校验 |
 | QUIC | full | Hysteria2/TUIC 具有普通、Salamander、Gecko、native datagram、单向流 UDP 和 TLS 恢复的本地真实服务端 E2E |
 | XTLS Vision | full | VLESS 双向 padding、TLS 1.3 ServerHello 判定、方向独立切换和 direct copy 均有真实 mock 拨号 |
@@ -76,6 +77,8 @@
 - ShadowTLS v3 的 ClientHello 认证、TLS handshake wrapper、camouflage、data HMAC 和 backend
   组合位于 `src/outbound/shadowtls.rs`；Shadowsocks plugin 接入位于
   `src/outbound/shadowsocks.rs`。
+- Naive 的 HTTP/1.1、HTTP/2、HTTP/3 CONNECT、Basic Auth、padding、连接复用和错误边界
+  位于 `src/outbound/naive.rs`；H3 遇到仅支持 TCP 的 dialer-proxy 时会明确拒绝。
 - 跨协议 UDP association、NAT key、session pool、背压、idle eviction、reassembly、
   replay window 和统计位于 `src/outbound/udp/`；协议私有 wire format 保留在各协议模块。
 - 两者共用的 endpoint 连接生命周期、QUIC varint 和连接超时位于
@@ -102,4 +105,6 @@
   `tests/remaining_protocols.rs`
 - ShadowTLS: `tests/shadowtls_real_dial.rs`，覆盖独立服务端 96KB TCP、HelloRetryRequest、
   Shadowsocks plugin、错密码、证书拒绝和 camouflage
-- SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / Naive / Hysteria v1: `tests/remaining_protocols.rs`
+- Naive: `tests/naive_real_dial.rs`，覆盖 H2/H3 单连接双流复用、每流 96KB 数据、Basic Auth、
+  header/payload padding 和 407 不重拨；H1 兼容与 UDP 不适用边界位于 `tests/remaining_protocols.rs`
+- SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / Hysteria v1: `tests/remaining_protocols.rs`

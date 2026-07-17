@@ -41,6 +41,12 @@ where
     ACTIVE_TCP_DIALER.scope(dialer, future).await
 }
 
+pub(crate) fn active_tcp_dialer_is_set() -> bool {
+    ACTIVE_TCP_DIALER
+        .try_with(|dialer| dialer.is_some())
+        .unwrap_or(false)
+}
+
 pub(crate) async fn connect_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
     let active = active_dial_context();
     if let Some(dialer) = ACTIVE_TCP_DIALER.try_with(Clone::clone).ok().flatten() {

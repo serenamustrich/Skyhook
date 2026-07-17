@@ -29,6 +29,10 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   handshake records, HelloRetryRequest handling, active-probe camouflage, and strict certificate
   boundaries. Standalone SOCKS5 data backends, dialer-proxy composition, and the Shadowsocks
   `shadow-tls` SIP003 plugin have independent real-dial coverage; native ShadowTLS is TCP-only.
+- NaiveProxy HTTP/2 CONNECT, explicitly selected HTTP/3 CONNECT, and HTTP/1.1 compatibility with
+  Basic authentication, official non-index header padding, bidirectional padding for the first
+  eight payload frames, multiplexed sessions, and IPv6 targets. NaiveProxy transports TCP streams;
+  CONNECT-UDP is an explicit not-applicable boundary.
 - ShadowsocksR TCP/UDP for none/dummy, AES-CTR/CFB, RC4-MD5, ChaCha20, ChaCha20-IETF, and
   XChaCha20; authenticated
   `verify_simple`, `auth_simple`, `auth_sha1`, `auth_sha1_v2`, `auth_sha1_v4`,
@@ -121,9 +125,9 @@ Current matrix details are in `docs/protocol-matrix.md`:
 
 - **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **partial**: Naive, HTTP, and SSH while their documented gaps remain
+- **partial**: HTTP and SSH while their documented gaps remain
 - **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria2, TUIC,
-  WireGuard, AnyTLS, ShadowTLS, and SOCKS5
+  WireGuard, AnyTLS, ShadowTLS, Naive, and SOCKS5
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently

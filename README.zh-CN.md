@@ -9,8 +9,8 @@
   - 协议能力基线来源：`Supercore/docs/protocol-matrix.md`
   - 仅当 matrix 标注为 `full` 时，才对外宣称“完整可用”。
   - `partial` / `parse-only` / `unsupported` 仅作功能边界说明，不作为“完整支持”承诺。
-- full：Shadowsocks、ShadowsocksR、Snell、Trojan、VMess、VLESS、Hysteria2、TUIC、WireGuard、AnyTLS、ShadowTLS、SOCKS5。其他协议按具体路径提供能力，但尚未满足整个协议标记为 full 的证据标准。
-- partial：Naive、HTTP、SSH。
+- full：Shadowsocks、ShadowsocksR、Snell、Trojan、VMess、VLESS、Hysteria2、TUIC、WireGuard、AnyTLS、ShadowTLS、Naive、SOCKS5。其他协议按具体路径提供能力，但尚未满足整个协议标记为 full 的证据标准。
+- partial：HTTP、SSH。
 - Trojan 支持 TLS+TCP、UDP、WebSocket、gRPC、HTTP/2、HTTPUpgrade、自定义请求头、ALPN 和 UDP over WS/gRPC，并处理 gRPC trailer、HTTPUpgrade 状态、半关闭、UDP 隧道复用、超时会话淘汰与 8192 字节 UDP 兼容边界。VMess 支持 AEAD 与 legacy alterId、TCP/UDP、WebSocket、gRPC、HTTP/2、HTTP camouflage、HTTPUpgrade、自定义请求头和 ALPN，并覆盖多帧长连接、认证 EOF、多目的 UDP、错误认证及超时会话恢复；XHTTP 会在拨号前明确返回不支持。
 - Shadowsocks 支持 legacy stream、stream、AEAD、扩展 AEAD 与 Shadowsocks 2022 方法，完成 TCP/UDP 双向真实拨号、SIP022/SIP023 多用户 EIH、重放保护、simple-obfs HTTP/TLS、v2ray-plugin WebSocket/TLS 和 UoT v1/v2；SIP003 TCP plugin 的 UDP 通过 UoT 承载。
 - ShadowsocksR 覆盖 `none/dummy`、AES-CTR/CFB、RC4-MD5、ChaCha20/IETF、XChaCha20 共 11 种 stream cipher，支持 origin、verify/auth、auth_aes、auth_chain a-f、TCP/UDP、多用户、random_head、HTTP simple/post 与 TLS ticket auth/fastauth；auth_sha1_v4 的 UDP 是协议自身不适用边界。
@@ -21,6 +21,7 @@
 - WireGuard 使用 BoringTun 与用户态 TCP/IP 栈，支持 IPv4/IPv6、TCP/UDP、隧道内 DNS、MTU、reserved、pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由。
 - AnyTLS v2 支持 TLS 认证、官方 padding 与服务端动态更新、会话复用和空闲回收、SYNACK、心跳、TCP 与 sing-box UoT v2 UDP；独立 TLS 服务端测试覆盖 96KB 数据、多路流、UDP 与会话复用。
 - ShadowTLS v3 支持 TLS 1.3 ClientHello HMAC 认证、握手 ApplicationData 校验与还原、TLS camouflage、HelloRetryRequest、证书/密码错误边界、独立 SOCKS5 backend 和 Shadowsocks `shadow-tls` 插件组合；协议原生为 TCP transport，Shadowsocks UDP 由 UoT 承载。
+- Naive 支持 HTTP/2 CONNECT、显式 HTTP/3 CONNECT 和 HTTP/1.1 兼容路径，完整发送 Basic Auth、官方 16-32 字节非索引请求头 padding 与双向前 8 帧 payload padding；支持 H2/H3 连接复用、IPv6 目标和明确的 407/证书/状态错误。NaiveProxy 原生只隧道化 TCP 流，CONNECT-UDP 为协议不适用边界。
 - parse-only：Hysteria v1、Mieru、Juicity、MASQUE、OpenVPN。
 - 订阅能力：支持多订阅导入、切换、更新、缓存、生命周期计量。
 - 规则能力：支持主要规则目标与 RULE-SET 规则源。

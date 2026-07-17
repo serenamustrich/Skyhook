@@ -27,7 +27,7 @@ pub(crate) use quic::{
     random_u16, random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
 };
 pub(crate) use socket_options::bind_interface;
-pub(crate) use tcp::{connect_tcp, order_addresses, scope_tcp_dialer};
+pub(crate) use tcp::{active_tcp_dialer_is_set, connect_tcp, order_addresses, scope_tcp_dialer};
 pub(crate) use tls::{tls13_client_config, tls_client_config};
 pub(crate) use websocket::{open_websocket_transport, open_websocket_transport_without_headers};
 
