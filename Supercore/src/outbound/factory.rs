@@ -411,6 +411,9 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             sni,
             skip_cert_verify,
             alpn,
+            idle_session_check_interval,
+            idle_session_timeout,
+            min_idle_session,
         } => Arc::new(AnyTlsOutbound::new(
             name.clone(),
             server.clone(),
@@ -419,6 +422,9 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             sni.clone(),
             *skip_cert_verify,
             alpn.clone(),
+            *idle_session_check_interval,
+            *idle_session_timeout,
+            *min_idle_session,
         )),
         OutboundConfig::ShadowTls {
             name,

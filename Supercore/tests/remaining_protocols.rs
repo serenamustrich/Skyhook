@@ -620,6 +620,9 @@ async fn anytls_outbound_does_not_hang_against_tls_server() {
             sni: Some("anytls.example.com".to_string()),
             skip_cert_verify: true,
             alpn: vec![],
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
         }],
         None,
     )
@@ -636,7 +639,7 @@ async fn anytls_outbound_does_not_hang_against_tls_server() {
 }
 
 #[test]
-fn anytls_capability_reports_no_udp() {
+fn anytls_capability_reports_uot_v2_udp() {
     let config = config_with_default(
         "anytls-cap",
         OutboundConfig::AnyTls {
@@ -647,19 +650,16 @@ fn anytls_capability_reports_no_udp() {
             sni: None,
             skip_cert_verify: false,
             alpn: vec!["h2".to_string()],
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
         },
     );
     let runtime = Runtime::new(config).expect("runtime");
     let snapshot = find_snapshot(&runtime, "anytls-cap");
-    assert!(!snapshot.udp_supported);
-    assert!(
-        snapshot
-            .limitations
-            .iter()
-            .any(|item| item.contains("anytls udp is not supported")),
-        "got {:?}",
-        snapshot.limitations,
-    );
+    assert!(snapshot.tcp_supported);
+    assert!(snapshot.udp_supported);
+    assert_eq!(snapshot.udp_mode.as_deref(), Some("anytls-uot-v2"));
 }
 
 #[test]
@@ -1028,6 +1028,9 @@ fn capability_report_covers_all_partial_protocols() {
             sni: None,
             skip_cert_verify: false,
             alpn: vec![],
+            idle_session_check_interval: None,
+            idle_session_timeout: None,
+            min_idle_session: None,
         },
         OutboundConfig::ShadowTls {
             name: "shadow".to_string(),

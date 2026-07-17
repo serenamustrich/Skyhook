@@ -542,6 +542,29 @@ impl SubscriptionNode {
                     &["skip-cert-verify", "allowInsecure", "insecure"],
                 ),
                 alpn: string_list_param(&self.params, &["alpn"]),
+                idle_session_check_interval: first_param(
+                    &self.params,
+                    &["idle-session-check-interval", "idle_session_check_interval"],
+                )
+                .map(|value| parse_u64_text(&value, "anytls idle session check interval"))
+                .transpose()?,
+                idle_session_timeout: first_param(
+                    &self.params,
+                    &["idle-session-timeout", "idle_session_timeout"],
+                )
+                .map(|value| parse_u64_text(&value, "anytls idle session timeout"))
+                .transpose()?,
+                min_idle_session: first_param(
+                    &self.params,
+                    &["min-idle-session", "min_idle_session"],
+                )
+                .map(|value| parse_u64_text(&value, "anytls minimum idle sessions"))
+                .transpose()?
+                .map(|value| {
+                    usize::try_from(value)
+                        .context("anytls minimum idle sessions exceeds platform limits")
+                })
+                .transpose()?,
             }),
             NodeProtocol::ShadowTls => Ok(OutboundConfig::ShadowTls {
                 name: self.name.clone(),
@@ -2141,6 +2164,41 @@ proxies:
         assert!(error
             .to_string()
             .contains("invalid wireguard reserved byte 'not-a-byte'"));
+    }
+
+    #[test]
+    fn converts_anytls_v2_session_options_without_losing_values() {
+        let text = r#"
+proxies:
+  - name: ANYTLS-V2
+    type: anytls
+    server: anytls.example.com
+    port: 443
+    password: secret
+    sni: edge.example.com
+    alpn: [h2, http/1.1]
+    idle-session-check-interval: 11
+    idle-session-timeout: 22
+    min-idle-session: 3
+"#;
+
+        let document = parse_subscription(text).unwrap();
+        let outbound = document.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::AnyTls {
+                idle_session_check_interval,
+                idle_session_timeout,
+                min_idle_session,
+                alpn,
+                ..
+            } => {
+                assert_eq!(idle_session_check_interval, Some(11));
+                assert_eq!(idle_session_timeout, Some(22));
+                assert_eq!(min_idle_session, Some(3));
+                assert_eq!(alpn, vec!["h2", "http/1.1"]);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
     }
 
     #[test]

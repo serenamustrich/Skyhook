@@ -675,6 +675,12 @@ pub enum OutboundConfig {
         skip_cert_verify: bool,
         #[serde(default)]
         alpn: Vec<String>,
+        #[serde(default, alias = "idle-session-check-interval")]
+        idle_session_check_interval: Option<u64>,
+        #[serde(default, alias = "idle-session-timeout")]
+        idle_session_timeout: Option<u64>,
+        #[serde(default, alias = "min-idle-session")]
+        min_idle_session: Option<usize>,
     },
     ShadowTls {
         name: String,

@@ -1218,6 +1218,11 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        最长前缀、DNS UDP-to-TCP fallback、保活和重复密文拒绝；`cargo check --all-targets`、192 项 lib、21 项
        plan behavior 和 29 项 remaining protocols 回归通过。
    - [ ] `NEXT-011F`：AnyTLS/ShadowTLS/Naive 完整能力收口。
+     - [x] AnyTLS v2：TLS auth、官方/动态 padding、SYNACK、心跳、会话复用与空闲回收、
+       TCP 和 sing-box UoT v2 UDP 均已实现；独立 TLS 服务端覆盖 96KB 数据、并发流、
+       UDP、单会话复用和超时淘汰。
+     - [ ] ShadowTLS v3：等待完整握手、认证、TLS camouflage、backend 组合和错误边界收口。
+     - [ ] Naive：等待 HTTP/2、按配置 HTTP/3、Basic auth、padding 和协议适用边界收口。
    - [ ] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
 
 ### 11.1 协议完成标准

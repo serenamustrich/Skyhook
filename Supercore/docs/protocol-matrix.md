@@ -23,7 +23,7 @@
 | TUIC | full | full | full | full | quic | full | v5 TLS exporter 认证、TCP、native datagram/QUIC 单向流 UDP、fragmentation/reassembly、association 隔离、heartbeat、Dissociate、max packet 和持久 TLS 恢复均有本地真实服务端验证；恢复确认前不发送认证或业务数据，避免 0-RTT replay |
 | Snell | full | full | full | full | tcp/http/tls | full | 默认 v1；v1-v5 TCP、v3-v5 UDP-over-TCP、独立响应 salt 与 HTTP/TLS obfs 均有真实拨号测试；v5 使用公开的 v4 兼容 wire format；v4/v5 支持 `reuse: true`、10 条连接池、15 秒空闲淘汰、零帧半关闭、并发流和陈旧连接自动重拨；空 PSK 在拨号前拒绝，v1/v2 UDP 为协议自身不适用边界 |
 | WireGuard | full | full | full | full | udp/userspace-netstack | full | BoringTun Noise 握手与计数器、真实用户态 TCP/UDP、IPv4/IPv6、隧道内 DNS（UDP 截断后回退 TCP）、MTU、reserved、pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由；配置错误在拨号前明确拒绝 |
-| AnyTLS | full | full | partial | none | tcp | partial | anytls over UDP 尚未实现 |
+| AnyTLS | full | full | full | full | tcp/UoT-v2 | full | v2 TLS auth、官方 padding 与服务端动态更新、SYNACK、心跳、会话复用、空闲回收、TCP 和 sing-box UoT v2 UDP；独立 TLS 服务端覆盖 96KB TCP、并发流、UDP、单会话复用和超时淘汰 |
 | ShadowTLS | full | full | partial | none | tcp | partial | v3 支持；udp 与独立隧道行为保留限制 |
 | Naive | full | full | partial | none | tcp | partial | HTTP/1.1 CONNECT，UDP 与扩展能力未完成 |
 | HTTP | full | full | partial | none | tcp | partial | UDP not implemented |
@@ -71,6 +71,8 @@
   `src/outbound/tuic.rs`。
 - WireGuard 的 BoringTun 会话、用户态 TCP/IP 栈、TCP/UDP socket、DNS、Peer 路由、
   keepalive 和 replay/counter 处理位于 `src/outbound/wireguard.rs`。
+- AnyTLS v2 的认证、padding、会话/流调度、SYNACK、心跳、空闲回收和 UoT v2 位于
+  `src/outbound/anytls.rs`。
 - 跨协议 UDP association、NAT key、session pool、背压、idle eviction、reassembly、
   replay window 和统计位于 `src/outbound/udp/`；协议私有 wire format 保留在各协议模块。
 - 两者共用的 endpoint 连接生命周期、QUIC varint 和连接超时位于
@@ -93,5 +95,6 @@
 - Hysteria2 / TUIC: `src/outbound/tests.rs`、`tests/vless_hy2_tuic.rs`
 - WireGuard: `src/outbound/wireguard.rs` 的本地双端 E2E，覆盖 IPv4/IPv6、TCP/UDP、
   DNS、96KB 数据、多 Peer、最长前缀、保活、reserved 和重放拒绝
-- AnyTLS: `tests/real_subscription_compat.rs`
+- AnyTLS: `tests/anytls_real_dial.rs`、`src/outbound/anytls.rs` 单元测试和
+  `tests/remaining_protocols.rs`
 - SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / ShadowTLS / Naive / Hysteria v1: `tests/remaining_protocols.rs`
