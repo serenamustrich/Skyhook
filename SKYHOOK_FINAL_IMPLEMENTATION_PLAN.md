@@ -8,9 +8,9 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.10（按 2026-07-17 `4e343a3` 已提交基线重新核对）
+> 计划版本：v1.11（按 2026-07-17 `350ba26` 已提交基线重新核对）
 >
-> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008C3`。
+> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008B2`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -339,8 +339,11 @@ M1 Outbound 第一批已实现、验证并提交：
 - `NEXT-008C2` 尚未达到 `VERIFIED`：当前机器没有匹配
   `com.apple.developer.networking.multipath` 的 Apple provisioning profile，真实 Wi-Fi/
   有线网络多路径切换留在 M12 发布真机门，不能用本地 bridge 测试替代。
-- smux 当前只有配置模型且会明确拒绝启用；WebSocket early data 字段尚未接入握手。
-  这些能力必须继续实现，不得用“已解析”或“已报错”代替功能完成。
+- `NEXT-008C3` 已以 `350ba26` 提交：smux、yamux 和 h2mux 已接入真实
+  sing-mux 物理会话与逻辑流，支持连接/流上限、padding、only-tcp、UDP stream、
+  cancellation、坏会话剔除后单次重试，以及 `/v1/outbounds` 运行统计；两个并发逻辑流
+  共用一条物理连接已由本地真实对端验证。
+- WebSocket early data 字段尚未接入握手；该能力继续由 `NEXT-008B2` 收口。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
@@ -360,31 +363,29 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 完成 `NEXT-008C3`：实现 smux、yamux 和 h2mux 的连接/流生命周期、有界池、健康剔除、
-   cancellation、流量统计和 only-tcp 语义，并证明多流复用真正发生。
-2. 完成 `NEXT-008B2`：WebSocket early data、HTTPUpgrade 阶段超时、H2 GOAWAY/RST 和 QUIC
+1. 完成 `NEXT-008B2`：WebSocket early data、HTTPUpgrade 阶段超时、H2 GOAWAY/RST 和 QUIC
    pool 并发、失效重建、关闭语义的真实 mock-server 测试。
-3. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
+2. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
    统计的独立验收，不允许未实际执行的 session 被记为超时。
-4. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
+3. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
    OpenAPI 3.1 与 Swift client model。
-5. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
+4. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
    mock、config/runtime、plan behavior 和 Swift `/v1` 回归全部通过后，才将 M1 改为
    `IMPLEMENTED`；MPTCP 的外部 profile 真机证据在 M12 补齐后再改为 `VERIFIED`。
-6. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
+5. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
-7. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
+6. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
-8. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
+7. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
     多订阅本地切换、Provider、代理组、国家分组、智能规则、App/域名/IP 指定节点、
     按订阅累计流量、连接表、分类日志和 Doctor。
-9. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
+8. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
     profiling、长稳、安全、CI、供应链、开源许可和文档真实性收口。
-10. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
+9. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
     更新中英文 README，完成签名、
     公证、带既定背景和 Finder 布局的 DMG、安全扫描、GitHub 提交与 Release 下载链接。
 
-在第 10 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
+在第 9 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
 
 ## 6. 不可违反的开发规则
 
@@ -816,7 +817,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
          与 App 签名一致性，普通开发包不得因受限 entitlement 被 AMFI 终止。
        - [ ] 在具有合法 profile 的 Apple Silicon 真机验证 Wi-Fi/有线网络路径变化、
          公网远端 TCP、连接存活、流量连续性和回退行为后，才将本项改为 `VERIFIED`。
-     - [ ] `NEXT-008C3`：完成 smux、yamux、h2mux、pool limits、padding、only-tcp 和失效剔除。
+     - [x] `NEXT-008C3`：完成 smux、yamux、h2mux、pool limits、padding、only-tcp 和失效剔除。
    - [ ] `NEXT-008D`：收口公共 UDP association、NAT、fragmentation/reassembly、replay window、
      backpressure、idle eviction、cancellation 和统计证据。
    - [ ] `NEXT-008E`：收口 API 统一分页、过滤、稳定排序、游标、state 边界、OpenAPI
@@ -892,6 +893,24 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 - 默认无 profile App：Swift debug、Rust release、嵌套签名和 deep verify 通过；
   `supercore --help` 正常退出，签名中不含 multipath entitlement。
 - 真实 MPTCP 多路径切换：等待合法 Apple provisioning profile，留在 M12 验收门。
+
+`NEXT-008C3` 验证记录：
+
+- 提交：`350ba26`。
+- sing-mux 外层协议：保留地址 `sp.mux.sing-box.arpa:444`、v0/v1、三种 protocol id、
+  256–767 字节随机 padding 和前 16 帧 padding 已逐字节验证。
+- smux、yamux、h2mux：本地真实对端均通过双并发逻辑流回显；每种后端物理拨号数均为 1，
+  证明实际发生复用而非每流新建 TCP。
+- pool：max-connections、min-streams、max-streams、每物理连接 4096 流硬上限、坏会话剔除、
+  单次重建、deadline 和 cancellation 已进入生产路径。
+- UDP：sing-mux 固定目标 packet stream 往返通过；only-tcp=true 已验证绕过 mux，调用底层
+  原生 UDP。
+- 运行统计：物理连接、逻辑流、重用、失败、剔除、上传和下载计数已通过 Outbound runtime
+  stats 暴露到 `/v1/outbounds`；statistic 控制 underlay 是否在面板显示。
+- `cargo check --all-targets`：通过且无 warning。
+- Rust lib：120 passed，0 failed，0 ignored。
+- `common_outbound_options`：14 passed，0 failed；另有 1 个与本项无关的 MPTCP profile
+  真机用例按既定发布门 ignored。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。
