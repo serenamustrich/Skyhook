@@ -8,9 +8,9 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.12（按 2026-07-17 `f8ac08a` 已提交基线重新核对）
+> 计划版本：v1.13（按 2026-07-17 `87dba29` 已提交基线重新核对）
 >
-> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008D`。
+> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008E`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -312,9 +312,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `f8ac08a` 基线上重新核对：
+2026-07-17 在 `87dba29` 基线上重新核对：
 
-- 当前分支为 `main`，已提交代码基线停在 `f8ac08a`。
+- 当前分支为 `main`，已提交代码基线停在 `87dba29`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -351,6 +351,12 @@ M1 Outbound 第一批已实现、验证并提交：
   重建一次、清池时连接确实关闭。验证结果：`cargo check --all-targets` 无 warning，Rust
   lib 133 passed，transport 21 passed，Trojan/VMess 19 passed，VLESS/Hysteria2/TUIC 19
   passed，Shadowsocks 15 passed，common options 14 passed、1 个 MPTCP entitlement 测试 ignored。
+- `NEXT-008D` 已以 `87dba29` 提交：所有 leaf outbound 统一进入 bounded UDP runtime；
+  endpoint-dependent/independent association key 包含协议、节点、目标、来源、App、订阅、
+  代理组、网卡、IP 策略和 dialer chain；统一完成队列背压、总 deadline、cancellation、
+  idle/capacity eviction、流量统计、碎片重组和 SS2022 replay window。HY2/TUIC、SOCKS5、
+  Shadowsocks、Trojan、VMess、VLESS 的物理 UDP session pool 已按上下文隔离；原生 UDP/QUIC
+  配置 dialer-proxy 时明确报告 capability 限制并拒绝运行，不再静默直连泄漏。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
@@ -370,23 +376,21 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
-   统计的独立验收，不允许未实际执行的 session 被记为超时。
-2. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
+1. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
    OpenAPI 3.1 与 Swift client model。
-3. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
+2. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
    mock、config/runtime、plan behavior 和 Swift `/v1` 回归全部通过后，才将 M1 改为
    `IMPLEMENTED`；MPTCP 的外部 profile 真机证据在 M12 补齐后再改为 `VERIFIED`。
-4. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
+3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
-5. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
+4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
-6. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
+5. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
     多订阅本地切换、Provider、代理组、国家分组、智能规则、App/域名/IP 指定节点、
     按订阅累计流量、连接表、分类日志和 Doctor。
-7. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
+6. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
     profiling、长稳、安全、CI、供应链、开源许可和文档真实性收口。
-8. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
+7. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
     更新中英文 README，完成签名、
     公证、带既定背景和 Finder 布局的 DMG、安全扫描、GitHub 提交与 Release 下载链接。
 
@@ -824,7 +828,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        - [ ] 在具有合法 profile 的 Apple Silicon 真机验证 Wi-Fi/有线网络路径变化、
          公网远端 TCP、连接存活、流量连续性和回退行为后，才将本项改为 `VERIFIED`。
      - [x] `NEXT-008C3`：完成 smux、yamux、h2mux、pool limits、padding、only-tcp 和失效剔除。
-   - [ ] `NEXT-008D`：收口公共 UDP association、NAT、fragmentation/reassembly、replay window、
+   - [x] `NEXT-008D`：收口公共 UDP association、NAT、fragmentation/reassembly、replay window、
      backpressure、idle eviction、cancellation 和统计证据。
    - [ ] `NEXT-008E`：收口 API 统一分页、过滤、稳定排序、游标、state 边界、OpenAPI
      和 Swift model。
@@ -878,8 +882,8 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 - 配置构建阶段拒绝无效证书指纹、空网卡/拨号器名、非法 keepalive/QUIC MTU/
   smux 上限、未知 outbound 引用、未知 dialer-proxy 和拨号有向环。
 - 持久化订阅中的无效 common options 不再静默忽略；runtime reload 失败时保留旧状态。
-- dialer-proxy 已通过真实 TCP 底层拨号接管测试；原生 UDP/QUIC 下的链式语义
-  保留在 `NEXT-008D` 收口，本项不夸大为全网络类型已完成。
+- dialer-proxy 已通过真实 TCP 底层拨号接管测试；原生 UDP/QUIC 下无法安全使用链式
+  packet tunnel 的组合已在 `NEXT-008D` 通过 capability 和运行时错误明确拒绝，不静默直连。
 - `cargo check --all-targets`：通过且无 warning。
 - `common_outbound_options`：9 passed。
 - outbound lib：49 passed。
@@ -917,6 +921,28 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 - Rust lib：120 passed，0 failed，0 ignored。
 - `common_outbound_options`：14 passed，0 failed；另有 1 个与本项无关的 MPTCP profile
   真机用例按既定发布门 ignored。
+
+`NEXT-008D` 验证记录：
+
+- 提交：`87dba29`。
+- UDP runtime：每个 leaf outbound 均有独立的 64 并发、256 等待队列、4,096 logical
+  association 上限和 60 秒 idle eviction；未获得执行许可的请求不会计入拨号尝试或超时。
+- NAT/session key：区分 endpoint-dependent 与 endpoint-independent，纳入协议、节点、目标、
+  source/bind、inbound、App、订阅、代理组、网卡、IP strategy 和 dialer chain。
+- session pool：每个上下文最多 4 个物理 session、最多 256 个 key、60 秒 idle eviction；
+  SOCKS5、Shadowsocks、Trojan、VMess、VLESS、Hysteria2 和 TUIC 已迁入统一 keyed pool。
+- 安全边界：原生 UDP/QUIC 无 packet tunnel 时不允许 dialer-proxy 静默绕过；capability 与
+  运行时返回相同限制。
+- 数据正确性：公共 reassembly 限制 64 个进行中包、65,535 字节总载荷和 10 秒 idle；
+  拒绝重复、越界和不一致分片；SS2022 使用 64 位滑动 replay window。
+- 统计：active、waiting、attempt、成功、失败、执行超时、取消、排队超时/取消、背压拒绝、
+  association 创建/淘汰和双向字节数均进入 `/v1/outbounds` runtime stats；Core 的 UDP
+  connection 与 subscription traffic 继续按实际 payload/response 记账。
+- `cargo check --all-targets`：通过且无 warning。
+- `cargo test --tests`：Rust lib 142 passed；main 2 passed；全部协议、config/runtime、订阅、
+  transport/UDP 集成测试通过；1 个 MPTCP profile 真机测试和 1 个需显式外部订阅 URL 的测试
+  按既定门禁 ignored。
+- 私有订阅域名、URL 和 token 扫描：0 命中。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。
