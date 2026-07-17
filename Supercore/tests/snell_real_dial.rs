@@ -364,11 +364,12 @@ async fn send_server_bytes(
 }
 
 async fn run_snell_tcp(
-    version: u8,
+    configured_version: Option<u8>,
     method: Option<&str>,
     cipher: TestCipher,
     obfs: TestObfs,
 ) -> anyhow::Result<()> {
+    let version = configured_version.unwrap_or(1);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let psk = b"snell-test-psk".to_vec();
@@ -425,7 +426,7 @@ async fn run_snell_tcp(
             port: address.port(),
             psk: String::from_utf8(psk)?,
             method: method.map(ToString::to_string),
-            version: Some(version),
+            version: configured_version,
             obfs: match obfs {
                 TestObfs::Plain => None,
                 TestObfs::Http => Some("http".to_string()),
@@ -529,6 +530,94 @@ async fn run_snell_v4_tcp(version: u8, obfs: TestObfs) -> anyhow::Result<()> {
         .await
         .context("Snell v4 TCP response timed out")??;
     assert_eq!(&response, b"pong");
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snell_v4_relays_large_bidirectional_stream() -> anyhow::Result<()> {
+    const PAYLOAD_LEN: usize = 96 * 1024;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let psk = b"snell-v4-large-stream-psk".to_vec();
+    let server_psk = psk.clone();
+    let payload = (0..PAYLOAD_LEN)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let server_payload = payload.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut prefetched = Vec::new();
+        let request_salt = take_exact(&mut stream, &mut prefetched, V4_SALT_LEN).await?;
+        let request_key = derive_snell_key(TestCipher::Aes128Gcm, &server_psk, &request_salt)?;
+        let mut request_nonce = [0u8; 12];
+        let handshake = decode_v4_frame(
+            &mut stream,
+            &mut prefetched,
+            &request_key,
+            &mut request_nonce,
+        )
+        .await?;
+        assert_eq!(handshake[1], 1);
+
+        let response_salt = [0xd1; V4_SALT_LEN];
+        let response_key = derive_snell_key(TestCipher::Aes128Gcm, &server_psk, &response_salt)?;
+        let mut response_nonce = [0u8; 12];
+        let status = encode_v4_frame(&response_key, &mut response_nonce, &[0], 0)?;
+        stream.write_all(&response_salt).await?;
+        stream.write_all(&status).await?;
+        stream.flush().await?;
+
+        let mut upload = Vec::with_capacity(PAYLOAD_LEN);
+        while upload.len() < PAYLOAD_LEN {
+            upload.extend_from_slice(
+                &decode_v4_frame(
+                    &mut stream,
+                    &mut prefetched,
+                    &request_key,
+                    &mut request_nonce,
+                )
+                .await?,
+            );
+        }
+        assert_eq!(upload, server_payload);
+
+        for chunk in server_payload.chunks(12 * 1024) {
+            let frame = encode_v4_frame(&response_key, &mut response_nonce, chunk, 0)?;
+            stream.write_all(&frame).await?;
+        }
+        stream.flush().await?;
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-v4-large".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            psk: String::from_utf8(psk)?,
+            method: None,
+            version: Some(4),
+            obfs: None,
+            obfs_host: None,
+            reuse: false,
+        }],
+        None,
+    )?;
+    let mut tunnel = outbounds
+        .get("snell-v4-large")
+        .context("missing large-stream Snell outbound")?
+        .connect(&Destination::new("large.example", 443), 3000)
+        .await?;
+    tunnel.write_all(&payload).await?;
+    tunnel.flush().await?;
+    let mut response = vec![0u8; PAYLOAD_LEN];
+    timeout(Duration::from_secs(3), tunnel.read_exact(&mut response))
+        .await
+        .context("Snell large response timed out")??;
+    assert_eq!(response, payload);
     server.await??;
     Ok(())
 }
@@ -729,6 +818,138 @@ async fn serve_one_plain_v4_reuse_request(
     Ok(())
 }
 
+async fn serve_concurrent_plain_v4_reuse_request(
+    mut stream: TcpStream,
+    psk: &[u8],
+    response_salt: [u8; V4_SALT_LEN],
+) -> anyhow::Result<String> {
+    let mut prefetched = Vec::new();
+    let request_salt = take_exact(&mut stream, &mut prefetched, V4_SALT_LEN).await?;
+    let request_key = derive_snell_key(TestCipher::Aes128Gcm, psk, &request_salt)?;
+    let mut request_nonce = [0u8; 12];
+    let handshake = decode_v4_frame(
+        &mut stream,
+        &mut prefetched,
+        &request_key,
+        &mut request_nonce,
+    )
+    .await?;
+    assert_eq!(handshake[1], 5);
+    let host_len = handshake[3] as usize;
+    let host = String::from_utf8(handshake[4..4 + host_len].to_vec())?;
+
+    let response_key = derive_snell_key(TestCipher::Aes128Gcm, psk, &response_salt)?;
+    let mut response_nonce = [0u8; 12];
+    let status = encode_v4_frame(&response_key, &mut response_nonce, &[0], 0)?;
+    stream.write_all(&response_salt).await?;
+    stream.write_all(&status).await?;
+    stream.flush().await?;
+
+    let upload = decode_v4_frame(
+        &mut stream,
+        &mut prefetched,
+        &request_key,
+        &mut request_nonce,
+    )
+    .await?;
+    let echo = encode_v4_frame(&response_key, &mut response_nonce, &upload, 0)?;
+    stream.write_all(&echo).await?;
+
+    let zero = decode_v4_frame(
+        &mut stream,
+        &mut prefetched,
+        &request_key,
+        &mut request_nonce,
+    )
+    .await?;
+    assert!(zero.is_empty());
+    let zero = encode_v4_frame(&response_key, &mut response_nonce, &[], 0)?;
+    stream.write_all(&zero).await?;
+    stream.flush().await?;
+    Ok(host)
+}
+
+#[tokio::test]
+async fn snell_v4_reuse_supports_concurrent_streams() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let psk = b"snell-v4-concurrent-reuse-psk".to_vec();
+    let server_psk = psk.clone();
+
+    let server = tokio::spawn(async move {
+        let mut handlers = Vec::new();
+        for index in 0..4u8 {
+            let (stream, _) = listener.accept().await?;
+            let psk = server_psk.clone();
+            handlers.push(tokio::spawn(async move {
+                serve_concurrent_plain_v4_reuse_request(stream, &psk, [0xe0 + index; V4_SALT_LEN])
+                    .await
+            }));
+        }
+        let mut hosts = Vec::new();
+        for handler in handlers {
+            hosts.push(handler.await??);
+        }
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            [
+                "concurrent-0.example",
+                "concurrent-1.example",
+                "concurrent-2.example",
+                "concurrent-3.example",
+            ]
+        );
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-v4-concurrent".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            psk: String::from_utf8(psk)?,
+            method: None,
+            version: Some(4),
+            obfs: None,
+            obfs_host: None,
+            reuse: true,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("snell-v4-concurrent")
+        .context("missing concurrent Snell outbound")?;
+    let destinations = [
+        Destination::new("concurrent-0.example", 443),
+        Destination::new("concurrent-1.example", 443),
+        Destination::new("concurrent-2.example", 443),
+        Destination::new("concurrent-3.example", 443),
+    ];
+    let (first, second, third, fourth) = tokio::join!(
+        outbound.connect(&destinations[0], 3000),
+        outbound.connect(&destinations[1], 3000),
+        outbound.connect(&destinations[2], 3000),
+        outbound.connect(&destinations[3], 3000),
+    );
+    let mut tunnels = vec![first?, second?, third?, fourth?];
+    let payloads = [b"stream-0", b"stream-1", b"stream-2", b"stream-3"];
+    for (tunnel, payload) in tunnels.iter_mut().zip(payloads) {
+        tunnel.write_all(payload).await?;
+        tunnel.shutdown().await?;
+    }
+    for (tunnel, payload) in tunnels.iter_mut().zip(payloads) {
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), tunnel.read_to_end(&mut response))
+            .await
+            .context("concurrent Snell response timed out")??;
+        assert_eq!(response, payload);
+    }
+
+    server.await??;
+    Ok(())
+}
+
 #[tokio::test]
 async fn snell_v4_reuse_retries_stale_pooled_connection() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -796,23 +1017,183 @@ async fn snell_v4_reuse_retries_stale_pooled_connection() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn snell_v1_chacha20_tcp_real_dial() -> anyhow::Result<()> {
-    run_snell_tcp(1, None, TestCipher::Chacha20Poly1305, TestObfs::Plain).await
+    run_snell_tcp(Some(1), None, TestCipher::Chacha20Poly1305, TestObfs::Plain).await
+}
+
+#[tokio::test]
+async fn snell_defaults_to_v1_chacha20_tcp_real_dial() -> anyhow::Result<()> {
+    run_snell_tcp(None, None, TestCipher::Chacha20Poly1305, TestObfs::Plain).await
+}
+
+#[tokio::test]
+async fn snell_empty_psk_is_rejected_before_dial() -> anyhow::Result<()> {
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-empty-psk".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: 1,
+            psk: String::new(),
+            method: None,
+            version: Some(3),
+            obfs: None,
+            obfs_host: None,
+            reuse: false,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("snell-empty-psk")
+        .context("missing empty-PSK Snell outbound")?;
+    let capability = outbound.capability();
+    assert!(!capability.tcp_supported);
+    assert!(!capability.udp_supported);
+    assert!(capability
+        .limitations
+        .iter()
+        .any(|limitation| limitation.contains("PSK must not be empty")));
+
+    let tcp_error = match outbound
+        .connect(&Destination::new("target.example", 443), 100)
+        .await
+    {
+        Ok(_) => return Err(anyhow!("empty Snell PSK unexpectedly dialed TCP")),
+        Err(error) => error,
+    };
+    assert!(tcp_error.to_string().contains("PSK must not be empty"));
+    let udp_error = outbound
+        .udp_exchange(&Destination::new("dns.example", 53), b"query", 100)
+        .await
+        .expect_err("empty Snell PSK unexpectedly dialed UDP");
+    assert!(udp_error.to_string().contains("PSK must not be empty"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn snell_wrong_psk_cannot_authenticate() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server_psk = b"snell-correct-psk".to_vec();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut prefetched = Vec::new();
+        let request_salt = take_exact(&mut stream, &mut prefetched, 32).await?;
+        let request_key =
+            derive_snell_key(TestCipher::Chacha20Poly1305, &server_psk, &request_salt)?;
+        let mut request_nonce = [0u8; 12];
+        let result = decode_chunk(
+            &mut stream,
+            &mut prefetched,
+            TestCipher::Chacha20Poly1305,
+            &request_key,
+            &mut request_nonce,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "wrong Snell PSK authenticated unexpectedly"
+        );
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-wrong-psk".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            psk: "snell-wrong-psk".to_string(),
+            method: None,
+            version: Some(1),
+            obfs: None,
+            obfs_host: None,
+            reuse: false,
+        }],
+        None,
+    )?;
+    let mut tunnel = outbounds
+        .get("snell-wrong-psk")
+        .context("missing wrong-PSK Snell outbound")?
+        .connect(&Destination::new("target.example", 443), 3000)
+        .await?;
+    tunnel.write_all(b"must-not-pass").await?;
+    tunnel.flush().await?;
+    let mut response = [0u8; 1];
+    let count = timeout(Duration::from_secs(3), tunnel.read(&mut response))
+        .await
+        .context("wrong-PSK Snell stream did not close")??;
+    assert_eq!(count, 0);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snell_server_close_propagates_eof() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let psk = b"snell-server-close-psk".to_vec();
+    let server_psk = psk.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut prefetched = Vec::new();
+        let request_salt = take_exact(&mut stream, &mut prefetched, 32).await?;
+        let request_key =
+            derive_snell_key(TestCipher::Chacha20Poly1305, &server_psk, &request_salt)?;
+        let mut request_nonce = [0u8; 12];
+        let handshake = decode_chunk(
+            &mut stream,
+            &mut prefetched,
+            TestCipher::Chacha20Poly1305,
+            &request_key,
+            &mut request_nonce,
+        )
+        .await?;
+        assert_eq!(handshake[1], 1);
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Snell {
+            name: "snell-server-close".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            psk: String::from_utf8(psk)?,
+            method: None,
+            version: Some(1),
+            obfs: None,
+            obfs_host: None,
+            reuse: false,
+        }],
+        None,
+    )?;
+    let mut tunnel = outbounds
+        .get("snell-server-close")
+        .context("missing server-close Snell outbound")?
+        .connect(&Destination::new("target.example", 443), 3000)
+        .await?;
+    let mut response = [0u8; 1];
+    let count = timeout(Duration::from_secs(3), tunnel.read(&mut response))
+        .await
+        .context("closed Snell server did not propagate EOF")??;
+    assert_eq!(count, 0);
+    server.await??;
+    Ok(())
 }
 
 #[tokio::test]
 async fn snell_v2_aes128_tcp_real_dial() -> anyhow::Result<()> {
-    run_snell_tcp(2, None, TestCipher::Aes128Gcm, TestObfs::Plain).await
+    run_snell_tcp(Some(2), None, TestCipher::Aes128Gcm, TestObfs::Plain).await
 }
 
 #[tokio::test]
 async fn snell_v3_aes128_tcp_real_dial() -> anyhow::Result<()> {
-    run_snell_tcp(3, None, TestCipher::Aes128Gcm, TestObfs::Plain).await
+    run_snell_tcp(Some(3), None, TestCipher::Aes128Gcm, TestObfs::Plain).await
 }
 
 #[tokio::test]
 async fn snell_v3_aes256_http_obfs_real_dial() -> anyhow::Result<()> {
     run_snell_tcp(
-        3,
+        Some(3),
         Some("aes-256-gcm"),
         TestCipher::Aes256Gcm,
         TestObfs::Http,
@@ -822,7 +1203,7 @@ async fn snell_v3_aes256_http_obfs_real_dial() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn snell_v3_tls_obfs_real_dial() -> anyhow::Result<()> {
-    run_snell_tcp(3, None, TestCipher::Aes128Gcm, TestObfs::Tls).await
+    run_snell_tcp(Some(3), None, TestCipher::Aes128Gcm, TestObfs::Tls).await
 }
 
 #[tokio::test]

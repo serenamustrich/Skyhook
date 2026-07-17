@@ -14,6 +14,7 @@
 - 后台更新订阅、后台测速，不阻塞当前代理使用。
 - Shadowsocks 支持完整 TCP/UDP 拨号、SIP022/SIP023、UoT v1/v2、simple-obfs 和
   v2ray-plugin WebSocket/TLS。
+- Snell 支持 v1-v5 TCP、v3-v5 UDP-over-TCP、HTTP/TLS 混淆和 v4/v5 连接复用。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
 - 订阅与 Provider 下载默认使用直连通道，失败时保留已有本地缓存。
 - 支持自定义域名/IP 规则，并让这些规则优先于订阅规则。

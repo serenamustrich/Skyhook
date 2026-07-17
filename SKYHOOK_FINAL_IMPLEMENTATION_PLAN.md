@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.17（完成 `NEXT-010B` ShadowsocksR 收口）
+> 计划版本：v1.18（完成 `NEXT-010C` Snell 收口）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-010C`。
+> M2 进行中，当前直接执行点为 `NEXT-011`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -386,7 +386,7 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. `NEXT-010A`、`NEXT-010B` 已完成；执行 `NEXT-010C` 收口 Snell。
+1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C` 已完成；执行 `NEXT-011` 依次收口其余现有协议。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1150,9 +1150,13 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
    - 58 项真实拨号覆盖 11 种 cipher、TCP/UDP、obfs、认证、多用户、96KB 双向流、错误
      密码、损坏响应、错误参数、超时和取消；标准 `ssr://` URI 与
      `cargo check --all-targets` 通过。
-3. [ ] `NEXT-010C`：Snell 完整能力收口。
+3. [x] `NEXT-010C`：Snell 完整能力收口。
    - 核对 v1-v5、UDP-over-TCP、obfs、reuse/pool 和协议自身的 not-applicable 边界。
    - 补齐并发、半关闭、空闲淘汰、陈旧连接和错误 PSK 的独立互操作证据。
+   - 默认协议版本已改为 v1，空 PSK 在 capability 和实际拨号前同时拒绝。
+   - 24 项真实拨号覆盖 v1-v5 TCP、v3-v5 UDP-over-TCP、HTTP/TLS obfs、96KB 双向
+     长流量、错误 PSK、server close、4 路并发复用、零帧半关闭和陈旧连接自动重拨；
+     连接池容量/空闲淘汰 2 项与 `cargo check --all-targets` 通过。
 4. [ ] `NEXT-011`：依次收口 Trojan、VMess、VLESS/Reality/Vision、Hysteria2/TUIC、
    WireGuard、AnyTLS/ShadowTLS/Naive、HTTP/SOCKS5/SSH，完成 M2 集中验收。
 

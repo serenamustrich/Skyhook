@@ -241,7 +241,8 @@ impl Outbound for SnellOutbound {
 
     fn capability(&self) -> OutboundCapability {
         let mut limitations = Vec::new();
-        let version = self.version.unwrap_or(3);
+        let version = self.version.unwrap_or(1);
+        let psk_supported = !self.psk.is_empty();
         let version_supported = matches!(version, 1..=5);
         let method = self.method.as_deref().unwrap_or(if version == 1 {
             "chacha20-ietf-poly1305"
@@ -281,6 +282,9 @@ impl Outbound for SnellOutbound {
         if !version_supported {
             limitations.push(format!("unsupported snell version {version}"));
         }
+        if !psk_supported {
+            limitations.push("snell PSK must not be empty".to_string());
+        }
         if !method_supported {
             limitations.push(format!("unsupported snell method {method}"));
         }
@@ -306,8 +310,10 @@ impl Outbound for SnellOutbound {
         } else if !udp_supported && obfs_supported {
             limitations.push("snell udp over simple-obfs is not supported".to_string());
         }
+        let udp_supported = udp_supported && psk_supported;
         OutboundCapability {
             tcp_supported: version_supported
+                && psk_supported
                 && method_supported
                 && obfs_supported
                 && reuse_supported,
@@ -330,6 +336,7 @@ impl Outbound for SnellOutbound {
         destination: &Destination,
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
+        validate_snell_psk(&self.psk)?;
         let version = validate_snell_version(self.version)?;
         if self.reuse && version < 4 {
             return Err(anyhow!(
@@ -387,6 +394,7 @@ impl Outbound for SnellOutbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
+        validate_snell_psk(&self.psk)?;
         if self
             .obfs
             .as_deref()
@@ -676,13 +684,21 @@ const SNELL_V4_HEADER_PLAIN_LEN: usize = 7;
 const SNELL_V4_HEADER_CIPHER_LEN: usize = SNELL_V4_HEADER_PLAIN_LEN + SS_TAG_LEN;
 
 fn validate_snell_version(version: Option<u8>) -> anyhow::Result<u8> {
-    let version = version.unwrap_or(3);
+    let version = version.unwrap_or(1);
     if matches!(version, 1..=5) {
         Ok(version)
     } else {
         Err(anyhow!(
             "unsupported snell version {version}; supported: 1, 2, 3, 4, 5"
         ))
+    }
+}
+
+fn validate_snell_psk(psk: &str) -> anyhow::Result<()> {
+    if psk.is_empty() {
+        Err(anyhow!("snell PSK must not be empty"))
+    } else {
+        Ok(())
     }
 }
 
@@ -769,7 +785,7 @@ fn build_snell_tcp_handshake_with_reuse(
     if destination.host.len() > 255 {
         return Err(anyhow!("snell destination host is too long"));
     }
-    let command = match snell_version.unwrap_or(3) {
+    let command = match snell_version.unwrap_or(1) {
         2 => SNELL_COMMAND_CONNECT_REUSE,
         4 | 5 if reuse => SNELL_COMMAND_CONNECT_REUSE,
         1 | 3 | 4 | 5 => SNELL_COMMAND_CONNECT,
