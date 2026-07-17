@@ -110,9 +110,23 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
 }
 
 pub(crate) fn tls_client_config(skip_cert_verify: bool) -> anyhow::Result<ClientConfig> {
+    tls_client_config_with_versions(
+        skip_cert_verify,
+        &[&rustls::version::TLS13, &rustls::version::TLS12],
+    )
+}
+
+pub(crate) fn tls13_client_config(skip_cert_verify: bool) -> anyhow::Result<ClientConfig> {
+    tls_client_config_with_versions(skip_cert_verify, &[&rustls::version::TLS13])
+}
+
+fn tls_client_config_with_versions(
+    skip_cert_verify: bool,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> anyhow::Result<ClientConfig> {
     let provider = Arc::new(aws_lc_rs::default_provider());
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?;
+        .with_protocol_versions(versions)?;
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let verifier: Arc<dyn ServerCertVerifier> = if skip_cert_verify {

@@ -1586,6 +1586,7 @@ fn shadowsocks_plugin_config(
             .cloned()
             .unwrap_or_else(|| "http".to_string()),
         "v2ray-plugin" => "v2ray-plugin".to_string(),
+        "shadow-tls" | "shadowtls" => "shadow-tls".to_string(),
         _ => return Err(anyhow!("unsupported shadowsocks plugin {plugin}")),
     };
     Ok(Some(ShadowsocksPluginConfig {
@@ -1608,6 +1609,15 @@ fn shadowsocks_plugin_config(
             .or_else(|| params.get("skip-cert-verify"))
             .map(|value| bool_text(value))
             .unwrap_or(false),
+        password: params.get("plugin-opts-password").cloned(),
+        version: params
+            .get("plugin-opts-version")
+            .map(|value| {
+                value
+                    .parse::<u8>()
+                    .context("invalid shadow-tls plugin version")
+            })
+            .transpose()?,
     }))
 }
 
@@ -1624,7 +1634,7 @@ fn parse_clash_plugin_opts(value: &Value, params: &mut BTreeMap<String, String>)
     if let Some(path) = yaml_string(mapping, "path") {
         params.insert("plugin-opts-path".to_string(), path);
     }
-    for key in ["tls", "skip-cert-verify"] {
+    for key in ["tls", "skip-cert-verify", "password", "version"] {
         if let Some(value) = mapping
             .get(Value::String(key.to_string()))
             .and_then(yaml_scalar_to_string)
@@ -1778,6 +1788,12 @@ fn parse_simple_obfs_plugin(value: &str, params: &mut BTreeMap<String, String>) 
                     "plugin-opts-skip-cert-verify".to_string(),
                     value.to_string(),
                 );
+            }
+            "password" => {
+                params.insert("plugin-opts-password".to_string(), value.to_string());
+            }
+            "version" => {
+                params.insert("plugin-opts-version".to_string(), value.to_string());
             }
             _ => {}
         }
@@ -2225,6 +2241,58 @@ proxies:
                 let plugin = plugin.expect("plugin");
                 assert_eq!(plugin.mode, "http");
                 assert_eq!(plugin.host.as_deref(), Some("edge.example.com"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converts_shadowsocks_shadowtls_v3_yaml_plugin_options() {
+        let text = r#"
+proxies:
+  - name: HK-SHADOWTLS
+    type: ss
+    server: hk.example.com
+    port: 443
+    cipher: aes-128-gcm
+    password: shadowsocks-secret
+    plugin: shadow-tls
+    plugin-opts:
+      host: edge.example.com
+      password: shadowtls-secret
+      version: 3
+      skip-cert-verify: true
+"#;
+
+        let document = parse_subscription(text).unwrap();
+        let outbound = document.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Shadowsocks { plugin, .. } => {
+                let plugin = plugin.expect("plugin");
+                assert_eq!(plugin.mode, "shadow-tls");
+                assert_eq!(plugin.host.as_deref(), Some("edge.example.com"));
+                assert_eq!(plugin.password.as_deref(), Some("shadowtls-secret"));
+                assert_eq!(plugin.version, Some(3));
+                assert!(plugin.skip_cert_verify);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_shadowsocks_shadowtls_v3_sip003_plugin_options() {
+        let uri = "ss://YWVzLTEyOC1nY206c2hhZG93c29ja3Mtc2VjcmV0@hk.example.com:443/?plugin=shadow-tls%3Bhost%3Dedge.example.com%3Bpassword%3Dshadowtls-secret%3Bversion%3D3%3Bskip-cert-verify%3Dtrue#HK";
+
+        let document = parse_subscription(uri).unwrap();
+        let outbound = document.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Shadowsocks { plugin, .. } => {
+                let plugin = plugin.expect("plugin");
+                assert_eq!(plugin.mode, "shadow-tls");
+                assert_eq!(plugin.host.as_deref(), Some("edge.example.com"));
+                assert_eq!(plugin.password.as_deref(), Some("shadowtls-secret"));
+                assert_eq!(plugin.version, Some(3));
+                assert!(plugin.skip_cert_verify);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

@@ -25,6 +25,9 @@
   pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由。
 - AnyTLS v2 支持 TLS 认证、动态 padding、会话复用与空闲回收、SYNACK/心跳、TCP 和
   sing-box UoT v2 UDP，并提供真实独立服务端拨号验证。
+- ShadowTLS v3 支持 TLS 1.3 ClientHello 认证、握手流量校验与还原、TLS camouflage、
+  Shadowsocks `shadow-tls` 插件和 dialer-proxy backend 组合；原生协议仅承载 TCP，
+  Shadowsocks 场景可通过 UoT 承载 UDP。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
 - 订阅与 Provider 下载默认使用直连通道，失败时保留已有本地缓存。
 - 支持自定义域名/IP 规则，并让这些规则优先于订阅规则。

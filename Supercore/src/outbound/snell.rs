@@ -767,6 +767,8 @@ fn snell_obfs_plugin(
         path: None,
         tls: false,
         skip_cert_verify: false,
+        password: None,
+        version: None,
     }))
 }
 

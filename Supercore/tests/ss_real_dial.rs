@@ -2002,6 +2002,8 @@ async fn ss_plugin_config_parses() {
                 path: None,
                 tls: false,
                 skip_cert_verify: false,
+                password: None,
+                version: None,
             });
         }
     }

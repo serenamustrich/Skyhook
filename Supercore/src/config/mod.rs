@@ -856,6 +856,10 @@ pub struct ShadowsocksPluginConfig {
     pub tls: bool,
     #[serde(default)]
     pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub version: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

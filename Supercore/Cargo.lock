@@ -4460,6 +4460,7 @@ dependencies = [
  "h3-quinn",
  "hickory-proto 0.25.2",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "http",
  "ipnet",
  "lea",

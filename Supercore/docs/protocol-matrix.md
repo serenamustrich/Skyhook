@@ -24,7 +24,7 @@
 | Snell | full | full | full | full | tcp/http/tls | full | 默认 v1；v1-v5 TCP、v3-v5 UDP-over-TCP、独立响应 salt 与 HTTP/TLS obfs 均有真实拨号测试；v5 使用公开的 v4 兼容 wire format；v4/v5 支持 `reuse: true`、10 条连接池、15 秒空闲淘汰、零帧半关闭、并发流和陈旧连接自动重拨；空 PSK 在拨号前拒绝，v1/v2 UDP 为协议自身不适用边界 |
 | WireGuard | full | full | full | full | udp/userspace-netstack | full | BoringTun Noise 握手与计数器、真实用户态 TCP/UDP、IPv4/IPv6、隧道内 DNS（UDP 截断后回退 TCP）、MTU、reserved、pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由；配置错误在拨号前明确拒绝 |
 | AnyTLS | full | full | full | full | tcp/UoT-v2 | full | v2 TLS auth、官方 padding 与服务端动态更新、SYNACK、心跳、会话复用、空闲回收、TCP 和 sing-box UoT v2 UDP；独立 TLS 服务端覆盖 96KB TCP、并发流、UDP、单会话复用和超时淘汰 |
-| ShadowTLS | full | full | partial | none | tcp | partial | v3 支持；udp 与独立隧道行为保留限制 |
+| ShadowTLS | full | full | full | not-applicable | tcp/ss-plugin/dialer-proxy | full | 严格 v3 TLS 1.3 ClientHello HMAC、握手 ApplicationData 校验/XOR 还原、HelloRetryRequest、TLS camouflage、证书与密码错误边界均已实现；独立 SOCKS5 data backend、dialer-proxy 和 Shadowsocks `shadow-tls` SIP003 plugin 有真实拨号。ShadowTLS 原生是 TCP transport，Shadowsocks UDP 通过 UoT 承载 |
 | Naive | full | full | partial | none | tcp | partial | HTTP/1.1 CONNECT，UDP 与扩展能力未完成 |
 | HTTP | full | full | partial | none | tcp | partial | UDP not implemented |
 | SOCKS5 | full | full | full | full | tcp | full | - |
@@ -73,6 +73,9 @@
   keepalive 和 replay/counter 处理位于 `src/outbound/wireguard.rs`。
 - AnyTLS v2 的认证、padding、会话/流调度、SYNACK、心跳、空闲回收和 UoT v2 位于
   `src/outbound/anytls.rs`。
+- ShadowTLS v3 的 ClientHello 认证、TLS handshake wrapper、camouflage、data HMAC 和 backend
+  组合位于 `src/outbound/shadowtls.rs`；Shadowsocks plugin 接入位于
+  `src/outbound/shadowsocks.rs`。
 - 跨协议 UDP association、NAT key、session pool、背压、idle eviction、reassembly、
   replay window 和统计位于 `src/outbound/udp/`；协议私有 wire format 保留在各协议模块。
 - 两者共用的 endpoint 连接生命周期、QUIC varint 和连接超时位于
@@ -97,4 +100,6 @@
   DNS、96KB 数据、多 Peer、最长前缀、保活、reserved 和重放拒绝
 - AnyTLS: `tests/anytls_real_dial.rs`、`src/outbound/anytls.rs` 单元测试和
   `tests/remaining_protocols.rs`
-- SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / ShadowTLS / Naive / Hysteria v1: `tests/remaining_protocols.rs`
+- ShadowTLS: `tests/shadowtls_real_dial.rs`，覆盖独立服务端 96KB TCP、HelloRetryRequest、
+  Shadowsocks plugin、错密码、证书拒绝和 camouflage
+- SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / Naive / Hysteria v1: `tests/remaining_protocols.rs`

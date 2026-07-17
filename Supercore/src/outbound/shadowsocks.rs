@@ -51,6 +51,7 @@ use crate::{config::ShadowsocksPluginConfig, routing::Destination};
 
 use super::io::read_exact_or_eof;
 use super::{
+    shadowtls::open_v3_transport,
     target::{encode_socks5_destination, parse_socks5_destination_prefix},
     transports::{
         connect_tcp, open_websocket_transport_without_headers, run_dial_phase, tls_client_config,
@@ -160,7 +161,11 @@ impl ShadowsocksOutbound {
         };
 
         if let Some(plugin) = &self.plugin {
-            if plugin_is_v2ray_ws(Some(plugin)) {
+            if plugin_is_shadowtls(Some(plugin)) {
+                transport =
+                    open_shadowtls_plugin_transport(transport, plugin, &self.server, timeout_ms)
+                        .await?;
+            } else if plugin_is_v2ray_ws(Some(plugin)) {
                 transport = open_websocket_transport_without_headers(
                     transport,
                     plugin.host.as_deref().unwrap_or(&self.server),
@@ -223,7 +228,11 @@ impl ShadowsocksOutbound {
         };
 
         if let Some(plugin) = &self.plugin {
-            if plugin_is_v2ray_ws(Some(plugin)) {
+            if plugin_is_shadowtls(Some(plugin)) {
+                transport =
+                    open_shadowtls_plugin_transport(transport, plugin, &self.server, timeout_ms)
+                        .await?;
+            } else if plugin_is_v2ray_ws(Some(plugin)) {
                 transport = open_websocket_transport_without_headers(
                     transport,
                     plugin.host.as_deref().unwrap_or(&self.server),
@@ -417,11 +426,17 @@ impl Outbound for ShadowsocksOutbound {
             if !plugin_is_v2ray_ws(Some(plugin))
                 && !plugin_is_http_obfs(Some(plugin))
                 && !plugin_is_tls_obfs(Some(plugin))
+                && !plugin_is_shadowtls(Some(plugin))
             {
                 return OutboundCapability::unsupported(format!(
                     "unsupported shadowsocks plugin mode {}",
                     plugin.mode
                 ));
+            }
+            if plugin_is_shadowtls(Some(plugin)) {
+                if let Err(error) = validate_shadowtls_plugin(plugin) {
+                    return OutboundCapability::unsupported(error.to_string());
+                }
             }
             if self.udp_over_tcp {
                 OutboundCapability::tcp_udp(match self.udp_over_tcp_version {
@@ -549,6 +564,10 @@ impl Outbound for ShadowsocksOutbound {
                     timeout_ms,
                 )
                 .await?;
+            } else if plugin_is_shadowtls(Some(plugin)) {
+                transport =
+                    open_shadowtls_plugin_transport(transport, plugin, &self.server, timeout_ms)
+                        .await?;
             } else {
                 initial =
                     apply_shadowsocks_plugin_request(plugin, &self.server, self.port, initial)?;
@@ -2633,6 +2652,57 @@ fn plugin_is_v2ray_ws(plugin: Option<&ShadowsocksPluginConfig>) -> bool {
         let mode = p.mode.to_ascii_lowercase();
         mode == "v2ray-plugin" || mode == "websocket"
     })
+}
+
+fn plugin_is_shadowtls(plugin: Option<&ShadowsocksPluginConfig>) -> bool {
+    plugin.is_some_and(|plugin| {
+        matches!(
+            plugin.mode.to_ascii_lowercase().as_str(),
+            "shadow-tls" | "shadowtls"
+        )
+    })
+}
+
+fn validate_shadowtls_plugin(plugin: &ShadowsocksPluginConfig) -> anyhow::Result<()> {
+    if plugin.version.unwrap_or(3) != 3 {
+        return Err(anyhow!("only shadow-tls plugin version 3 is supported"));
+    }
+    if plugin
+        .host
+        .as_deref()
+        .is_none_or(|host| host.trim().is_empty())
+    {
+        return Err(anyhow!("shadow-tls plugin host is required"));
+    }
+    if plugin
+        .password
+        .as_deref()
+        .is_none_or(|password| password.is_empty())
+    {
+        return Err(anyhow!("shadow-tls plugin password is required"));
+    }
+    Ok(())
+}
+
+async fn open_shadowtls_plugin_transport(
+    stream: BoxedStream,
+    plugin: &ShadowsocksPluginConfig,
+    fallback_server: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<BoxedStream> {
+    validate_shadowtls_plugin(plugin)?;
+    open_v3_transport(
+        stream,
+        plugin
+            .password
+            .as_deref()
+            .expect("validated password")
+            .as_bytes(),
+        plugin.host.as_deref().unwrap_or(fallback_server),
+        plugin.skip_cert_verify,
+        timeout_ms,
+    )
+    .await
 }
 
 pub(super) fn plugin_is_tls_obfs(plugin: Option<&ShadowsocksPluginConfig>) -> bool {

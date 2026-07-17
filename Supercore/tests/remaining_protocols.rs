@@ -688,35 +688,6 @@ fn anytls_password_sha256_hash_is_deterministic() {
     assert_eq!(hash, again);
 }
 
-// ---------------------------------------------------------------------------
-// 5. ShadowTLS: mock TLS server that records the client hello
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn shadowtls_v3_outbound_handshake_completes_against_self_signed() {
-    let (addr, server) = spawn_tls_drop_server("shadow.example").await;
-    let outbounds = build_outbounds(
-        &[OutboundConfig::ShadowTls {
-            name: "shadowtls-v3".to_string(),
-            server: "127.0.0.1".to_string(),
-            port: addr.port(),
-            password: "p".to_string(),
-            version: Some(3),
-            sni: Some("shadow.example".to_string()),
-            skip_cert_verify: true,
-        }],
-        None,
-    )
-    .expect("build");
-    let outbound = outbounds.get("shadowtls-v3").expect("outbound");
-    let _ = timeout(
-        Duration::from_millis(2000),
-        outbound.connect(&Destination::new("target.example", 443), 2000),
-    )
-    .await;
-    let _ = server.await;
-}
-
 #[test]
 fn shadowtls_capability_rejects_non_v3() {
     let config = config_with_default(
@@ -737,7 +708,7 @@ fn shadowtls_capability_rejects_non_v3() {
         snapshot
             .limitations
             .iter()
-            .any(|item| item.contains("only shadowtls v3 is supported")),
+            .any(|item| item.contains("unsupported shadowtls version 1")),
         "got {:?}",
         snapshot.limitations,
     );

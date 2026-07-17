@@ -455,24 +455,21 @@ fn emit_client_hello_for_retry(
     };
 
     if let Some(provider) = &config.dangerous_client_hello_session_id_provider {
-        if retryreq.is_some() {
-            return Err(Error::General(
-                "custom ClientHello session id is not supported after HelloRetryRequest".into(),
-            ));
-        }
-        let key_exchange = key_share.as_deref().ok_or_else(|| {
-            Error::General("custom ClientHello session id requires a TLS 1.3 key share".into())
-        })?;
-        let raw_client_hello = chp.get_encoding();
-        let sealed_session_id = provider.seal_session_id(
-            &input.random.0,
-            &raw_client_hello,
-            key_exchange,
-        )?;
-        input.session_id = SessionId::from_32_bytes(sealed_session_id);
-        match &mut chp.0 {
-            HandshakePayload::ClientHello(payload) => payload.session_id = input.session_id,
-            _ => unreachable!("constructed as ClientHello"),
+        if retryreq.is_none() {
+            let key_exchange = key_share.as_deref().ok_or_else(|| {
+                Error::General("custom ClientHello session id requires a TLS 1.3 key share".into())
+            })?;
+            let raw_client_hello = chp.get_encoding();
+            let sealed_session_id = provider.seal_session_id(
+                &input.random.0,
+                &raw_client_hello,
+                key_exchange,
+            )?;
+            input.session_id = SessionId::from_32_bytes(sealed_session_id);
+            match &mut chp.0 {
+                HandshakePayload::ClientHello(payload) => payload.session_id = input.session_id,
+                _ => unreachable!("constructed as ClientHello"),
+            }
         }
     }
 

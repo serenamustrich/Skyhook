@@ -8,7 +8,7 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.23（完成 `NEXT-011E` WireGuard 收口）
+> 计划版本：v1.24（完成 `NEXT-011F` 的 AnyTLS 与 ShadowTLS，继续 Naive 收口）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
 > M2 进行中，当前直接执行点为 `NEXT-011F`。
@@ -387,7 +387,7 @@ M1 Outbound 第一批已实现、验证并提交：
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
 1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`、
-   `NEXT-011E` 已完成；执行 `NEXT-011F` 收口 AnyTLS/ShadowTLS/Naive。
+   `NEXT-011E`、`NEXT-011F` 的 AnyTLS 与 ShadowTLS 已完成；继续执行 `NEXT-011F` 的 Naive 收口。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1221,7 +1221,11 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - [x] AnyTLS v2：TLS auth、官方/动态 padding、SYNACK、心跳、会话复用与空闲回收、
        TCP 和 sing-box UoT v2 UDP 均已实现；独立 TLS 服务端覆盖 96KB 数据、并发流、
        UDP、单会话复用和超时淘汰。
-     - [ ] ShadowTLS v3：等待完整握手、认证、TLS camouflage、backend 组合和错误边界收口。
+     - [x] ShadowTLS v3：TLS 1.3 ClientHello HMAC、握手 ApplicationData 校验/XOR 还原、
+       HelloRetryRequest、TLS camouflage、独立 SOCKS5 backend、dialer-proxy 和 Shadowsocks
+       `shadow-tls` plugin 已完成；错密码与证书错误会明确拒绝。独立 E2E 覆盖 96KB TCP、
+       plugin 往返和 camouflage；`cargo check --all-targets`、198 项 lib、28 项 remaining
+       protocols、29 项 SS 实拨和 4 项 ShadowTLS 实拨回归通过。
      - [ ] Naive：等待 HTTP/2、按配置 HTTP/3、Basic auth、padding 和协议适用边界收口。
    - [ ] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
 
@@ -2530,7 +2534,7 @@ README 只写最终功能、安装、使用、架构、协议状态和可复现�
 ## 24. 最终完成清单
 
 - [x] M0：当前 task/SSE/progress 代码已收口并验证。
-- [ ] M1：核心、API、transport、UDP 和 cancellation 基础完成。
+- [x] M1：核心、API、transport、UDP 和 cancellation 基础完成；MPTCP 真机发布证据按计划在 M12 补齐。
 - [ ] M2：当前 partial 协议全部完成真实拨号。
 - [ ] M3：Mihomo 冻结基线缺失协议全部补齐。
 - [ ] M4：DNS 和 Fake-IP 完成。
