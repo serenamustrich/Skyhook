@@ -9,7 +9,7 @@ mod tasks;
 
 use std::sync::Arc;
 
-use axum::{extract::FromRef, Router};
+use axum::extract::FromRef;
 
 use crate::core::Runtime;
 
@@ -90,7 +90,7 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-fn build_router(runtime: Arc<Runtime>, auth: ControlAuthState) -> Router {
+fn build_router(runtime: Arc<Runtime>, auth: ControlAuthState) -> axum::Router {
     build_router_with_tasks(runtime, auth, TaskManager::default())
 }
 
@@ -102,6 +102,7 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         http::{header::AUTHORIZATION, HeaderMap, HeaderValue, Method, Request, StatusCode},
+        Router,
     };
     use tokio_stream::StreamExt;
     use tower::ServiceExt;
