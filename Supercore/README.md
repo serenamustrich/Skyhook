@@ -25,11 +25,13 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 - Shadowsocks `v2ray-plugin` WebSocket transport with optional TLS, real WebSocket framing, and
   independent response salts.
 - Shadowsocks UDP-over-TCP v1/v2 for native and plugin transports, with bounded reusable sessions.
-- ShadowsocksR origin TCP/UDP for AES-CFB, RC4-MD5, ChaCha20, and ChaCha20-IETF; authenticated
+- ShadowsocksR TCP/UDP for none/dummy, AES-CTR/CFB, RC4-MD5, ChaCha20, ChaCha20-IETF, and
+  XChaCha20; authenticated
   `verify_simple`, `auth_simple`, `auth_sha1`, `auth_sha1_v2`, `auth_sha1_v4`,
   `auth_aes128_md5`/`auth_aes128_sha1`, and `auth_chain_a` through `auth_chain_f`.
-  Supported combinations include TCP/UDP, multi-user `uid:key` parameters, HTTP simple/post,
-  and TLS ticket obfuscation; protocol-specific UDP boundaries remain explicit in the matrix.
+  Supported combinations include TCP/UDP, multi-user `uid:key` parameters, random-head, HTTP
+  simple/post, and TLS ticket auth/fastauth obfuscation; protocol-specific UDP boundaries remain
+  explicit in the matrix.
 - Snell v1-v5 TCP with independent response salts, HTTP/TLS obfuscation, and v3-v5
   UDP-over-TCP. v5 follows the public v4-compatible wire format. v4/v5 support opt-in
   `reuse: true` with a bounded 10-connection pool, 15-second idle eviction, protocol zero-frame

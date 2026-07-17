@@ -9,7 +9,11 @@ use cfb_mode::cipher::KeyIvInit;
 use chacha20::cipher::StreamCipher;
 use md5::{Digest, Md5};
 use sha1::Sha1;
-use supercore::{config::OutboundConfig, outbound::build_outbounds, routing::Destination};
+use supercore::{
+    config::OutboundConfig,
+    outbound::{build_outbounds, context::DialContext},
+    routing::Destination,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -18,44 +22,73 @@ use tokio::{
 
 #[derive(Clone, Copy)]
 enum TestCipher {
+    Dummy,
+    Aes128Ctr,
+    Aes192Ctr,
+    Aes256Ctr,
     Aes128Cfb,
     Aes192Cfb,
     Aes256Cfb,
     Rc4Md5,
     Chacha20Legacy,
     Chacha20Ietf,
+    XChacha20,
 }
 
 impl TestCipher {
     fn method(self) -> &'static str {
         match self {
+            Self::Dummy => "none",
+            Self::Aes128Ctr => "aes-128-ctr",
+            Self::Aes192Ctr => "aes-192-ctr",
+            Self::Aes256Ctr => "aes-256-ctr",
             Self::Aes128Cfb => "aes-128-cfb",
             Self::Aes192Cfb => "aes-192-cfb",
             Self::Aes256Cfb => "aes-256-cfb",
             Self::Rc4Md5 => "rc4-md5",
             Self::Chacha20Legacy => "chacha20",
             Self::Chacha20Ietf => "chacha20-ietf",
+            Self::XChacha20 => "xchacha20",
         }
     }
 
     fn key_len(self) -> usize {
         match self {
-            Self::Aes128Cfb | Self::Rc4Md5 => 16,
-            Self::Aes192Cfb => 24,
-            Self::Aes256Cfb | Self::Chacha20Legacy | Self::Chacha20Ietf => 32,
+            Self::Dummy | Self::Aes128Ctr | Self::Aes128Cfb | Self::Rc4Md5 => 16,
+            Self::Aes192Ctr | Self::Aes192Cfb => 24,
+            Self::Aes256Ctr
+            | Self::Aes256Cfb
+            | Self::Chacha20Legacy
+            | Self::Chacha20Ietf
+            | Self::XChacha20 => 32,
         }
     }
 
     fn iv_len(self) -> usize {
         match self {
+            Self::Dummy => 0,
             Self::Chacha20Legacy => 8,
             Self::Chacha20Ietf => 12,
+            Self::XChacha20 => 24,
             _ => 16,
         }
     }
 
     fn encryptor(self, key: &[u8], iv: &[u8]) -> anyhow::Result<TestStreamCipher> {
         match self {
+            Self::Dummy => Ok(TestStreamCipher::Dummy),
+            Self::Aes128Ctr => Ok(TestStreamCipher::Aes128Ctr(
+                ctr::Ctr128BE::<Aes128>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid AES-128-CTR key/iv"))?,
+            )),
+            Self::Aes192Ctr => Ok(TestStreamCipher::Aes192Ctr(
+                ctr::Ctr128BE::<Aes192>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid AES-192-CTR key/iv"))?,
+            )),
+            Self::Aes256Ctr => Ok(TestStreamCipher::Aes256Ctr(
+                ctr::Ctr128BE::<Aes256>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid AES-256-CTR key/iv"))?,
+            )),
             Self::Aes128Cfb => Ok(TestStreamCipher::Aes128Enc(
                 cfb_mode::BufEncryptor::<Aes128>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid AES-128-CFB key/iv"))?,
@@ -83,11 +116,23 @@ impl TestCipher {
                 chacha20::ChaCha20::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid ChaCha20-IETF key/iv"))?,
             )),
+            Self::XChacha20 => Ok(TestStreamCipher::XChacha(
+                chacha20::XChaCha20::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid XChaCha20 key/iv"))?,
+            )),
         }
     }
 
     fn decryptor(self, key: &[u8], iv: &[u8]) -> anyhow::Result<TestStreamCipher> {
         match self {
+            Self::Dummy
+            | Self::Aes128Ctr
+            | Self::Aes192Ctr
+            | Self::Aes256Ctr
+            | Self::Rc4Md5
+            | Self::Chacha20Legacy
+            | Self::Chacha20Ietf
+            | Self::XChacha20 => self.encryptor(key, iv),
             Self::Aes128Cfb => Ok(TestStreamCipher::Aes128Dec(
                 cfb_mode::BufDecryptor::<Aes128>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid AES-128-CFB key/iv"))?,
@@ -100,14 +145,15 @@ impl TestCipher {
                 cfb_mode::BufDecryptor::<Aes256>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid AES-256-CFB key/iv"))?,
             )),
-            Self::Rc4Md5 => self.encryptor(key, iv),
-            Self::Chacha20Legacy => self.encryptor(key, iv),
-            Self::Chacha20Ietf => self.encryptor(key, iv),
         }
     }
 }
 
 enum TestStreamCipher {
+    Dummy,
+    Aes128Ctr(ctr::Ctr128BE<Aes128>),
+    Aes192Ctr(ctr::Ctr128BE<Aes192>),
+    Aes256Ctr(ctr::Ctr128BE<Aes256>),
     Aes128Enc(cfb_mode::BufEncryptor<Aes128>),
     Aes192Enc(cfb_mode::BufEncryptor<Aes192>),
     Aes256Enc(cfb_mode::BufEncryptor<Aes256>),
@@ -117,11 +163,16 @@ enum TestStreamCipher {
     Rc4(rc4::Rc4<rc4::consts::U16>),
     ChachaLegacy(chacha20::ChaCha20Legacy),
     ChachaIetf(chacha20::ChaCha20),
+    XChacha(chacha20::XChaCha20),
 }
 
 impl TestStreamCipher {
     fn apply(&mut self, data: &mut [u8]) {
         match self {
+            Self::Dummy => {}
+            Self::Aes128Ctr(cipher) => cipher.apply_keystream(data),
+            Self::Aes192Ctr(cipher) => cipher.apply_keystream(data),
+            Self::Aes256Ctr(cipher) => cipher.apply_keystream(data),
             Self::Aes128Enc(cipher) => cipher.encrypt(data),
             Self::Aes192Enc(cipher) => cipher.encrypt(data),
             Self::Aes256Enc(cipher) => cipher.encrypt(data),
@@ -131,6 +182,7 @@ impl TestStreamCipher {
             Self::Rc4(cipher) => cipher.apply_keystream(data),
             Self::ChachaLegacy(cipher) => cipher.apply_keystream(data),
             Self::ChachaIetf(cipher) => cipher.apply_keystream(data),
+            Self::XChacha(cipher) => cipher.apply_keystream(data),
         }
     }
 }
@@ -138,6 +190,7 @@ impl TestStreamCipher {
 #[derive(Clone, Copy)]
 enum TestObfs {
     Plain,
+    RandomHead,
     HttpSimple,
     HttpPost,
 }
@@ -728,6 +781,11 @@ async fn read_ssr_initial(stream: &mut TcpStream, obfs: TestObfs) -> anyhow::Res
     if matches!(obfs, TestObfs::Plain) {
         return Ok(Vec::new());
     }
+    if matches!(obfs, TestObfs::RandomHead) {
+        return Err(anyhow!(
+            "random_head must be acknowledged before SSR payload"
+        ));
+    }
     let mut data = Vec::new();
     let header_end = loop {
         let mut buffer = [0u8; 1024];
@@ -769,7 +827,22 @@ async fn run_ssr_tcp(cipher: TestCipher, obfs: TestObfs) -> anyhow::Result<()> {
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
-        let mut prefetched = read_ssr_initial(&mut stream, obfs).await?;
+        let mut prefetched = if matches!(obfs, TestObfs::RandomHead) {
+            let mut header = [0u8; 128];
+            let length = stream.read(&mut header).await?;
+            assert!((8..=103).contains(&length));
+            let payload_len = length - 4;
+            let checksum = u32::from_le_bytes(header[payload_len..length].try_into()?);
+            assert_eq!(
+                checksum,
+                u32::MAX.wrapping_sub(ssr_crc32(&header[..payload_len]))
+            );
+            stream.write_all(b"random-head-ok").await?;
+            stream.flush().await?;
+            Vec::new()
+        } else {
+            read_ssr_initial(&mut stream, obfs).await?
+        };
         let request_iv = take_exact(&mut stream, &mut prefetched, cipher.iv_len()).await?;
         let key = evp_bytes_to_key(&server_password, cipher.key_len());
         let mut decryptor = cipher.decryptor(&key, &request_iv)?;
@@ -783,11 +856,13 @@ async fn run_ssr_tcp(cipher: TestCipher, obfs: TestObfs) -> anyhow::Result<()> {
         assert_eq!(upload, b"ping");
 
         let response_iv = vec![0x50 + cipher.iv_len() as u8; cipher.iv_len()];
-        assert_ne!(response_iv, request_iv);
+        if cipher.iv_len() > 0 {
+            assert_ne!(response_iv, request_iv);
+        }
         let mut encryptor = cipher.encryptor(&key, &response_iv)?;
         let mut pong = b"pong".to_vec();
         encryptor.apply(&mut pong);
-        if matches!(obfs, TestObfs::Plain) {
+        if matches!(obfs, TestObfs::Plain | TestObfs::RandomHead) {
             stream.write_all(&response_iv).await?;
         } else {
             stream
@@ -810,6 +885,7 @@ async fn run_ssr_tcp(cipher: TestCipher, obfs: TestObfs) -> anyhow::Result<()> {
             protocol: "origin".to_string(),
             obfs: match obfs {
                 TestObfs::Plain => "plain",
+                TestObfs::RandomHead => "random_head",
                 TestObfs::HttpSimple => "http_simple",
                 TestObfs::HttpPost => "http_post",
             }
@@ -884,6 +960,68 @@ async fn run_ssr_udp(cipher: TestCipher) -> anyhow::Result<()> {
         .udp_exchange(&destination, b"query", 3000)
         .await?;
     assert_eq!(response, b"answer");
+    server.await??;
+    Ok(())
+}
+
+async fn run_ssr_large_duplex_real_dial() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let cipher = TestCipher::Aes256Ctr;
+    let password = "ssr-large-password";
+    let destination = Destination::new("large.example", 443);
+    let target = destination_bytes(&destination);
+    let upload = (0..96 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let download = upload.iter().map(|byte| byte ^ 0xa5).collect::<Vec<_>>();
+    let expected_upload = upload.clone();
+    let expected_download = download.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let key = evp_bytes_to_key(password.as_bytes(), cipher.key_len());
+        let mut request_iv = vec![0u8; cipher.iv_len()];
+        stream.read_exact(&mut request_iv).await?;
+        let mut decryptor = cipher.decryptor(&key, &request_iv)?;
+        let mut request_target = vec![0u8; target.len()];
+        stream.read_exact(&mut request_target).await?;
+        decryptor.apply(&mut request_target);
+        assert_eq!(request_target, target);
+        let mut received = vec![0u8; expected_upload.len()];
+        stream.read_exact(&mut received).await?;
+        decryptor.apply(&mut received);
+        assert_eq!(received, expected_upload);
+
+        let response_iv = vec![0x72; cipher.iv_len()];
+        let mut response = expected_download;
+        cipher.encryptor(&key, &response_iv)?.apply(&mut response);
+        stream.write_all(&response_iv).await?;
+        stream.write_all(&response).await?;
+        stream.shutdown().await?;
+        anyhow::Ok(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Ssr {
+            name: "ssr-large".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            method: cipher.method().to_string(),
+            password: password.to_string(),
+            protocol: "origin".to_string(),
+            obfs: "plain".to_string(),
+            protocol_param: None,
+            obfs_param: None,
+        }],
+        None,
+    )?;
+    let outbound = outbounds.get("ssr-large").context("missing SSR outbound")?;
+    let mut tunnel = outbound.connect(&destination, 3000).await?;
+    tunnel.write_all(&upload).await?;
+    tunnel.flush().await?;
+    let mut response = vec![0u8; download.len()];
+    timeout(Duration::from_secs(5), tunnel.read_exact(&mut response)).await??;
+    assert_eq!(response, download);
     server.await??;
     Ok(())
 }
@@ -1204,6 +1342,7 @@ async fn run_ssr_auth_aes(
     protocol: &'static str,
     hash: TestAuthHash,
     protocol_param: Option<&'static str>,
+    corrupt_response: bool,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -1289,6 +1428,10 @@ async fn run_ssr_auth_aes(
 
         let response_iv = vec![0x99; cipher.iv_len()];
         let mut response = build_auth_aes_data(hash, &user_key, 1, b"pong");
+        if corrupt_response {
+            let last = response.len() - 1;
+            response[last] ^= 0x80;
+        }
         cipher
             .encryptor(&server_key, &response_iv)?
             .apply(&mut response);
@@ -1320,10 +1463,15 @@ async fn run_ssr_auth_aes(
     tunnel.write_all(b"ping").await?;
     tunnel.flush().await?;
     let mut response = [0u8; 4];
-    timeout(Duration::from_secs(3), tunnel.read_exact(&mut response))
+    let read = timeout(Duration::from_secs(3), tunnel.read_exact(&mut response))
         .await
-        .context("SSR AES auth response timed out")??;
-    assert_eq!(&response, b"pong");
+        .context("SSR AES auth response timed out")?;
+    if corrupt_response {
+        assert!(read.is_err(), "corrupt SSR response unexpectedly succeeded");
+    } else {
+        read?;
+        assert_eq!(&response, b"pong");
+    }
     server.await??;
     Ok(())
 }
@@ -1640,8 +1788,7 @@ async fn run_ssr_auth_chain_udp(kind: TestAuthChainKind) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn ssr_tls12_ticket_auth_obfs_real_dial() -> anyhow::Result<()> {
+async fn run_ssr_tls12_ticket_obfs(mode: &'static str) -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let password = "ssr-ticket-password";
@@ -1752,7 +1899,7 @@ async fn ssr_tls12_ticket_auth_obfs_real_dial() -> anyhow::Result<()> {
             method: "aes-128-cfb".to_string(),
             password: password.to_string(),
             protocol: "origin".to_string(),
-            obfs: "tls1.2_ticket_auth".to_string(),
+            obfs: mode.to_string(),
             protocol_param: None,
             obfs_param: Some("obfs.example".to_string()),
         }],
@@ -1775,8 +1922,18 @@ async fn ssr_tls12_ticket_auth_obfs_real_dial() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn ssr_tls12_ticket_auth_obfs_real_dial() -> anyhow::Result<()> {
+    run_ssr_tls12_ticket_obfs("tls1.2_ticket_auth").await
+}
+
+#[tokio::test]
+async fn ssr_tls12_ticket_fastauth_obfs_real_dial() -> anyhow::Result<()> {
+    run_ssr_tls12_ticket_obfs("tls1.2_ticket_fastauth").await
+}
+
+#[tokio::test]
 async fn ssr_auth_aes128_md5_tcp_real_dial() -> anyhow::Result<()> {
-    run_ssr_auth_aes("auth_aes128_md5", TestAuthHash::Md5, None).await
+    run_ssr_auth_aes("auth_aes128_md5", TestAuthHash::Md5, None, false).await
 }
 
 #[tokio::test]
@@ -1785,8 +1942,65 @@ async fn ssr_auth_aes128_sha1_multi_user_tcp_real_dial() -> anyhow::Result<()> {
         "auth_aes128_sha1",
         TestAuthHash::Sha1,
         Some("1001:user-secret"),
+        false,
     )
     .await
+}
+
+#[tokio::test]
+async fn ssr_auth_aes_rejects_corrupt_response_state() -> anyhow::Result<()> {
+    run_ssr_auth_aes("auth_aes128_md5", TestAuthHash::Md5, None, true).await
+}
+
+#[tokio::test]
+async fn ssr_auth_aes_wrong_password_cannot_authenticate() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let destination = Destination::new("wrong-password.example", 443);
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let cipher = TestCipher::Aes128Cfb;
+        let server_key = evp_bytes_to_key(b"correct-password", cipher.key_len());
+        let mut request_iv = vec![0u8; cipher.iv_len()];
+        stream.read_exact(&mut request_iv).await?;
+        let mut prefix = vec![0u8; 31];
+        stream.read_exact(&mut prefix).await?;
+        cipher
+            .decryptor(&server_key, &request_iv)?
+            .apply(&mut prefix);
+        let mut hmac_key = request_iv;
+        hmac_key.extend_from_slice(&server_key);
+        assert_ne!(
+            &prefix[1..7],
+            &TestAuthHash::Md5.hmac(&hmac_key, &prefix[..1])[..6]
+        );
+        anyhow::Ok(())
+    });
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Ssr {
+            name: "ssr-wrong-password".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: address.port(),
+            method: "aes-128-cfb".to_string(),
+            password: "wrong-password".to_string(),
+            protocol: "auth_aes128_md5".to_string(),
+            obfs: "plain".to_string(),
+            protocol_param: None,
+            obfs_param: None,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("ssr-wrong-password")
+        .context("missing SSR wrong-password outbound")?;
+    let mut tunnel = outbound.connect(&destination, 3000).await?;
+    tunnel.write_all(b"ping").await?;
+    tunnel.flush().await?;
+    let mut response = [0u8; 1];
+    let read = timeout(Duration::from_secs(3), tunnel.read(&mut response)).await??;
+    assert_eq!(read, 0);
+    server.await??;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1922,6 +2136,10 @@ macro_rules! udp_test {
     };
 }
 
+tcp_test!(ssr_dummy_tcp_real_dial, TestCipher::Dummy);
+tcp_test!(ssr_aes128_ctr_tcp_real_dial, TestCipher::Aes128Ctr);
+tcp_test!(ssr_aes192_ctr_tcp_real_dial, TestCipher::Aes192Ctr);
+tcp_test!(ssr_aes256_ctr_tcp_real_dial, TestCipher::Aes256Ctr);
 tcp_test!(ssr_aes128_cfb_tcp_real_dial, TestCipher::Aes128Cfb);
 tcp_test!(ssr_aes192_cfb_tcp_real_dial, TestCipher::Aes192Cfb);
 tcp_test!(ssr_aes256_cfb_tcp_real_dial, TestCipher::Aes256Cfb);
@@ -1931,7 +2149,12 @@ tcp_test!(
     TestCipher::Chacha20Legacy
 );
 tcp_test!(ssr_chacha20_ietf_tcp_real_dial, TestCipher::Chacha20Ietf);
+tcp_test!(ssr_xchacha20_tcp_real_dial, TestCipher::XChacha20);
 
+udp_test!(ssr_dummy_udp_real_dial, TestCipher::Dummy);
+udp_test!(ssr_aes128_ctr_udp_real_dial, TestCipher::Aes128Ctr);
+udp_test!(ssr_aes192_ctr_udp_real_dial, TestCipher::Aes192Ctr);
+udp_test!(ssr_aes256_ctr_udp_real_dial, TestCipher::Aes256Ctr);
 udp_test!(ssr_aes128_cfb_udp_real_dial, TestCipher::Aes128Cfb);
 udp_test!(ssr_aes192_cfb_udp_real_dial, TestCipher::Aes192Cfb);
 udp_test!(ssr_aes256_cfb_udp_real_dial, TestCipher::Aes256Cfb);
@@ -1941,10 +2164,62 @@ udp_test!(
     TestCipher::Chacha20Legacy
 );
 udp_test!(ssr_chacha20_ietf_udp_real_dial, TestCipher::Chacha20Ietf);
+udp_test!(ssr_xchacha20_udp_real_dial, TestCipher::XChacha20);
+
+#[tokio::test]
+async fn ssr_large_bidirectional_stream_real_dial() -> anyhow::Result<()> {
+    run_ssr_large_duplex_real_dial().await
+}
+
+#[tokio::test]
+async fn ssr_udp_timeout_and_cancellation_are_bounded() -> anyhow::Result<()> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Ssr {
+            name: "ssr-timeout".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: socket.local_addr()?.port(),
+            method: "aes-128-cfb".to_string(),
+            password: "password".to_string(),
+            protocol: "origin".to_string(),
+            obfs: "plain".to_string(),
+            protocol_param: None,
+            obfs_param: None,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("ssr-timeout")
+        .context("missing SSR timeout outbound")?;
+    let destination = Destination::new("timeout.example", 53);
+    let timeout_error = outbound
+        .udp_exchange(&destination, b"ping", 30)
+        .await
+        .unwrap_err();
+    assert!(timeout_error.to_string().contains("timed out"));
+
+    let context = DialContext::new(destination, 5_000);
+    let cancellation = context.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancellation.cancel();
+    });
+    let cancel_error = outbound
+        .udp_exchange_context(&context, b"ping")
+        .await
+        .unwrap_err();
+    assert!(cancel_error.to_string().contains("cancelled"));
+    Ok(())
+}
 
 #[tokio::test]
 async fn ssr_http_simple_real_dial() -> anyhow::Result<()> {
     run_ssr_tcp(TestCipher::Aes128Cfb, TestObfs::HttpSimple).await
+}
+
+#[tokio::test]
+async fn ssr_random_head_real_dial() -> anyhow::Result<()> {
+    run_ssr_tcp(TestCipher::Aes128Cfb, TestObfs::RandomHead).await
 }
 
 #[tokio::test]
@@ -1982,5 +2257,40 @@ async fn ssr_auth_chain_protocol_is_rejected_before_network_dial() -> anyhow::Re
         Err(error) => error,
     };
     assert!(error.to_string().contains("not implemented safely yet"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssr_invalid_multi_user_param_is_rejected_before_network_dial() -> anyhow::Result<()> {
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Ssr {
+            name: "ssr-invalid-user".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: 1,
+            method: "aes-128-cfb".to_string(),
+            password: "password".to_string(),
+            protocol: "auth_aes128_sha1".to_string(),
+            obfs: "plain".to_string(),
+            protocol_param: Some("missing-separator".to_string()),
+            obfs_param: None,
+        }],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("ssr-invalid-user")
+        .context("missing SSR invalid-user outbound")?;
+    let capability = outbound.capability();
+    assert!(!capability.tcp_supported);
+    assert!(!capability.udp_supported);
+    assert!(capability
+        .limitations
+        .iter()
+        .any(|item| item.contains("uid:password")));
+    let error = outbound
+        .connect(&Destination::new("target.example", 443), 100)
+        .await
+        .err()
+        .context("invalid SSR protocol-param unexpectedly connected")?;
+    assert!(error.to_string().contains("uid:password"));
     Ok(())
 }

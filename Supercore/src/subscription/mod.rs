@@ -1962,6 +1962,41 @@ proxies:
     }
 
     #[test]
+    fn parses_standard_ssr_uri_with_extended_cipher_and_user_param() {
+        use base64::Engine as _;
+
+        let engine = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let password = engine.encode("secret");
+        let remarks = engine.encode("SSR-CTR");
+        let user = engine.encode("1001:user-secret");
+        let decoded = format!(
+            "example.com:8388:auth_aes128_sha1:aes-256-ctr:random_head:{password}/?remarks={remarks}&protoparam={user}"
+        );
+        let uri = format!("ssr://{}", engine.encode(decoded));
+        let document = parse_subscription(&uri).unwrap();
+        let outbound = document.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Ssr {
+                name,
+                method,
+                password,
+                protocol,
+                obfs,
+                protocol_param,
+                ..
+            } => {
+                assert_eq!(name, "SSR-CTR");
+                assert_eq!(method, "aes-256-ctr");
+                assert_eq!(password, "secret");
+                assert_eq!(protocol, "auth_aes128_sha1");
+                assert_eq!(obfs, "random_head");
+                assert_eq!(protocol_param.as_deref(), Some("1001:user-secret"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
     fn converts_shadowsocks_udp_over_tcp_options() {
         let text = r#"
 proxies:

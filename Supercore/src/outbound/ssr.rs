@@ -83,6 +83,9 @@ impl Outbound for SsrOutbound {
         let method_supported = SsrCipher::from_method(&self.method).is_ok();
         let protocol = ssr_protocol_kind(&self.protocol);
         let protocol_supported = protocol.is_ok();
+        let protocol_param_error = protocol.as_ref().ok().and_then(|kind| {
+            validate_ssr_protocol_param(*kind, self.protocol_param.as_deref()).err()
+        });
         let obfs_supported = ssr_obfs_mode(&self.obfs).is_ok();
         if !method_supported {
             limitations.push(format!("unsupported ssr method {}", self.method));
@@ -93,8 +96,12 @@ impl Outbound for SsrOutbound {
         if !obfs_supported {
             limitations.push(format!("unsupported ssr obfs {}", self.obfs));
         }
+        if let Some(error) = &protocol_param_error {
+            limitations.push(error.to_string());
+        }
         let udp_supported = method_supported
             && obfs_supported
+            && protocol_param_error.is_none()
             && protocol
                 .as_ref()
                 .is_ok_and(|value| *value != SsrProtocolKind::AuthSha1V4);
@@ -105,7 +112,10 @@ impl Outbound for SsrOutbound {
             limitations.push("ssr auth_sha1_v4 udp is not supported".to_string());
         }
         OutboundCapability {
-            tcp_supported: method_supported && protocol_supported && obfs_supported,
+            tcp_supported: method_supported
+                && protocol_supported
+                && protocol_param_error.is_none()
+                && obfs_supported,
             udp_supported,
             udp_mode: Some(if udp_supported {
                 "ssr-datagram-stream-cipher".to_string()
@@ -122,6 +132,7 @@ impl Outbound for SsrOutbound {
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
         let protocol = ssr_protocol_kind(&self.protocol)?;
+        validate_ssr_protocol_param(protocol, self.protocol_param.as_deref())?;
         if protocol == SsrProtocolKind::Origin
             && self
                 .protocol_param
@@ -158,6 +169,19 @@ impl Outbound for SsrOutbound {
 
         let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
         let mut stream: BoxedStream = Box::new(tcp);
+        if obfs == SsrObfsMode::RandomHead {
+            stream.write_all(&build_ssr_random_head()?).await?;
+            stream.flush().await?;
+            return Ok(Box::new(spawn_ssr_random_head_stream(
+                cipher,
+                key,
+                upload,
+                stream,
+                protocol_encoder,
+                protocol_decoder,
+                initial,
+            )));
+        }
         if obfs == SsrObfsMode::Tls12TicketAuth {
             let (client_hello, client_id) = build_ssr_tls12_ticket_client_hello(
                 self.obfs_param.as_deref().unwrap_or(&self.server),
@@ -196,6 +220,7 @@ impl Outbound for SsrOutbound {
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
         let protocol = ssr_protocol_kind(&self.protocol)?;
+        validate_ssr_protocol_param(protocol, self.protocol_param.as_deref())?;
         if protocol == SsrProtocolKind::AuthSha1V4 {
             return Err(anyhow!("ssr auth_sha1_v4 UDP is not supported"));
         }
@@ -208,7 +233,8 @@ impl Outbound for SsrOutbound {
         encode_socks5_destination(destination, &mut plaintext)?;
         plaintext.extend_from_slice(payload);
         let chain_user_key = if ssr_is_auth_chain(protocol) {
-            let (uid, user_key) = ssr_chain_user_credentials(self.protocol_param.as_deref(), &key)?;
+            let (uid, user_key) =
+                ssr_chain_user_credentials(protocol, self.protocol_param.as_deref(), &key)?;
             plaintext = ssr_auth_chain_udp_encode(&plaintext, &key, &user_key, uid)?;
             Some(user_key)
         } else {
@@ -277,6 +303,7 @@ impl Outbound for SsrOutbound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SsrObfsMode {
     Plain,
+    RandomHead,
     HttpSimple,
     HttpPost,
     Tls12TicketAuth,
@@ -370,7 +397,9 @@ impl SsrProtocolEncoder {
             .map_err(|error| anyhow!("failed to generate SSR connection id: {error}"))?;
         let (uid, user_key) = match ssr_auth_hash(kind) {
             Some(hash) => ssr_user_credentials(hash, protocol_param, key)?,
-            None if ssr_is_auth_chain(kind) => ssr_chain_user_credentials(protocol_param, key)?,
+            None if ssr_is_auth_chain(kind) => {
+                ssr_chain_user_credentials(kind, protocol_param, key)?
+            }
             None => ([0u8; 4], key.to_vec()),
         };
         Ok(Self {
@@ -839,16 +868,61 @@ fn ssr_protocol_kind(value: &str) -> anyhow::Result<SsrProtocolKind> {
     }
 }
 
+fn validate_ssr_protocol_param(
+    kind: SsrProtocolKind,
+    protocol_param: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(value) = protocol_param
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if !ssr_is_auth_chain(kind) && ssr_auth_hash(kind).is_none() {
+        return Ok(());
+    }
+    if kind == SsrProtocolKind::AuthChainF && value.parse::<u64>().is_ok() {
+        return Ok(());
+    }
+    let (uid, password) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow!("SSR protocol_param must use uid:password"))?;
+    uid.trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid SSR protocol_param uid {uid:?}"))?;
+    if password.trim().is_empty() {
+        return Err(anyhow!("SSR protocol_param user password is empty"));
+    }
+    Ok(())
+}
+
 fn ssr_obfs_mode(value: &str) -> anyhow::Result<SsrObfsMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "plain" => Ok(SsrObfsMode::Plain),
+        "random_head" | "random-head" => Ok(SsrObfsMode::RandomHead),
         "http_simple" | "http-simple" => Ok(SsrObfsMode::HttpSimple),
         "http_post" | "http-post" => Ok(SsrObfsMode::HttpPost),
-        "tls1.2_ticket_auth" | "tls1.2-ticket-auth" => Ok(SsrObfsMode::Tls12TicketAuth),
+        "tls1.2_ticket_auth"
+        | "tls1.2-ticket-auth"
+        | "tls1.2_ticket_fastauth"
+        | "tls1.2-ticket-fastauth" => Ok(SsrObfsMode::Tls12TicketAuth),
         value => Err(anyhow!(
-            "ssr obfs {value} is not implemented safely yet; supported: plain, http_simple, http_post, tls1.2_ticket_auth"
+            "ssr obfs {value} is not implemented safely yet; supported: plain, random_head, http_simple, http_post, tls1.2_ticket_auth, tls1.2_ticket_fastauth"
         )),
     }
+}
+
+fn build_ssr_random_head() -> anyhow::Result<Vec<u8>> {
+    let mut random = [0u8; 1];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow!("failed to generate SSR random_head length: {error}"))?;
+    let payload_len = 4 + random[0] as usize % 96;
+    let mut header = vec![0u8; payload_len + 4];
+    getrandom::fill(&mut header[..payload_len])
+        .map_err(|error| anyhow!("failed to generate SSR random_head payload: {error}"))?;
+    let checksum = u32::MAX.wrapping_sub(ssr_crc32(&header[..payload_len]));
+    header[payload_len..].copy_from_slice(&checksum.to_le_bytes());
+    Ok(header)
 }
 
 fn build_ssr_http_obfs_request(
@@ -1067,6 +1141,73 @@ where
     Ok(())
 }
 
+fn spawn_ssr_random_head_stream(
+    cipher: SsrCipher,
+    key: Vec<u8>,
+    mut upload: SsrStreamCipher,
+    stream: BoxedStream,
+    mut protocol_encoder: SsrProtocolEncoder,
+    protocol_decoder: SsrProtocolDecoder,
+    initial: Vec<u8>,
+) -> DuplexStream {
+    let (app_side, relay_side) = tokio::io::duplex(64 * 1024);
+    let (mut local_read, mut local_write) = tokio::io::split(relay_side);
+    let (mut remote_read, mut remote_write) = tokio::io::split(stream);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        if ready_rx.await.is_err() || remote_write.write_all(&initial).await.is_err() {
+            let _ = remote_write.shutdown().await;
+            return;
+        }
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            match local_read.read(&mut buffer).await {
+                Ok(0) => {
+                    let _ = remote_write.shutdown().await;
+                    break;
+                }
+                Ok(read) => {
+                    let Ok(mut encoded) = protocol_encoder.encode(&buffer[..read]) else {
+                        break;
+                    };
+                    upload.apply(&mut encoded);
+                    if remote_write.write_all(&encoded).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        let mut acknowledgement = [0u8; 4096];
+        match remote_read.read(&mut acknowledgement).await {
+            Ok(0) | Err(_) => {
+                let _ = local_write.shutdown().await;
+                return;
+            }
+            Ok(_) => {}
+        }
+        if ready_tx.send(()).is_err() {
+            let _ = local_write.shutdown().await;
+            return;
+        }
+        let mut protocol_decoder = protocol_decoder;
+        relay_ssr_download(
+            cipher,
+            &key,
+            &mut protocol_decoder,
+            &mut remote_read,
+            &mut local_write,
+        )
+        .await;
+    });
+
+    app_side
+}
+
 fn spawn_ssr_tls12_ticket_stream(
     cipher: SsrCipher,
     key: Vec<u8>,
@@ -1260,11 +1401,13 @@ fn ssr_user_credentials(
     protocol_param: Option<&str>,
     server_key: &[u8],
 ) -> anyhow::Result<([u8; 4], Vec<u8>)> {
-    if let Some((uid, password)) = protocol_param
+    if let Some(value) = protocol_param
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|value| value.split_once(':'))
     {
+        let (uid, password) = value.split_once(':').ok_or_else(|| {
+            anyhow!("SSR protocol_param must use uid:password for authenticated users")
+        })?;
         let uid = uid
             .trim()
             .parse::<u32>()
@@ -1282,14 +1425,23 @@ fn ssr_user_credentials(
 }
 
 fn ssr_chain_user_credentials(
+    kind: SsrProtocolKind,
     protocol_param: Option<&str>,
     server_key: &[u8],
 ) -> anyhow::Result<([u8; 4], Vec<u8>)> {
-    if let Some((uid, password)) = protocol_param
+    if let Some(value) = protocol_param
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|value| value.split_once(':'))
     {
+        if kind == SsrProtocolKind::AuthChainF && value.parse::<u64>().is_ok() {
+            let mut uid = [0u8; 4];
+            getrandom::fill(&mut uid)
+                .map_err(|error| anyhow!("failed to generate SSR auth-chain uid: {error}"))?;
+            return Ok((uid, server_key.to_vec()));
+        }
+        let (uid, password) = value
+            .split_once(':')
+            .ok_or_else(|| anyhow!("SSR auth-chain protocol_param must use uid:password"))?;
         let uid = uid
             .trim()
             .parse::<u32>()
@@ -2076,47 +2228,72 @@ async fn relay_ssr_download<R, W>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SsrCipher {
+    Dummy,
+    Aes128Ctr,
+    Aes192Ctr,
+    Aes256Ctr,
     Aes128Cfb,
     Aes192Cfb,
     Aes256Cfb,
     Rc4Md5,
     Chacha20Legacy,
     Chacha20Ietf,
+    XChacha20,
 }
 
 impl SsrCipher {
     fn from_method(method: &str) -> anyhow::Result<Self> {
         match method.to_ascii_lowercase().as_str() {
+            "none" | "dummy" => Ok(Self::Dummy),
+            "aes-128-ctr" => Ok(Self::Aes128Ctr),
+            "aes-192-ctr" => Ok(Self::Aes192Ctr),
+            "aes-256-ctr" => Ok(Self::Aes256Ctr),
             "aes-128-cfb" => Ok(Self::Aes128Cfb),
             "aes-192-cfb" => Ok(Self::Aes192Cfb),
             "aes-256-cfb" => Ok(Self::Aes256Cfb),
             "rc4-md5" => Ok(Self::Rc4Md5),
             "chacha20" => Ok(Self::Chacha20Legacy),
             "chacha20-ietf" => Ok(Self::Chacha20Ietf),
+            "xchacha20" => Ok(Self::XChacha20),
             _ => Err(anyhow!("unsupported ssr method {method}")),
         }
     }
 
     fn key_len(self) -> usize {
         match self {
-            Self::Aes128Cfb => 16,
-            Self::Aes192Cfb => 24,
-            Self::Aes256Cfb => 32,
+            Self::Dummy | Self::Aes128Ctr | Self::Aes128Cfb => 16,
+            Self::Aes192Ctr | Self::Aes192Cfb => 24,
+            Self::Aes256Ctr | Self::Aes256Cfb => 32,
             Self::Rc4Md5 => 16,
-            Self::Chacha20Legacy | Self::Chacha20Ietf => 32,
+            Self::Chacha20Legacy | Self::Chacha20Ietf | Self::XChacha20 => 32,
         }
     }
 
     fn iv_len(self) -> usize {
         match self {
+            Self::Dummy => 0,
             Self::Chacha20Legacy => 8,
             Self::Chacha20Ietf => 12,
+            Self::XChacha20 => 24,
             _ => 16,
         }
     }
 
     fn encryptor(self, key: &[u8], iv: &[u8]) -> anyhow::Result<SsrStreamCipher> {
         match self {
+            Self::Dummy => Ok(SsrStreamCipher::Dummy),
+            Self::Aes128Ctr => Ok(SsrStreamCipher::Aes128Ctr(
+                ctr::Ctr128BE::<Aes128>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid aes-128-ctr key/iv"))?,
+            )),
+            Self::Aes192Ctr => Ok(SsrStreamCipher::Aes192Ctr(
+                ctr::Ctr128BE::<Aes192>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid aes-192-ctr key/iv"))?,
+            )),
+            Self::Aes256Ctr => Ok(SsrStreamCipher::Aes256Ctr(
+                ctr::Ctr128BE::<Aes256>::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid aes-256-ctr key/iv"))?,
+            )),
             Self::Aes128Cfb => Ok(SsrStreamCipher::Aes128Enc(
                 cfb_mode::BufEncryptor::<Aes128>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid aes-128-cfb key/iv"))?,
@@ -2164,11 +2341,23 @@ impl SsrCipher {
                         .map_err(|_| anyhow!("invalid chacha20-ietf key/iv"))?,
                 ))
             }
+            Self::XChacha20 => Ok(SsrStreamCipher::XChacha20(
+                chacha20::XChaCha20::new_from_slices(key, iv)
+                    .map_err(|_| anyhow!("invalid xchacha20 key/iv"))?,
+            )),
         }
     }
 
     fn decryptor(self, key: &[u8], iv: &[u8]) -> anyhow::Result<SsrStreamCipher> {
         match self {
+            Self::Dummy
+            | Self::Aes128Ctr
+            | Self::Aes192Ctr
+            | Self::Aes256Ctr
+            | Self::Rc4Md5
+            | Self::Chacha20Legacy
+            | Self::Chacha20Ietf
+            | Self::XChacha20 => self.encryptor(key, iv),
             Self::Aes128Cfb => Ok(SsrStreamCipher::Aes128Dec(
                 cfb_mode::BufDecryptor::<Aes128>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid aes-128-cfb key/iv"))?,
@@ -2181,41 +2370,6 @@ impl SsrCipher {
                 cfb_mode::BufDecryptor::<Aes256>::new_from_slices(key, iv)
                     .map_err(|_| anyhow!("invalid aes-256-cfb key/iv"))?,
             )),
-            Self::Rc4Md5 => {
-                let rc4_key = rc4_md5_derive_key(key, iv);
-                let key_arr = rc4::Key::<rc4::consts::U16>::from_slice(&rc4_key);
-                Ok(SsrStreamCipher::Rc4Dec(rc4::Rc4::<rc4::consts::U16>::new(
-                    key_arr,
-                )))
-            }
-            Self::Chacha20Legacy => {
-                let chacha_key = if key.len() == 16 {
-                    let mut extended = vec![0u8; 32];
-                    extended[..16].copy_from_slice(key);
-                    extended[16..].copy_from_slice(key);
-                    extended
-                } else {
-                    key.to_vec()
-                };
-                Ok(SsrStreamCipher::Chacha20LegacyDec(
-                    chacha20::ChaCha20Legacy::new_from_slices(&chacha_key, iv)
-                        .map_err(|_| anyhow!("invalid chacha20 key/iv"))?,
-                ))
-            }
-            Self::Chacha20Ietf => {
-                let chacha_key = if key.len() == 16 {
-                    let mut extended = vec![0u8; 32];
-                    extended[..16].copy_from_slice(key);
-                    extended[16..].copy_from_slice(key);
-                    extended
-                } else {
-                    key.to_vec()
-                };
-                Ok(SsrStreamCipher::Chacha20IetfDec(
-                    chacha20::ChaCha20::new_from_slices(&chacha_key, iv)
-                        .map_err(|_| anyhow!("invalid chacha20-ietf key/iv"))?,
-                ))
-            }
         }
     }
 }
@@ -2229,6 +2383,10 @@ fn rc4_md5_derive_key(key: &[u8], iv: &[u8]) -> Vec<u8> {
 }
 
 enum SsrStreamCipher {
+    Dummy,
+    Aes128Ctr(ctr::Ctr128BE<Aes128>),
+    Aes192Ctr(ctr::Ctr128BE<Aes192>),
+    Aes256Ctr(ctr::Ctr128BE<Aes256>),
     Aes128Enc(cfb_mode::BufEncryptor<Aes128>),
     Aes192Enc(cfb_mode::BufEncryptor<Aes192>),
     Aes256Enc(cfb_mode::BufEncryptor<Aes256>),
@@ -2236,17 +2394,19 @@ enum SsrStreamCipher {
     Aes192Dec(cfb_mode::BufDecryptor<Aes192>),
     Aes256Dec(cfb_mode::BufDecryptor<Aes256>),
     Rc4Enc(rc4::Rc4<rc4::consts::U16>),
-    Rc4Dec(rc4::Rc4<rc4::consts::U16>),
     Chacha20LegacyEnc(chacha20::ChaCha20Legacy),
-    Chacha20LegacyDec(chacha20::ChaCha20Legacy),
     Chacha20IetfEnc(chacha20::ChaCha20),
-    Chacha20IetfDec(chacha20::ChaCha20),
+    XChacha20(chacha20::XChaCha20),
 }
 
 impl SsrStreamCipher {
     fn apply(&mut self, data: &mut [u8]) {
         use cipher::StreamCipher;
         match self {
+            Self::Dummy => {}
+            Self::Aes128Ctr(cipher) => cipher.apply_keystream(data),
+            Self::Aes192Ctr(cipher) => cipher.apply_keystream(data),
+            Self::Aes256Ctr(cipher) => cipher.apply_keystream(data),
             Self::Aes128Enc(cipher) => cipher.encrypt(data),
             Self::Aes192Enc(cipher) => cipher.encrypt(data),
             Self::Aes256Enc(cipher) => cipher.encrypt(data),
@@ -2254,11 +2414,9 @@ impl SsrStreamCipher {
             Self::Aes192Dec(cipher) => cipher.decrypt(data),
             Self::Aes256Dec(cipher) => cipher.decrypt(data),
             Self::Rc4Enc(cipher) => cipher.apply_keystream(data),
-            Self::Rc4Dec(cipher) => cipher.apply_keystream(data),
             Self::Chacha20LegacyEnc(cipher) => cipher.apply_keystream(data),
-            Self::Chacha20LegacyDec(cipher) => cipher.apply_keystream(data),
             Self::Chacha20IetfEnc(cipher) => cipher.apply_keystream(data),
-            Self::Chacha20IetfDec(cipher) => cipher.apply_keystream(data),
+            Self::XChacha20(cipher) => cipher.apply_keystream(data),
         }
     }
 }

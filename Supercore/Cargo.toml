@@ -19,6 +19,7 @@ bytes = "1"
 chacha20poly1305 = { version = "0.10", features = ["reduced-round"] }
 chacha20 = "0.9"
 ccm = "0.5"
+ctr = "0.9"
 lea = "0.5.4"
 aegis = { version = "0.9.15", default-features = false, features = ["std", "pure-rust"] }
 deoxys = { version = "0.2.0-rc.3", default-features = false, features = ["alloc"] }

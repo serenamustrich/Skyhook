@@ -4235,6 +4235,7 @@ dependencies = [
  "cipher 0.4.4",
  "clap",
  "crc32c",
+ "ctr 0.9.2",
  "deoxys",
  "digest 0.10.7",
  "futures",
