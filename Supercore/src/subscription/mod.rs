@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use url::Url;
 
-use crate::config::{OutboundConfig, ShadowsocksPluginConfig};
+use crate::{
+    config::{
+        OutboundCommonConfig, OutboundConfig, ShadowsocksPluginConfig, SmuxConfig, SmuxProtocol,
+    },
+    outbound::context::IpVersionStrategy,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriptionDocument {
@@ -126,6 +131,84 @@ impl SubscriptionDocument {
 }
 
 impl SubscriptionNode {
+    pub fn common_options(&self) -> anyhow::Result<Option<OutboundCommonConfig>> {
+        let mut options = OutboundCommonConfig::default();
+        options.ip_version = match first_param(&self.params, &["ip-version", "ip_version"])
+            .as_deref()
+            .unwrap_or("dual")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "dual" => IpVersionStrategy::Dual,
+            "ipv4" | "v4" => IpVersionStrategy::Ipv4,
+            "ipv6" | "v6" => IpVersionStrategy::Ipv6,
+            "prefer-ipv4" | "prefer_ipv4" => IpVersionStrategy::PreferIpv4,
+            "prefer-ipv6" | "prefer_ipv6" => IpVersionStrategy::PreferIpv6,
+            value => return Err(anyhow!("unsupported ip-version {value}")),
+        };
+        options.interface_name = first_param(&self.params, &["interface-name", "interface"]);
+        options.routing_mark = first_param(&self.params, &["routing-mark", "routing_mark"])
+            .map(|value| parse_u32_text(&value, "routing-mark"))
+            .transpose()?;
+        options.tfo = bool_param_any(&self.params, &["tfo", "tcp-fast-open"]);
+        options.mptcp = bool_param_any(&self.params, &["mptcp", "multipath-tcp"]);
+        options.dialer_proxy = first_param(&self.params, &["dialer-proxy", "dialer_proxy"]);
+        if self.params.contains_key("udp") {
+            options.udp = bool_param(&self.params, "udp");
+        }
+        options.certificate_fingerprint = first_param(
+            &self.params,
+            &["certificate-fingerprint", "cert-fingerprint", "fingerprint"],
+        );
+        options.keepalive_secs = first_param(&self.params, &["keepalive", "keepalive-secs"])
+            .map(|value| parse_u64_text(&value, "keepalive"))
+            .transpose()?;
+        options.quic_mtu = first_param(&self.params, &["quic-mtu", "mtu"])
+            .map(|value| parse_u16_text(&value, "quic-mtu"))
+            .transpose()?;
+        options.quic_zero_rtt = bool_param_any(&self.params, &["quic-zero-rtt", "zero-rtt"]);
+        options.websocket_early_data_header = first_param(
+            &self.params,
+            &["early-data-header-name", "ws-early-data-header"],
+        );
+        options.websocket_max_early_data =
+            first_param(&self.params, &["max-early-data", "ws-max-early-data"])
+                .map(|value| parse_u64_text(&value, "max-early-data").map(|value| value as usize))
+                .transpose()?
+                .unwrap_or(0);
+        if bool_param(&self.params, "smux-enabled") {
+            options.smux = Some(SmuxConfig {
+                enabled: true,
+                protocol: match first_param(&self.params, &["smux-protocol"])
+                    .as_deref()
+                    .unwrap_or("smux")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "smux" => SmuxProtocol::Smux,
+                    "yamux" => SmuxProtocol::Yamux,
+                    "h2mux" | "h2-mux" => SmuxProtocol::H2Mux,
+                    value => return Err(anyhow!("unsupported smux protocol {value}")),
+                },
+                max_connections: first_param(&self.params, &["smux-max-connections"])
+                    .map(|value| parse_u64_text(&value, "smux-max-connections"))
+                    .transpose()?
+                    .unwrap_or(4) as usize,
+                max_streams: first_param(&self.params, &["smux-max-streams"])
+                    .map(|value| parse_u64_text(&value, "smux-max-streams"))
+                    .transpose()?
+                    .unwrap_or(8) as usize,
+                padding: bool_param(&self.params, "smux-padding"),
+                only_tcp: !self.params.contains_key("smux-only-tcp")
+                    || bool_param(&self.params, "smux-only-tcp"),
+            });
+        }
+
+        options.validate()?;
+
+        Ok((options != OutboundCommonConfig::default()).then_some(options))
+    }
+
     pub fn to_outbound_config(&self) -> anyhow::Result<OutboundConfig> {
         match &self.protocol {
             NodeProtocol::Http => Ok(OutboundConfig::Http {
@@ -811,6 +894,10 @@ fn parse_clash_proxy(value: &Value) -> anyhow::Result<SubscriptionNode> {
             parse_clash_ws_opts(value, &mut params);
             continue;
         }
+        if key == "smux" {
+            parse_clash_smux_opts(value, &mut params);
+            continue;
+        }
         if key == "grpc-opts" {
             parse_clash_grpc_opts(value, &mut params);
             continue;
@@ -829,13 +916,15 @@ fn parse_clash_proxy(value: &Value) -> anyhow::Result<SubscriptionNode> {
             params.insert(key.to_string(), values.join(","));
         }
     }
-    Ok(SubscriptionNode {
+    let node = SubscriptionNode {
         name,
         protocol,
         server,
         port,
         params,
-    })
+    };
+    node.common_options()?;
+    Ok(node)
 }
 
 fn parse_clash_group(value: &Value) -> anyhow::Result<SubscriptionGroup> {
@@ -974,7 +1063,10 @@ fn parse_uri_subscription(text: &str) -> anyhow::Result<SubscriptionDocument> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        match parse_node_uri(line) {
+        match parse_node_uri(line).and_then(|node| {
+            node.common_options()?;
+            Ok(node)
+        }) {
             Ok(node) => nodes.push(node),
             Err(error) => unsupported.push(UnsupportedItem {
                 item: line.to_string(),
@@ -1204,6 +1296,30 @@ fn bool_param_any(params: &BTreeMap<String, String>, keys: &[&str]) -> bool {
     keys.iter().any(|key| bool_param(params, key))
 }
 
+fn parse_u64_text(value: &str, label: &str) -> anyhow::Result<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| anyhow!("invalid {label} value {value}: {error}"))
+}
+
+fn parse_u32_text(value: &str, label: &str) -> anyhow::Result<u32> {
+    let value = value.trim();
+    let result = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u32::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse::<u32>());
+    result.map_err(|error| anyhow!("invalid {label} value {value}: {error}"))
+}
+
+fn parse_u16_text(value: &str, label: &str) -> anyhow::Result<u16> {
+    value
+        .trim()
+        .parse::<u16>()
+        .map_err(|error| anyhow!("invalid {label} value {value}: {error}"))
+}
+
 fn first_param(params: &BTreeMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| params.get(*key))
@@ -1337,6 +1453,12 @@ fn parse_clash_ws_opts(value: &Value, params: &mut BTreeMap<String, String>) {
     if let Some(host) = yaml_string(mapping, "host") {
         params.insert("host".to_string(), host);
     }
+    if let Some(max_early_data) = yaml_u64(mapping, "max-early-data") {
+        params.insert("max-early-data".to_string(), max_early_data.to_string());
+    }
+    if let Some(header) = yaml_string(mapping, "early-data-header-name") {
+        params.insert("early-data-header-name".to_string(), header);
+    }
     if let Some(headers) = mapping
         .get(Value::String("headers".to_string()))
         .and_then(Value::as_mapping)
@@ -1349,6 +1471,27 @@ fn parse_clash_ws_opts(value: &Value, params: &mut BTreeMap<String, String>) {
         }
         if let Some(host) = yaml_string(headers, "Host").or_else(|| yaml_string(headers, "host")) {
             params.insert("host".to_string(), host);
+        }
+    }
+}
+
+fn parse_clash_smux_opts(value: &Value, params: &mut BTreeMap<String, String>) {
+    let Some(mapping) = value.as_mapping() else {
+        return;
+    };
+    for key in [
+        "enabled",
+        "protocol",
+        "max-connections",
+        "max-streams",
+        "padding",
+        "only-tcp",
+    ] {
+        if let Some(value) = mapping
+            .get(Value::String(key.to_string()))
+            .and_then(yaml_scalar_to_string)
+        {
+            params.insert(format!("smux-{key}"), value);
         }
     }
 }

@@ -19,7 +19,8 @@ fn realistic_mixed_subscription_fixture_builds_runtime_config() {
         document.unsupported
     );
 
-    let config = runtime_config_from_document(SuperConfig::default(), &document, true);
+    let config = runtime_config_from_document(SuperConfig::default(), &document, true)
+        .expect("runtime config");
     assert!(config.outbounds.iter().any(|item| item.name() == "Auto"));
     assert!(config
         .rules

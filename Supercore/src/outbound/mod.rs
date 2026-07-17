@@ -1,4 +1,5 @@
 mod anytls;
+mod configured;
 pub mod context;
 mod direct;
 pub mod error;
@@ -29,7 +30,7 @@ mod vless;
 mod vmess;
 mod wireguard;
 
-pub use factory::build_outbounds;
+pub use factory::{build_outbounds, build_outbounds_with_options};
 pub use target::encode_socks5_destination;
 pub use traits::{BoxedStream, Outbound, OutboundCapability, OutboundMap, ProxyStream};
 

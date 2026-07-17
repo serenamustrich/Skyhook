@@ -315,7 +315,7 @@ fn subscription_rules_keep_base_custom_rules_first() {
         },
     ];
 
-    let config = runtime_config_from_document(base, &document, true);
+    let config = runtime_config_from_document(base, &document, true).expect("runtime config");
 
     assert_eq!(config.rules[0].target, RuleTarget::DomainSuffix);
     assert_eq!(config.rules[0].value, "custom.example");

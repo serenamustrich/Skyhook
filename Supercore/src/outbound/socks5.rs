@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
+    net::UdpSocket,
     sync::Mutex,
     time::timeout,
 };
@@ -32,7 +32,7 @@ pub(super) struct Socks5Outbound {
 type Socks5UdpPool = RoundRobinSessionPool<Socks5UdpSession>;
 
 struct Socks5UdpSession {
-    _control: TcpStream,
+    _control: Arc<Mutex<BoxedStream>>,
     udp: UdpSocket,
     relay: SocketAddr,
 }
@@ -94,7 +94,7 @@ impl Socks5Outbound {
         let relay = resolve_udp_socket_addr(relay_host, bound.port, timeout_ms).await?;
         let udp = create_bound_udp(relay)?;
         Ok(Socks5UdpSession {
-            _control: stream,
+            _control: Arc::new(Mutex::new(stream)),
             udp,
             relay,
         })
@@ -200,11 +200,14 @@ fn validate_socks5_response_header(header: [u8; 4], operation: &str) -> anyhow::
     Ok(())
 }
 
-async fn authenticate_socks5(
-    stream: &mut TcpStream,
+async fn authenticate_socks5<S>(
+    stream: &mut S,
     username: Option<&str>,
     password: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let username = username.ok_or_else(|| anyhow!("socks5 proxy requested username"))?;
     let password = password.ok_or_else(|| anyhow!("socks5 proxy requested password"))?;
     if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
@@ -223,11 +226,14 @@ async fn authenticate_socks5(
     Ok(())
 }
 
-async fn negotiate_socks5(
-    stream: &mut TcpStream,
+async fn negotiate_socks5<S>(
+    stream: &mut S,
     username: Option<&str>,
     password: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let methods = if username.is_some() && password.is_some() {
         vec![0x00, 0x02]
     } else {
@@ -246,14 +252,17 @@ async fn negotiate_socks5(
     }
 }
 
-async fn discard_socks5_bound_address(stream: &mut TcpStream, atyp: u8) -> anyhow::Result<()> {
+async fn discard_socks5_bound_address<S>(stream: &mut S, atyp: u8) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     read_socks5_bound_address(stream, atyp).await.map(|_| ())
 }
 
-async fn read_socks5_bound_address(
-    stream: &mut TcpStream,
-    atyp: u8,
-) -> anyhow::Result<Destination> {
+async fn read_socks5_bound_address<S>(stream: &mut S, atyp: u8) -> anyhow::Result<Destination>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     super::target::read_socks5_destination_after_atyp(stream, atyp)
         .await
         .context("invalid socks5 bound address")

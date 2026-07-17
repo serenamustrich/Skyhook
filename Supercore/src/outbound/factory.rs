@@ -1,11 +1,18 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use anyhow::anyhow;
 
-use crate::{config::OutboundConfig, telemetry::Telemetry};
+use crate::{
+    config::{OutboundCommonConfig, OutboundConfig},
+    telemetry::Telemetry,
+};
 
 use super::{
     anytls::AnyTlsOutbound,
+    configured::{outbound_registry, ConfiguredOutbound},
     direct::DirectOutbound,
     http_proxy::HttpOutbound,
     hysteria2::Hysteria2Outbound,
@@ -31,17 +38,101 @@ pub fn build_outbounds(
     configs: &[OutboundConfig],
     telemetry: Option<Arc<Telemetry>>,
 ) -> anyhow::Result<OutboundMap> {
+    build_outbounds_with_options(configs, &BTreeMap::new(), telemetry)
+}
+
+pub fn build_outbounds_with_options(
+    configs: &[OutboundConfig],
+    common_options: &BTreeMap<String, OutboundCommonConfig>,
+    telemetry: Option<Arc<Telemetry>>,
+) -> anyhow::Result<OutboundMap> {
+    validate_common_options(configs, common_options)?;
     let mut outbounds: OutboundMap = HashMap::new();
+    let registry = outbound_registry();
     for config in configs {
         if matches!(config, OutboundConfig::Group { .. }) {
             continue;
         }
         let outbound = build_leaf_outbound(config)?;
+        let outbound =
+            common_options
+                .get(config.name())
+                .cloned()
+                .map_or(outbound.clone(), |options| {
+                    Arc::new(ConfiguredOutbound::new(
+                        outbound,
+                        options,
+                        Arc::clone(&registry),
+                    )) as Arc<dyn Outbound>
+                });
         insert_leaf(&mut outbounds, config.name(), outbound)?;
     }
 
     attach_groups(configs, &mut outbounds, telemetry)?;
+    let mut registered = registry
+        .write()
+        .map_err(|_| anyhow!("outbound registry lock poisoned"))?;
+    registered.extend(
+        outbounds
+            .iter()
+            .map(|(name, outbound)| (name.clone(), Arc::downgrade(outbound))),
+    );
+    drop(registered);
     Ok(outbounds)
+}
+
+fn validate_common_options(
+    configs: &[OutboundConfig],
+    common_options: &BTreeMap<String, OutboundCommonConfig>,
+) -> anyhow::Result<()> {
+    let configs_by_name = configs
+        .iter()
+        .map(|config| (config.name(), config))
+        .collect::<HashMap<_, _>>();
+    for (name, options) in common_options {
+        let config = configs_by_name
+            .get(name.as_str())
+            .ok_or_else(|| anyhow!("outbound-options references unknown outbound {name}"))?;
+        if matches!(config, OutboundConfig::Group { .. }) {
+            return Err(anyhow!(
+                "outbound-options cannot be applied to proxy group {name}"
+            ));
+        }
+        options
+            .validate()
+            .map_err(|error| anyhow!("invalid outbound-options for {name}: {error}"))?;
+        if let Some(dialer) = options.dialer_proxy.as_deref() {
+            let dialer = dialer.trim();
+            if !configs_by_name.contains_key(dialer) {
+                return Err(anyhow!(
+                    "dialer-proxy {dialer} referenced by {name} does not exist"
+                ));
+            }
+        }
+    }
+
+    for start in common_options.keys() {
+        let mut chain = Vec::new();
+        let mut current = start.as_str();
+        loop {
+            if let Some(position) = chain.iter().position(|name| *name == current) {
+                chain.push(current);
+                return Err(anyhow!(
+                    "dialer-proxy cycle detected: {}",
+                    chain[position..].join(" -> ")
+                ));
+            }
+            chain.push(current);
+            let Some(next) = common_options
+                .get(current)
+                .and_then(|options| options.dialer_proxy.as_deref())
+            else {
+                break;
+            };
+            current = next.trim();
+        }
+    }
+    Ok(())
 }
 
 fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbound>> {

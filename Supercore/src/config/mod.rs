@@ -4,8 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
+
+use crate::outbound::context::IpVersionStrategy;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SuperConfig {
@@ -23,6 +25,8 @@ pub struct SuperConfig {
     pub geo: GeoConfig,
     #[serde(default = "default_outbounds")]
     pub outbounds: Vec<OutboundConfig>,
+    #[serde(default, rename = "outbound-options")]
+    pub outbound_options: BTreeMap<String, OutboundCommonConfig>,
     #[serde(default)]
     pub rule_sets: Vec<RuleSetConfig>,
     #[serde(default)]
@@ -51,6 +55,140 @@ pub struct CoreConfig {
     pub probe_interval_secs: u64,
     #[serde(default = "default_probe_concurrency")]
     pub probe_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct OutboundCommonConfig {
+    pub ip_version: IpVersionStrategy,
+    pub interface_name: Option<String>,
+    pub routing_mark: Option<u32>,
+    pub tfo: bool,
+    pub mptcp: bool,
+    pub dialer_proxy: Option<String>,
+    pub udp: bool,
+    pub certificate_fingerprint: Option<String>,
+    pub keepalive_secs: Option<u64>,
+    pub quic_mtu: Option<u16>,
+    pub quic_zero_rtt: bool,
+    pub websocket_early_data_header: Option<String>,
+    pub websocket_max_early_data: usize,
+    pub smux: Option<SmuxConfig>,
+}
+
+impl Default for OutboundCommonConfig {
+    fn default() -> Self {
+        Self {
+            ip_version: IpVersionStrategy::Dual,
+            interface_name: None,
+            routing_mark: None,
+            tfo: false,
+            mptcp: false,
+            dialer_proxy: None,
+            udp: true,
+            certificate_fingerprint: None,
+            keepalive_secs: None,
+            quic_mtu: None,
+            quic_zero_rtt: false,
+            websocket_early_data_header: None,
+            websocket_max_early_data: 0,
+            smux: None,
+        }
+    }
+}
+
+impl OutboundCommonConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self
+            .interface_name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            bail!("interface-name must not be empty");
+        }
+        if self
+            .dialer_proxy
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            bail!("dialer-proxy must not be empty");
+        }
+        if self.keepalive_secs == Some(0) {
+            bail!("keepalive must be greater than zero seconds");
+        }
+        if self.quic_mtu.is_some_and(|mtu| mtu < 1200) {
+            bail!("quic-mtu must be at least 1200 bytes");
+        }
+        if let Some(fingerprint) = &self.certificate_fingerprint {
+            parse_sha256_certificate_fingerprint(fingerprint)?;
+        }
+        if let Some(header) = &self.websocket_early_data_header {
+            if header.is_empty() || !header.bytes().all(is_http_token_byte) {
+                bail!("WebSocket early-data header must be a valid HTTP token");
+            }
+        }
+        if let Some(smux) = &self.smux {
+            if smux.enabled && smux.max_connections == 0 {
+                bail!("smux max-connections must be greater than zero");
+            }
+            if smux.enabled && smux.max_streams == 0 {
+                bail!("smux max-streams must be greater than zero");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn parse_sha256_certificate_fingerprint(value: &str) -> anyhow::Result<[u8; 32]> {
+    let normalized = value
+        .chars()
+        .filter(|character| !matches!(character, ':' | '-' | ' '))
+        .collect::<String>();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("certificate fingerprint must be a 32-byte SHA-256 hex value");
+    }
+    let mut fingerprint = [0u8; 32];
+    for (index, byte) in fingerprint.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&normalized[index * 2..index * 2 + 2], 16)?;
+    }
+    Ok(fingerprint)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SmuxConfig {
+    pub enabled: bool,
+    pub protocol: SmuxProtocol,
+    pub max_connections: usize,
+    pub max_streams: usize,
+    pub padding: bool,
+    pub only_tcp: bool,
+}
+
+impl Default for SmuxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: SmuxProtocol::Smux,
+            max_connections: 4,
+            max_streams: 8,
+            padding: false,
+            only_tcp: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SmuxProtocol {
+    #[default]
+    Smux,
+    Yamux,
+    H2Mux,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -712,6 +850,7 @@ impl Default for SuperConfig {
             subscriptions: SubscriptionConfig::default(),
             geo: GeoConfig::default(),
             outbounds: default_outbounds(),
+            outbound_options: BTreeMap::new(),
             rule_sets: Vec::new(),
             geoip_database: None,
             geoip: Vec::new(),

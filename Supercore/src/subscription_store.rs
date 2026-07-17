@@ -451,11 +451,7 @@ impl SubscriptionStore {
         let Some(document) = self.active_document()? else {
             return Ok(base);
         };
-        Ok(runtime_config_from_document(
-            base,
-            &document,
-            use_first_node_as_default,
-        ))
+        runtime_config_from_document(base, &document, use_first_node_as_default)
     }
 
     pub async fn update_all_from_urls(&self) -> anyhow::Result<Vec<SubscriptionUpdateSummary>> {
@@ -1138,10 +1134,22 @@ pub fn runtime_config_from_document(
     mut base: SuperConfig,
     document: &SubscriptionDocument,
     use_first_node_as_default: bool,
-) -> SuperConfig {
+) -> anyhow::Result<SuperConfig> {
     let outbounds = document_runtime_outbounds(document);
     let first_name = outbounds.first().map(|item| item.name().to_string());
     append_unique_outbounds(&mut base.outbounds, outbounds);
+    for node in &document.nodes {
+        match node.common_options().with_context(|| {
+            format!("invalid common options for subscription node {}", node.name)
+        })? {
+            Some(options) => {
+                base.outbound_options.insert(node.name.clone(), options);
+            }
+            None => {
+                base.outbound_options.remove(&node.name);
+            }
+        }
+    }
     let known_names = base
         .outbounds
         .iter()
@@ -1165,7 +1173,7 @@ pub fn runtime_config_from_document(
             }
         }
     }
-    base
+    Ok(base)
 }
 
 fn merge_base_and_subscription_rules(

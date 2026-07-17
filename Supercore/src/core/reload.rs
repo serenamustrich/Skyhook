@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::anyhow;
 
 use crate::{
-    config::SuperConfig, outbound::build_outbounds, routing::Router, telemetry::Telemetry,
+    config::SuperConfig, outbound::build_outbounds_with_options, routing::Router,
+    telemetry::Telemetry,
 };
 
 use super::{Runtime, RuntimeState};
@@ -48,7 +49,11 @@ pub(super) fn build_runtime_state(
     config: SuperConfig,
     telemetry: Arc<Telemetry>,
 ) -> anyhow::Result<RuntimeState> {
-    let outbounds = build_outbounds(&config.outbounds, Some(telemetry))?;
+    let outbounds = build_outbounds_with_options(
+        &config.outbounds,
+        &config.outbound_options,
+        Some(telemetry),
+    )?;
     if !outbounds.contains_key(&config.core.default_outbound) {
         return Err(anyhow!(
             "default outbound '{}' is not defined",

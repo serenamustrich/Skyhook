@@ -3,12 +3,15 @@ use std::sync::Arc;
 use rustls::{
     client::{
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        Resumption,
+        Resumption, WebPkiServerVerifier,
     },
     crypto::aws_lc_rs,
     ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256};
+
+use crate::{config::parse_sha256_certificate_fingerprint, outbound::context::active_dial_context};
 
 #[derive(Debug)]
 pub(crate) struct NoCertificateVerification;
@@ -58,21 +61,99 @@ impl ServerCertVerifier for NoCertificateVerification {
     }
 }
 
+#[derive(Debug)]
+struct PinnedCertificateVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    sha256: [u8; 32],
+}
+
+impl ServerCertVerifier for PinnedCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        if actual != self.sha256 {
+            return Err(rustls::Error::General(
+                "server certificate SHA-256 fingerprint mismatch".to_string(),
+            ));
+        }
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
 pub(crate) fn tls_client_config(skip_cert_verify: bool) -> anyhow::Result<ClientConfig> {
     let provider = aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?;
-    let mut config = if skip_cert_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let verifier: Arc<dyn ServerCertVerifier> = if skip_cert_verify {
+        Arc::new(NoCertificateVerification)
     } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
+        WebPkiServerVerifier::builder(Arc::new(roots)).build()?
     };
+    let verifier = active_dial_context()
+        .and_then(|context| context.certificate_fingerprint)
+        .map(|fingerprint| parse_sha256_certificate_fingerprint(&fingerprint))
+        .transpose()?
+        .map_or(verifier.clone(), |sha256| {
+            Arc::new(PinnedCertificateVerifier {
+                inner: verifier,
+                sha256,
+            }) as Arc<dyn ServerCertVerifier>
+        });
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     config.resumption = Resumption::in_memory_sessions(256);
     config.alpn_protocols.clear();
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::parse_sha256_certificate_fingerprint;
+
+    #[test]
+    fn validates_sha256_certificate_fingerprints() {
+        let fingerprint = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff";
+        assert_eq!(
+            parse_sha256_certificate_fingerprint(fingerprint).unwrap()[0],
+            0x00
+        );
+        assert_eq!(
+            parse_sha256_certificate_fingerprint(fingerprint).unwrap()[31],
+            0xff
+        );
+        assert!(parse_sha256_certificate_fingerprint("not-a-fingerprint").is_err());
+    }
 }

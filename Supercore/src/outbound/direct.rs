@@ -41,9 +41,7 @@ impl Outbound for DirectOutbound {
         destination: &Destination,
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
-        Ok(Box::new(
-            connect_tcp(&destination.authority(), timeout_ms).await?,
-        ))
+        connect_tcp(&destination.authority(), timeout_ms).await
     }
 
     async fn udp_exchange(

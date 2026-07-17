@@ -1,15 +1,25 @@
-use std::{collections::HashSet, io, net::SocketAddr, time::Duration};
+use std::{collections::HashSet, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context};
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
 use tokio::{net::TcpStream, task::JoinSet, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::outbound::context::{active_dial_context, IpVersionStrategy};
+use crate::{
+    outbound::{
+        context::{active_dial_context, DialContext, IpVersionStrategy},
+        BoxedStream, Outbound,
+    },
+    routing::Destination,
+};
 
 use super::socket_options::{bind_interface, enable_tcp_fast_open};
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+tokio::task_local! {
+    static ACTIVE_TCP_DIALER: Option<Arc<dyn Outbound>>;
+}
 
 #[derive(Clone)]
 struct TcpDialOptions {
@@ -21,8 +31,27 @@ struct TcpDialOptions {
     cancellation: CancellationToken,
 }
 
-pub(crate) async fn connect_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<TcpStream> {
+pub(crate) async fn scope_tcp_dialer<F>(dialer: Option<Arc<dyn Outbound>>, future: F) -> F::Output
+where
+    F: Future,
+{
+    ACTIVE_TCP_DIALER.scope(dialer, future).await
+}
+
+pub(crate) async fn connect_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
     let active = active_dial_context();
+    if let Some(dialer) = ACTIVE_TCP_DIALER.try_with(Clone::clone).ok().flatten() {
+        let endpoint = parse_endpoint(addr)?;
+        let mut context = active
+            .clone()
+            .unwrap_or_else(|| DialContext::new(endpoint.clone(), timeout_ms));
+        context.destination = endpoint;
+        context.selected_group = None;
+        context.selected_node = Some(dialer.name().to_string());
+        return ACTIVE_TCP_DIALER
+            .scope(None, dialer.connect_context(&context))
+            .await;
+    }
     let timeout_budget = active
         .as_ref()
         .map(|context| Duration::from_millis(timeout_ms).min(context.remaining_timeout()))
@@ -72,8 +101,25 @@ pub(crate) async fn connect_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<T
             result
                 .context("tcp connect timed out")?
                 .with_context(|| format!("failed to connect {addr}"))
+                .map(|stream| Box::new(stream) as BoxedStream)
         }
     }
+}
+
+fn parse_endpoint(addr: &str) -> anyhow::Result<Destination> {
+    if let Ok(socket) = addr.parse::<SocketAddr>() {
+        return Ok(Destination::new(socket.ip().to_string(), socket.port()));
+    }
+    let (host, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("invalid TCP endpoint {addr}"))?;
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid TCP endpoint port in {addr}"))?;
+    Ok(Destination::new(
+        host.trim_start_matches('[').trim_end_matches(']'),
+        port,
+    ))
 }
 
 async fn race_addresses(

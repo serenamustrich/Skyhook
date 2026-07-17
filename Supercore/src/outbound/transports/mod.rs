@@ -18,7 +18,7 @@ pub(crate) use quic::{
     random_u16, random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
 };
 pub(crate) use socket_options::bind_interface;
-pub(crate) use tcp::{connect_tcp, order_addresses};
+pub(crate) use tcp::{connect_tcp, order_addresses, scope_tcp_dialer};
 pub(crate) use tls::{tls_client_config, NoCertificateVerification};
 pub(crate) use websocket::{
     perform_websocket_handshake, perform_websocket_handshake_with_headers, spawn_websocket_stream,
