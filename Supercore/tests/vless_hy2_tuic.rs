@@ -197,7 +197,10 @@ fn parse_tuic_connect_request(buf: &[u8]) -> Result<(u8, String, u16), String> {
         return Err("short tuic connect header".into());
     }
     if buf[0] != 0x05 || buf[1] != 0x01 {
-        return Err(format!("unexpected tuic header bytes {:02x}{:02x}", buf[0], buf[1]));
+        return Err(format!(
+            "unexpected tuic header bytes {:02x}{:02x}",
+            buf[0], buf[1]
+        ));
     }
     let mut cursor = 2;
     let addr = match buf[cursor] {
@@ -219,7 +222,13 @@ fn parse_tuic_connect_request(buf: &[u8]) -> Result<(u8, String, u16), String> {
             if buf.len() < cursor + 5 {
                 return Err("short ipv4".into());
             }
-            let s = format!("{}.{}.{}.{}", buf[cursor + 1], buf[cursor + 2], buf[cursor + 3], buf[cursor + 4]);
+            let s = format!(
+                "{}.{}.{}.{}",
+                buf[cursor + 1],
+                buf[cursor + 2],
+                buf[cursor + 3],
+                buf[cursor + 4]
+            );
             cursor += 5;
             s
         }
@@ -317,6 +326,8 @@ async fn vless_tcp_real_dial_against_mock_server() {
         ws_path: None,
         ws_host: None,
         grpc_service_name: None,
+        transport_headers: std::collections::BTreeMap::new(),
+        alpn: Vec::new(),
         reality_public_key: None,
         reality_short_id: None,
         reality_fingerprint: None,
@@ -365,9 +376,11 @@ fn vless_vision_flow_encodes_protobuf_addon() {
 
 #[test]
 fn vless_config_with_reality_fields_parses_and_builds() {
-    // Construct an OutboundConfig::Vless with the Reality-specific fields and
-    // confirm that build_outbounds() accepts it. The TLS handshake will only
-    // be attempted at connect time — we only assert the build step.
+    let reality_secret = x25519_dalek::StaticSecret::from([9u8; 32]);
+    let reality_public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        x25519_dalek::PublicKey::from(&reality_secret).to_bytes(),
+    );
     let configs = vec![OutboundConfig::Vless {
         name: "vless-reality".to_string(),
         server: "example.com".to_string(),
@@ -382,7 +395,9 @@ fn vless_config_with_reality_fields_parses_and_builds() {
         ws_path: None,
         ws_host: None,
         grpc_service_name: None,
-        reality_public_key: Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()),
+        transport_headers: std::collections::BTreeMap::new(),
+        alpn: Vec::new(),
+        reality_public_key: Some(reality_public_key),
         reality_short_id: Some("01ab".to_string()),
         reality_fingerprint: Some("chrome".to_string()),
         reality_spider_x: Some("/".to_string()),
@@ -392,6 +407,7 @@ fn vless_config_with_reality_fields_parses_and_builds() {
     let outbound = map.get("vless-reality").expect("vless-reality lookup");
     assert_eq!(outbound.kind(), "vless");
     assert_eq!(outbound.name(), "vless-reality");
+    assert!(outbound.capability().tcp_supported);
 }
 
 #[test]
@@ -411,7 +427,7 @@ outbounds:
     security: reality
     sni: www.microsoft.com
     network: tcp
-    reality_public_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    reality_public_key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
     reality_short_id: "01ab"
     reality_fingerprint: chrome
     reality_spider_x: "/"
@@ -434,7 +450,7 @@ outbounds:
             assert_eq!(security.as_deref(), Some("reality"));
             assert_eq!(
                 reality_public_key.as_deref(),
-                Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"),
             );
             assert_eq!(reality_short_id.as_deref(), Some("01ab"));
             assert_eq!(reality_spider_x.as_deref(), Some("/"));
@@ -446,15 +462,12 @@ outbounds:
     // And it must build cleanly into a runtime Outbound.
     let map = build_outbounds(&cfg.outbounds, None).expect("build yaml vless");
     assert_eq!(map.len(), 1);
-    assert!(map.contains_key("vless-reality-yaml"));
+    assert!(map["vless-reality-yaml"].capability().tcp_supported);
 }
 
 #[test]
 fn vless_reality_short_id_validation() {
-    // Reality short_id must decode to exactly 1..=8 bytes. Exercise the parser
-    // indirectly by trying to build outbounds with a too-long short_id (the
-    // builder defers hex validation to the connect path, but the YAML parse
-    // + build must at least succeed).
+    // Reality short_id is at most 8 bytes and invalid data is rejected before dialing.
     let cfg = r#"
 outbounds:
   - type: vless
@@ -463,12 +476,14 @@ outbounds:
     port: 443
     uuid: 11111111-2222-3333-4444-555555555555
     security: reality
-    reality_public_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    reality_public_key: AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE
     reality_short_id: "00112233445566778899"
 "#;
     let parsed: SuperConfig = serde_yaml::from_str(cfg).expect("yaml parse bad short id");
-    let _ = parsed; // parser accepts anything that decodes as Option<String>.
-    // Build is lazy; the connect path validates the short_id length.
+    let map = build_outbounds(&parsed.outbounds, None).expect("build bad short id outbound");
+    let capability = map["vless-bad-short-id"].capability();
+    assert!(!capability.tcp_supported);
+    assert!(capability.limitations[0].contains("short_id"));
 }
 
 #[test]
@@ -478,10 +493,11 @@ fn vless_vision_flow_byte_layout_against_spec() {
     // Vision addons payload = 0x0a | varint(16) | "xtls-rprx-vision"
     // Build the expected byte buffer for destination example.com:8443 with vision flow.
     let mut expected = vec![0x00];
-    expected.extend_from_slice(
-        uuid::Uuid::parse_str(VLESS_TEST_UUID).unwrap().as_bytes(),
-    );
-    let addons: &[u8] = &[0x0a, 0x10, b'x', b't', b'l', b's', b'-', b'r', b'p', b'r', b'x', b'-', b'v', b'i', b's', b'i', b'o', b'n'];
+    expected.extend_from_slice(uuid::Uuid::parse_str(VLESS_TEST_UUID).unwrap().as_bytes());
+    let addons: &[u8] = &[
+        0x0a, 0x10, b'x', b't', b'l', b's', b'-', b'r', b'p', b'r', b'x', b'-', b'v', b'i', b's',
+        b'i', b'o', b'n',
+    ];
     expected.push(addons.len() as u8);
     expected.extend_from_slice(addons);
     expected.push(0x01); // TCP
@@ -490,7 +506,10 @@ fn vless_vision_flow_byte_layout_against_spec() {
     expected.push(b"example.com".len() as u8);
     expected.extend_from_slice(b"example.com");
 
-    assert_eq!(expected.len(), 1 + 16 + 1 + addons.len() + 1 + 2 + 1 + 1 + "example.com".len());
+    assert_eq!(
+        expected.len(),
+        1 + 16 + 1 + addons.len() + 1 + 2 + 1 + 1 + "example.com".len()
+    );
 
     // Sanity-parse what we just constructed to ensure the parser agrees.
     let parsed = parse_vless_request(&expected).expect("reparse");

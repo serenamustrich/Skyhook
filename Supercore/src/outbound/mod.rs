@@ -29,6 +29,7 @@ mod udp;
 mod unsupported;
 mod util;
 mod vless;
+mod vless_vision;
 mod vmess;
 mod wireguard;
 

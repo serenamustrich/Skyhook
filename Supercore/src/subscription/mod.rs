@@ -601,6 +601,8 @@ impl SubscriptionNode {
                     && network != "http"
                     && network != "httpupgrade"
                     && network != "http-upgrade"
+                    && network != "httpupgrade"
+                    && network != "http-upgrade"
                 {
                     return Err(anyhow!(
                         "vmess node {} uses unsupported network {}",
@@ -679,6 +681,8 @@ impl SubscriptionNode {
                     && network != "grpc"
                     && network != "h2"
                     && network != "http"
+                    && network != "httpupgrade"
+                    && network != "http-upgrade"
                 {
                     return Err(anyhow!(
                         "vless node {} uses unsupported network {}",
@@ -740,10 +744,10 @@ impl SubscriptionNode {
                         .cloned(),
                     skip_cert_verify: bool_param(&self.params, "skip-cert-verify")
                         || bool_param(&self.params, "allowInsecure"),
-                    network: Some(if network == "websocket" {
-                        "ws".to_string()
-                    } else {
-                        network
+                    network: Some(match network.as_str() {
+                        "websocket" => "ws".to_string(),
+                        "http-upgrade" => "httpupgrade".to_string(),
+                        _ => network,
                     }),
                     ws_path: self.params.get("path").cloned(),
                     ws_host: self
@@ -752,6 +756,8 @@ impl SubscriptionNode {
                         .or_else(|| self.params.get("ws-host"))
                         .cloned(),
                     grpc_service_name: grpc_service_name(&self.params),
+                    transport_headers: transport_headers(&self.params),
+                    alpn: string_list_param(&self.params, &["alpn"]),
                     reality_public_key: self
                         .params
                         .get("pbk")
@@ -2630,6 +2636,47 @@ proxies:
     }
 
     #[test]
+    fn converts_vless_http_upgrade_headers_and_alpn() {
+        let text = r#"
+proxies:
+  - name: VL-UPGRADE
+    type: vless
+    server: vl.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    security: tls
+    network: httpupgrade
+    alpn:
+      - http/1.1
+    http-upgrade-opts:
+      path: /upgrade
+      headers:
+        Host: cdn.example.com
+        X-VLESS-Test: enabled
+"#;
+
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Vless {
+                network,
+                ws_path,
+                ws_host,
+                transport_headers,
+                alpn,
+                ..
+            } => {
+                assert_eq!(network.as_deref(), Some("httpupgrade"));
+                assert_eq!(ws_path.as_deref(), Some("/upgrade"));
+                assert_eq!(ws_host.as_deref(), Some("cdn.example.com"));
+                assert_eq!(transport_headers["X-VLESS-Test"], "enabled");
+                assert_eq!(alpn, vec!["http/1.1"]);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
     fn converts_vless_grpc_uri_to_outbound_config() {
         let uri = "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?security=tls&type=grpc&serviceName=ray&sni=cdn.example.com#VL-GRPC";
 
@@ -2680,7 +2727,7 @@ proxies:
     #[test]
     fn parses_vless_reality_and_vision_fields() {
         let reality = parse_subscription(
-            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?security=reality&type=tcp&pbk=pub&sid=01&fp=chrome&spx=%2F#VL",
+            "vless://11111111-1111-1111-1111-111111111111@vl.example.com:443?security=reality&type=tcp&pbk=AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE&sid=01&fp=chrome&spx=%2F#VL",
         )
         .unwrap();
         let vision = parse_subscription(
@@ -2698,7 +2745,10 @@ proxies:
                 ..
             } => {
                 assert_eq!(security.as_deref(), Some("reality"));
-                assert_eq!(reality_public_key.as_deref(), Some("pub"));
+                assert_eq!(
+                    reality_public_key.as_deref(),
+                    Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE")
+                );
                 assert_eq!(reality_short_id.as_deref(), Some("01"));
                 assert_eq!(reality_fingerprint.as_deref(), Some("chrome"));
                 assert_eq!(reality_spider_x.as_deref(), Some("/"));

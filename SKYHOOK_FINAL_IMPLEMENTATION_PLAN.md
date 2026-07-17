@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.20（完成 `NEXT-011B` VMess 收口）
+> 计划版本：v1.21（完成 `NEXT-011C` VLESS/Reality/Vision 收口）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-011C`。
+> M2 进行中，当前直接执行点为 `NEXT-011D`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -386,8 +386,8 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B` 已完成；执行
-   `NEXT-011C` 收口 VLESS/Reality/Vision。
+1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`
+   已完成；执行 `NEXT-011D` 收口 Hysteria2/TUIC。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1178,7 +1178,23 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        96KB 多帧双向流、认证 EOF、错误 UUID、8192 字节 UDP 边界、多目的 association 和
        超时会话淘汰；12 项模块/订阅回归、HTTP camouflage 单测与
        `cargo check --all-targets` 通过。
-   - [ ] `NEXT-011C`：VLESS/Reality/Vision 完整能力收口。
+   - [x] `NEXT-011C`：VLESS/Reality/Vision 完整能力收口。
+     - VLESS 支持 TCP/command-UDP、TLS/无 TLS、WS、gRPC、H2、HTTP camouflage、
+       HTTPUpgrade、自定义 transport headers 和显式/默认 ALPN；XHTTP 在拨号前明确返回
+       unsupported，不伪装为连接超时。
+     - Reality 使用真实 X25519 key share、HKDF-SHA256、AES-256-GCM 加密 ClientHello
+       session ID，包含兼容版本、时间戳和 short ID；客户端通过派生 auth key 校验临时
+       Ed25519 证书的 HMAC-SHA512，普通证书即使跳过证书链检查也不能绕过 Reality 认证。
+     - Reality public key、short ID、SNI、spider path 和 fingerprint 均在拨号前校验；
+       fingerprint profile 实际参与 TLS 1.3 cipher suite 顺序和默认 ALPN，random/randomized
+       使用系统安全随机源。
+     - Vision 独立模块实现双向 padding、UUID 首帧、Continue/End/Direct 状态、外层 TLS
+       record 有界读取、TLS 1.3 ServerHello/密码套件判定和上下行独立 direct copy；随机源
+       失败会明确终止，不退化为全零填充。
+     - 20 项 VLESS 核心专项覆盖 Reality 成功/伪造证书失败、Vision direct、全部 transport、
+       custom headers、ALPN、96KB 双向半关闭、错误配置/响应、TLS 证书/超时、UDP 会话复用、
+       多目的隔离、超时淘汰恢复和 8192 字节边界；7 项订阅转换、6 项集成回归与
+       `cargo check --all-targets` 通过且无 warning。
    - [ ] `NEXT-011D`：Hysteria2/TUIC 完整能力收口。
    - [ ] `NEXT-011E`：WireGuard 完整能力收口。
    - [ ] `NEXT-011F`：AnyTLS/ShadowTLS/Naive 完整能力收口。

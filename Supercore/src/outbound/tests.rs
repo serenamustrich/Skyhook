@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use ::shadowsocks::{
@@ -24,13 +24,15 @@ use aes_gcm::{
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use hkdf::Hkdf;
 use md5::Digest;
+use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use rustls::crypto::aws_lc_rs;
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use sha2::Sha224;
+use sha2::{Sha224, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -63,7 +65,8 @@ use super::{
     util::hex_lower,
     vless::{
         build_vless_request, build_vless_request_with_flow, decode_reality_public_key,
-        decode_reality_short_id, seal_reality_session_id, VlessOutbound, REALITY_CLIENT_VERSION,
+        decode_reality_short_id, reality_hmac_sha512, seal_reality_session_id, VlessOutbound,
+        REALITY_CLIENT_VERSION,
     },
     vmess::{
         read_vmess_chunk, read_vmess_response_header, vmess_aes128gcm_decrypt,
@@ -911,6 +914,121 @@ fn transport_headers_reject_line_injection() {
     assert!(error.to_string().contains("invalid transport header value"));
 }
 
+struct PrefixedTcpStream {
+    prefix: Cursor<Vec<u8>>,
+    stream: TcpStream,
+}
+
+impl PrefixedTcpStream {
+    fn new(stream: TcpStream, prefix: Vec<u8>) -> Self {
+        Self {
+            prefix: Cursor::new(prefix),
+            stream,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let position = self.prefix.position() as usize;
+        let remaining = self.prefix.get_ref().len().saturating_sub(position);
+        if remaining > 0 {
+            let count = remaining.min(buf.remaining());
+            buf.put_slice(&self.prefix.get_ref()[position..position + count]);
+            self.prefix.set_position((position + count) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PrefixedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+fn parse_reality_client_hello_for_test(record: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32], Vec<u8>) {
+    assert!(record.len() >= 5);
+    assert_eq!(record[0], 0x16);
+    let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    assert_eq!(record.len(), record_len + 5);
+    let hello = &record[5..];
+    assert!(hello.len() >= 71);
+    assert_eq!(hello[0], 0x01);
+
+    let random: [u8; 32] = hello[6..38].try_into().unwrap();
+    let session_id_len = hello[38] as usize;
+    assert_eq!(session_id_len, 32);
+    let session_id_start = 39;
+    let session_id_end = session_id_start + session_id_len;
+    let session_id: [u8; 32] = hello[session_id_start..session_id_end].try_into().unwrap();
+
+    let mut cursor = session_id_end;
+    let cipher_suites_len = u16::from_be_bytes([hello[cursor], hello[cursor + 1]]) as usize;
+    cursor += 2 + cipher_suites_len;
+    let compression_methods_len = hello[cursor] as usize;
+    cursor += 1 + compression_methods_len;
+    let extensions_len = u16::from_be_bytes([hello[cursor], hello[cursor + 1]]) as usize;
+    cursor += 2;
+    let extensions_end = cursor + extensions_len;
+    assert!(extensions_end <= hello.len());
+
+    let mut key_share = None;
+    while cursor + 4 <= extensions_end {
+        let extension_type = u16::from_be_bytes([hello[cursor], hello[cursor + 1]]);
+        let extension_len = u16::from_be_bytes([hello[cursor + 2], hello[cursor + 3]]) as usize;
+        cursor += 4;
+        let extension_end = cursor + extension_len;
+        assert!(extension_end <= extensions_end);
+        if extension_type == 0x0033 {
+            let mut share_cursor = cursor + 2;
+            while share_cursor + 4 <= extension_end {
+                let group = u16::from_be_bytes([hello[share_cursor], hello[share_cursor + 1]]);
+                let key_len =
+                    u16::from_be_bytes([hello[share_cursor + 2], hello[share_cursor + 3]]) as usize;
+                share_cursor += 4;
+                let key_end = share_cursor + key_len;
+                assert!(key_end <= extension_end);
+                if group == 0x001d && key_len == 32 {
+                    key_share = Some(hello[share_cursor..key_end].try_into().unwrap());
+                    break;
+                }
+                share_cursor = key_end;
+            }
+        }
+        cursor = extension_end;
+    }
+
+    let mut aad = hello.to_vec();
+    aad[session_id_start..session_id_end].fill(0);
+    (
+        random,
+        session_id,
+        key_share.expect("Reality X25519 client key share"),
+        aad,
+    )
+}
+
 #[test]
 fn shadowsocks_2022_udp_replay_window_rejects_duplicates_and_old_packets() {
     let mut window = Ss2022ReplayWindow::default();
@@ -928,12 +1046,13 @@ async fn vless_outbound_sends_valid_tcp_request_over_tls_and_strips_response_hea
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
     let provider = aws_lc_rs::default_provider();
-    let server_config = ServerConfig::builder_with_provider(provider.into())
+    let mut server_config = ServerConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .unwrap();
+    server_config.alpn_protocols = vec![b"h2".to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
@@ -943,6 +1062,7 @@ async fn vless_outbound_sends_valid_tcp_request_over_tls_and_strips_response_hea
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut stream = acceptor.accept(stream).await.unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
         let mut fixed = [0u8; 1 + 16 + 1 + 1 + 2 + 1];
         stream.read_exact(&mut fixed).await.unwrap();
         assert_eq!(fixed[0], 0x00);
@@ -979,6 +1099,8 @@ async fn vless_outbound_sends_valid_tcp_request_over_tls_and_strips_response_hea
         None,
         None,
         None,
+        BTreeMap::new(),
+        vec!["h2".to_string()],
         None,
         None,
         None,
@@ -990,6 +1112,1033 @@ async fn vless_outbound_sends_valid_tcp_request_over_tls_and_strips_response_hea
     stream.read_exact(&mut response).await.unwrap();
 
     assert_eq!(&response, b"pong");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_tls_rejects_untrusted_certificate() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let provider = aws_lc_rs::default_provider();
+    let server_config = ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        assert!(acceptor.accept(stream).await.is_err());
+    });
+    let outbound = VlessOutbound::new(
+        "vless-untrusted-tls".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "11111111-1111-1111-1111-111111111111".to_string(),
+        None,
+        Some("tls".to_string()),
+        true,
+        Some("localhost".to_string()),
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let error = match outbound
+        .connect(&Destination::new("target.example", 443), 1000)
+        .await
+    {
+        Ok(_) => panic!("untrusted TLS certificate must fail"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("tls handshake"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_tls_handshake_obeys_dial_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    });
+    let outbound = VlessOutbound::new(
+        "vless-tls-timeout".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "11111111-1111-1111-1111-111111111111".to_string(),
+        None,
+        Some("tls".to_string()),
+        true,
+        Some("localhost".to_string()),
+        true,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let error = match outbound
+        .connect(&Destination::new("target.example", 443), 30)
+        .await
+    {
+        Ok(_) => panic!("stalled TLS handshake must time out"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("vless tls handshake timed out"));
+    server.await.unwrap();
+}
+
+async fn read_vless_request_for_test<S>(stream: &mut S) -> (Uuid, u8, Destination, Vec<u8>)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut prefix = [0u8; 18];
+    stream.read_exact(&mut prefix).await.unwrap();
+    assert_eq!(prefix[0], 0);
+    let user_id = Uuid::from_slice(&prefix[1..17]).unwrap();
+    let mut addons = vec![0u8; prefix[17] as usize];
+    stream.read_exact(&mut addons).await.unwrap();
+
+    let mut target_prefix = [0u8; 4];
+    stream.read_exact(&mut target_prefix).await.unwrap();
+    let command = target_prefix[0];
+    let port = u16::from_be_bytes([target_prefix[1], target_prefix[2]]);
+    let host = match target_prefix[3] {
+        0x01 => {
+            let mut octets = [0u8; 4];
+            stream.read_exact(&mut octets).await.unwrap();
+            std::net::Ipv4Addr::from(octets).to_string()
+        }
+        0x02 => {
+            let mut length = [0u8; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut domain = vec![0u8; length[0] as usize];
+            stream.read_exact(&mut domain).await.unwrap();
+            String::from_utf8(domain).unwrap()
+        }
+        0x03 => {
+            let mut octets = [0u8; 16];
+            stream.read_exact(&mut octets).await.unwrap();
+            std::net::Ipv6Addr::from(octets).to_string()
+        }
+        address_type => panic!("unexpected VLESS address type {address_type}"),
+    };
+    (user_id, command, Destination::new(host, port), addons)
+}
+
+#[tokio::test]
+async fn vless_reality_authenticates_client_hello_and_temporary_certificate() {
+    let reality_server_secret = X25519StaticSecret::from([9u8; 32]);
+    let reality_server_public = X25519PublicKey::from(&reality_server_secret).to_bytes();
+    let encoded_public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        reality_server_public,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("reality.example", 443);
+    let user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let expected_user_id = user_id;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut record_header = [0u8; 5];
+        stream.read_exact(&mut record_header).await.unwrap();
+        let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+        let mut client_hello_record = Vec::with_capacity(5 + record_len);
+        client_hello_record.extend_from_slice(&record_header);
+        client_hello_record.resize(5 + record_len, 0);
+        stream
+            .read_exact(&mut client_hello_record[5..])
+            .await
+            .unwrap();
+        let (hello_random, encrypted_session_id, client_public_key, hello_aad) =
+            parse_reality_client_hello_for_test(&client_hello_record);
+
+        let shared_secret =
+            reality_server_secret.diffie_hellman(&X25519PublicKey::from(client_public_key));
+        let mut auth_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&hello_random[..20]), shared_secret.as_bytes())
+            .expand(b"REALITY", &mut auth_key)
+            .unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&auth_key).unwrap();
+        let session_plaintext = cipher
+            .decrypt(
+                aes_gcm::Nonce::from_slice(&hello_random[20..]),
+                aes_gcm::aead::Payload {
+                    msg: &encrypted_session_id,
+                    aad: &hello_aad,
+                },
+            )
+            .unwrap();
+        assert_eq!(&session_plaintext[..3], &REALITY_CLIENT_VERSION);
+        assert_eq!(session_plaintext[3], 0);
+        assert_eq!(&session_plaintext[8..12], &[0x01, 0x23, 0x45, 0x67]);
+        let client_time = u32::from_be_bytes(session_plaintext[4..8].try_into().unwrap());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        assert!(now.abs_diff(client_time) <= 5);
+
+        let key_pair = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let certificate = CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut certificate_der = certificate.der().to_vec();
+        let reality_signature = reality_hmac_sha512(&auth_key, key_pair.public_key_raw());
+        let signature_start = certificate_der.len() - reality_signature.len();
+        certificate_der[signature_start..].copy_from_slice(&reality_signature);
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let provider = aws_lc_rs::default_provider();
+        let mut server_config = ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![CertificateDer::from(certificate_der)], private_key)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let prefixed = PrefixedTcpStream::new(stream, client_hello_record);
+        let mut stream = acceptor.accept(prefixed).await.unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        assert_eq!(
+            stream
+                .get_ref()
+                .1
+                .negotiated_cipher_suite()
+                .unwrap()
+                .suite(),
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+        );
+
+        let mut fixed = [0u8; 22];
+        stream.read_exact(&mut fixed).await.unwrap();
+        assert_eq!(fixed[0], 0x00);
+        assert_eq!(&fixed[1..17], expected_user_id.as_bytes());
+        assert_eq!(&fixed[17..22], &[0x00, 0x01, 0x01, 0xbb, 0x02]);
+        let mut domain_len = [0u8; 1];
+        stream.read_exact(&mut domain_len).await.unwrap();
+        let mut domain = vec![0u8; domain_len[0] as usize];
+        stream.read_exact(&mut domain).await.unwrap();
+        assert_eq!(domain, b"reality.example");
+        stream.write_all(&[0, 0]).await.unwrap();
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let outbound = VlessOutbound::new(
+        "vless-reality-test".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        user_id.to_string(),
+        None,
+        Some("reality".to_string()),
+        true,
+        Some("localhost".to_string()),
+        false,
+        None,
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        Some(encoded_public_key),
+        Some("01234567".to_string()),
+        Some("chrome".to_string()),
+        Some("/".to_string()),
+    );
+    let mut stream = outbound.connect(&destination, 2000).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_reality_rejects_unauthenticated_certificate_even_when_chain_checks_are_skipped() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let provider = aws_lc_rs::default_provider();
+    let server_config = ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = acceptor.accept(stream).await;
+    });
+
+    let reality_server_secret = X25519StaticSecret::from([9u8; 32]);
+    let encoded_public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        X25519PublicKey::from(&reality_server_secret).to_bytes(),
+    );
+    let outbound = VlessOutbound::new(
+        "vless-reality-bad-cert".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "11111111-1111-1111-1111-111111111111".to_string(),
+        None,
+        Some("reality".to_string()),
+        true,
+        Some("localhost".to_string()),
+        true,
+        None,
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        Some(encoded_public_key),
+        Some("01ab".to_string()),
+        Some("chrome".to_string()),
+        Some("/".to_string()),
+    );
+    let error = match outbound
+        .connect(&Destination::new("reality.example", 443), 2000)
+        .await
+    {
+        Ok(_) => panic!("ordinary TLS certificate must not authenticate as Reality"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("reality authentication failed"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_http_camouflage_sends_request_as_body_and_preserves_prefetched_response() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("target.example", 443);
+    let expected_user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(headers.starts_with("GET /vless HTTP/1.1\r\n"));
+        assert!(headers.contains("Host: cdn.example.com\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("x-supercore-test: enabled\r\n"));
+        let body_len = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+            })
+            .unwrap();
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body).await.unwrap();
+        let mut body = Cursor::new(body);
+        let (user_id, command, target, addons) = read_vless_request_for_test(&mut body).await;
+        assert_eq!(user_id, expected_user_id);
+        assert_eq!(command, 1);
+        assert_eq!(target, Destination::new("target.example", 443));
+        assert!(addons.is_empty());
+
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n\x00\x00")
+            .await
+            .unwrap();
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let outbound = VlessOutbound::new(
+        "vless-http-test".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        expected_user_id.to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("http".to_string()),
+        Some("/vless".to_string()),
+        Some("cdn.example.com".to_string()),
+        None,
+        BTreeMap::from([("X-Supercore-Test".to_string(), "enabled".to_string())]),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut stream = outbound.connect(&destination, 2000).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_http_upgrade_switches_to_raw_vless_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("target.example", 443);
+    let expected_user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while !headers.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = String::from_utf8(headers).unwrap();
+        assert!(headers.starts_with("GET /upgrade HTTP/1.1\r\n"));
+        assert!(headers.contains("Host: cdn.example.com\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("x-supercore-test: enabled\r\n"));
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (user_id, command, target, addons) = read_vless_request_for_test(&mut stream).await;
+        assert_eq!(user_id, expected_user_id);
+        assert_eq!(command, 1);
+        assert_eq!(target, Destination::new("target.example", 443));
+        assert!(addons.is_empty());
+        stream.write_all(&[0, 0]).await.unwrap();
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let outbound = VlessOutbound::new(
+        "vless-http-upgrade-test".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        expected_user_id.to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("httpupgrade".to_string()),
+        Some("/upgrade".to_string()),
+        Some("cdn.example.com".to_string()),
+        None,
+        BTreeMap::from([("X-Supercore-Test".to_string(), "enabled".to_string())]),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut stream = outbound.connect(&destination, 2000).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_udp_reuses_session_and_reads_response_header_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("udp.example", 53);
+    let expected_user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (user_id, command, target, addons) = read_vless_request_for_test(&mut stream).await;
+        assert_eq!(user_id, expected_user_id);
+        assert_eq!(command, 2);
+        assert_eq!(target, Destination::new("udp.example", 53));
+        assert!(addons.is_empty());
+
+        for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut length = [0u8; 2];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut packet).await.unwrap();
+            assert_eq!(packet, expected);
+            if index == 0 {
+                stream.write_all(&[0, 0]).await.unwrap();
+            }
+            let response = [b"reply-".as_slice(), expected].concat();
+            stream
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&response).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    });
+
+    let outbound = VlessOutbound::new(
+        "vless-udp-test".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        expected_user_id.to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        outbound
+            .udp_exchange(&destination, b"first", 2000)
+            .await
+            .unwrap(),
+        b"reply-first"
+    );
+    assert_eq!(
+        outbound
+            .udp_exchange(&destination, b"second", 2000)
+            .await
+            .unwrap(),
+        b"reply-second"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_udp_keeps_concurrent_destinations_isolated() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let expected_user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let server = tokio::spawn(async move {
+        let mut handlers = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handlers.push(tokio::spawn(async move {
+                let (user_id, command, target, _) = read_vless_request_for_test(&mut stream).await;
+                assert_eq!(user_id, expected_user_id);
+                assert_eq!(command, 2);
+                let mut length = [0u8; 2];
+                stream.read_exact(&mut length).await.unwrap();
+                let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+                stream.read_exact(&mut packet).await.unwrap();
+                stream.write_all(&[0, 0]).await.unwrap();
+                let response = format!("{}:{}:", target.host, target.port)
+                    .into_bytes()
+                    .into_iter()
+                    .chain(packet)
+                    .collect::<Vec<_>>();
+                stream
+                    .write_all(&(response.len() as u16).to_be_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&response).await.unwrap();
+            }));
+        }
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    });
+
+    let outbound = Arc::new(VlessOutbound::new(
+        "vless-udp-isolation".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        expected_user_id.to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    ));
+    let first_destination = Destination::new("one.example", 53);
+    let second_destination = Destination::new("two.example", 5353);
+    let (first, second) = tokio::join!(
+        outbound.udp_exchange(&first_destination, b"one", 2000),
+        outbound.udp_exchange(&second_destination, b"two", 2000),
+    );
+    assert_eq!(first.unwrap(), b"one.example:53:one");
+    assert_eq!(second.unwrap(), b"two.example:5353:two");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_udp_timeout_evicts_stale_session_and_recovers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("udp.example", 53);
+    let expected_user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        let (user_id, command, target, _) = read_vless_request_for_test(&mut first).await;
+        assert_eq!(
+            (user_id, command, target),
+            (expected_user_id, 2, destination.clone())
+        );
+        let mut length = [0u8; 2];
+        first.read_exact(&mut length).await.unwrap();
+        let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+        first.read_exact(&mut packet).await.unwrap();
+        assert_eq!(packet, b"timeout");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(first);
+
+        let (mut second, _) = listener.accept().await.unwrap();
+        let (user_id, command, target, _) = read_vless_request_for_test(&mut second).await;
+        assert_eq!(
+            (user_id, command, target),
+            (expected_user_id, 2, destination)
+        );
+        second.read_exact(&mut length).await.unwrap();
+        packet.resize(u16::from_be_bytes(length) as usize, 0);
+        second.read_exact(&mut packet).await.unwrap();
+        assert_eq!(packet, b"recovered");
+        second.write_all(&[0, 0]).await.unwrap();
+        second
+            .write_all(&(b"ok".len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        second.write_all(b"ok").await.unwrap();
+    });
+
+    let outbound = VlessOutbound::new(
+        "vless-udp-recovery".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        expected_user_id.to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(outbound
+        .udp_exchange(&Destination::new("udp.example", 53), b"timeout", 30)
+        .await
+        .is_err());
+    assert_eq!(
+        outbound
+            .udp_exchange(&Destination::new("udp.example", 53), b"recovered", 2000,)
+            .await
+            .unwrap(),
+        b"ok"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_udp_rejects_oversize_payload_before_dial() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let outbound = VlessOutbound::new(
+        "vless-udp-oversize".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "11111111-1111-1111-1111-111111111111".to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let error = outbound
+        .udp_exchange(&Destination::new("udp.example", 53), &[0u8; 8193], 1000)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("too large"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn vless_invalid_configuration_is_rejected_before_dial() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let outbound = VlessOutbound::new(
+        "vless-invalid".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "not-a-uuid".to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert!(!outbound.capability().tcp_supported);
+    let error = match outbound
+        .connect(&Destination::new("target.example", 443), 1000)
+        .await
+    {
+        Ok(_) => panic!("invalid VLESS UUID must fail"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid vless uuid"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn vless_rejects_invalid_response_version() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_vless_request_for_test(&mut stream).await;
+        stream.write_all(&[1, 0]).await.unwrap();
+    });
+    let outbound = VlessOutbound::new(
+        "vless-bad-response".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "11111111-1111-1111-1111-111111111111".to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let error = match outbound
+        .connect(&Destination::new("target.example", 443), 1000)
+        .await
+    {
+        Ok(_) => panic!("invalid response version must fail"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("unsupported vless response version 1"));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_stream_supports_large_bidirectional_payload_and_half_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let payload = (0..96 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected_payload = payload.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_vless_request_for_test(&mut stream).await;
+        stream.write_all(&[0, 0]).await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, expected_payload);
+        stream.write_all(&received).await.unwrap();
+        stream.shutdown().await.unwrap();
+    });
+    let outbound = VlessOutbound::new(
+        "vless-large-stream".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "11111111-1111-1111-1111-111111111111".to_string(),
+        None,
+        Some("none".to_string()),
+        false,
+        None,
+        false,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut stream = outbound
+        .connect(&Destination::new("target.example", 443), 2000)
+        .await
+        .unwrap();
+    stream.write_all(&payload).await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    assert_eq!(response, payload);
+    server.await.unwrap();
+}
+
+async fn read_vision_frame_for_test<S>(
+    stream: &mut S,
+    expected_user_id: Option<&Uuid>,
+) -> (u8, Vec<u8>)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut header = vec![0u8; if expected_user_id.is_some() { 21 } else { 5 }];
+    stream.read_exact(&mut header).await.unwrap();
+    let fields = if let Some(user_id) = expected_user_id {
+        assert_eq!(&header[..16], user_id.as_bytes());
+        &header[16..]
+    } else {
+        &header[..]
+    };
+    let command = fields[0];
+    let content_len = u16::from_be_bytes([fields[1], fields[2]]) as usize;
+    let padding_len = u16::from_be_bytes([fields[3], fields[4]]) as usize;
+    let mut content = vec![0u8; content_len];
+    stream.read_exact(&mut content).await.unwrap();
+    let mut padding = vec![0u8; padding_len];
+    stream.read_exact(&mut padding).await.unwrap();
+    (command, content)
+}
+
+async fn write_vision_frame_for_test<S>(
+    stream: &mut S,
+    user_id: Option<&Uuid>,
+    command: u8,
+    content: &[u8],
+) where
+    S: AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(user_id.map(|_| 16).unwrap_or(0) + 5 + content.len());
+    if let Some(user_id) = user_id {
+        frame.extend_from_slice(user_id.as_bytes());
+    }
+    frame.push(command);
+    frame.extend_from_slice(&(content.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.extend_from_slice(content);
+    stream.write_all(&frame).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+#[tokio::test]
+async fn vless_vision_padding_and_direct_switch_real_dial() {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let provider = aws_lc_rs::default_provider();
+    let server_config = ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("vision.example", 443);
+    let user_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let expected_user_id = user_id;
+    let (direct_ready_tx, direct_ready_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+
+        let mut prefix = [0u8; 18];
+        stream.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(prefix[0], 0);
+        assert_eq!(&prefix[1..17], expected_user_id.as_bytes());
+        let mut addons = vec![0u8; prefix[17] as usize];
+        stream.read_exact(&mut addons).await.unwrap();
+        assert_eq!(&addons[2..], b"xtls-rprx-vision");
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(request[0], 1);
+        assert_eq!(u16::from_be_bytes([request[1], request[2]]), 443);
+        assert_eq!(request[3], 2);
+        let mut domain_len = [0u8; 1];
+        stream.read_exact(&mut domain_len).await.unwrap();
+        let mut domain = vec![0u8; domain_len[0] as usize];
+        stream.read_exact(&mut domain).await.unwrap();
+        assert_eq!(domain, b"vision.example");
+        stream.write_all(&[0, 0]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let (command, client_hello) =
+            read_vision_frame_for_test(&mut stream, Some(&expected_user_id)).await;
+        assert_eq!(command, 0);
+        assert!(client_hello.starts_with(&[0x16, 0x03, 0x03]));
+
+        let mut server_hello_body = vec![0x03, 0x03];
+        server_hello_body.extend_from_slice(&[0x42; 32]);
+        server_hello_body.push(0);
+        server_hello_body.extend_from_slice(&[0x13, 0x01, 0x00]);
+        server_hello_body.extend_from_slice(&[0x00, 0x06, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        let mut handshake = vec![
+            0x02,
+            ((server_hello_body.len() >> 16) & 0xff) as u8,
+            ((server_hello_body.len() >> 8) & 0xff) as u8,
+            (server_hello_body.len() & 0xff) as u8,
+        ];
+        handshake.extend_from_slice(&server_hello_body);
+        let mut server_hello = vec![
+            0x16,
+            0x03,
+            0x03,
+            (handshake.len() >> 8) as u8,
+            handshake.len() as u8,
+        ];
+        server_hello.extend_from_slice(&handshake);
+        write_vision_frame_for_test(&mut stream, Some(&expected_user_id), 0, &server_hello).await;
+
+        let (command, application_data) = read_vision_frame_for_test(&mut stream, None).await;
+        assert_eq!(command, 2, "Vision did not enter direct-write mode");
+        assert!(application_data.starts_with(&[0x17, 0x03, 0x03]));
+        write_vision_frame_for_test(&mut stream, None, 2, b"DIRECT-READY").await;
+
+        let (mut raw, _) = stream.into_inner();
+        let _ = direct_ready_tx.send(());
+        let mut raw_upload = [0u8; 6];
+        raw.read_exact(&mut raw_upload).await.unwrap();
+        assert_eq!(&raw_upload, b"RAW-UP");
+        raw.write_all(b"RAW-DOWN").await.unwrap();
+        raw.flush().await.unwrap();
+    });
+
+    let outbound = VlessOutbound::new(
+        "vless-vision-test".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        user_id.to_string(),
+        Some("xtls-rprx-vision".to_string()),
+        Some("tls".to_string()),
+        true,
+        Some("localhost".to_string()),
+        true,
+        Some("tcp".to_string()),
+        None,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut stream = outbound.connect(&destination, 3000).await.unwrap();
+    stream
+        .write_all(&[0x16, 0x03, 0x03, 0x00, 0x01, 0x01])
+        .await
+        .unwrap();
+    let mut server_hello = [0u8; 55];
+    stream.read_exact(&mut server_hello).await.unwrap();
+    assert_eq!(&server_hello[..3], &[0x16, 0x03, 0x03]);
+
+    stream
+        .write_all(&[0x17, 0x03, 0x03, 0x00, 0x01, 0xaa])
+        .await
+        .unwrap();
+    let mut direct_ready = [0u8; 12];
+    stream.read_exact(&mut direct_ready).await.unwrap();
+    assert_eq!(&direct_ready, b"DIRECT-READY");
+    direct_ready_rx.await.unwrap();
+    stream.write_all(b"RAW-UP").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut raw_download = [0u8; 8];
+    stream.read_exact(&mut raw_download).await.unwrap();
+    assert_eq!(&raw_download, b"RAW-DOWN");
     server.await.unwrap();
 }
 
@@ -1048,6 +2197,9 @@ async fn vless_outbound_supports_websocket_transport() {
         let header = String::from_utf8(request[..header_end].to_vec()).unwrap();
         assert!(header.starts_with("GET /ray HTTP/1.1"));
         assert!(header.contains("Host: cdn.example.com"));
+        assert!(header
+            .to_ascii_lowercase()
+            .contains("x-vless-test: enabled"));
         let key = header
             .lines()
             .find_map(|line| {
@@ -1104,6 +2256,8 @@ async fn vless_outbound_supports_websocket_transport() {
         Some("/ray".to_string()),
         Some("cdn.example.com".to_string()),
         None,
+        BTreeMap::from([("X-VLESS-Test".to_string(), "enabled".to_string())]),
+        Vec::new(),
         None,
         None,
         None,
@@ -1184,6 +2338,8 @@ async fn vless_outbound_supports_grpc_transport() {
         None,
         Some("cdn.example.com".to_string()),
         Some("ray".to_string()),
+        BTreeMap::new(),
+        Vec::new(),
         None,
         None,
         None,
@@ -1265,6 +2421,8 @@ async fn vless_outbound_supports_h2_transport() {
         Some("/h2".to_string()),
         Some("cdn.example.com".to_string()),
         None,
+        BTreeMap::new(),
+        Vec::new(),
         None,
         None,
         None,

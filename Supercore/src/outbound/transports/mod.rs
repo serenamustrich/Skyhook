@@ -27,7 +27,7 @@ pub(crate) use quic::{
 };
 pub(crate) use socket_options::bind_interface;
 pub(crate) use tcp::{connect_tcp, order_addresses, scope_tcp_dialer};
-pub(crate) use tls::{tls_client_config, NoCertificateVerification};
+pub(crate) use tls::tls_client_config;
 pub(crate) use websocket::{open_websocket_transport, open_websocket_transport_without_headers};
 
 #[cfg(test)]

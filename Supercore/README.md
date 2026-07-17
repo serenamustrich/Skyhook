@@ -40,9 +40,14 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   and optional certificate verification bypass. Custom transport headers, explicit ALPN, gRPC
   trailer errors, UDP over WebSocket/gRPC, half-close, bounded UDP payloads, session reuse, and
   timeout eviction are covered by real-dial tests.
-- VLESS TCP and command-UDP outbound with TLS, SNI, and response-header stripping.
-- VLESS WebSocket, gRPC, and HTTP/2 transports for common subscription nodes.
-  VLESS remains `partial` in matrix terms due transport/Reality-Vision boundary limits.
+- VLESS TCP and command-UDP outbound with TLS or plaintext, WebSocket, gRPC, HTTP/2,
+  HTTP/1.1 camouflage, and HTTPUpgrade transports. Custom transport headers, ALPN,
+  multi-destination UDP associations, half-close, bounded payloads, and stale-session recovery
+  have independent real-dial coverage.
+- VLESS Reality performs X25519/HKDF/AES-GCM ClientHello authentication with short IDs and time
+  metadata, verifies authenticated temporary certificates, and applies named fingerprint profiles.
+  XTLS Vision implements bidirectional padding, TLS-record tracking, TLS 1.3 ServerHello validation,
+  and direction-independent direct-copy switching.
 - VMess AEAD and legacy alterId TCP plus command-UDP over TCP, WebSocket, gRPC, HTTP/2,
   HTTP/1.1 camouflage, and HTTPUpgrade. The AES-128-GCM, ChaCha20-Poly1305, and none body modes,
   standard `vmess://` JSON, custom transport headers, ALPN, multi-destination UDP associations,
@@ -110,9 +115,9 @@ Current matrix details are in `docs/protocol-matrix.md`:
 
 - **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **partial**: VLESS, Hysteria2, TUIC, WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, and SSH while
+- **partial**: Hysteria2, TUIC, WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, and SSH while
   their documented gaps remain
-- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, and SOCKS5
+- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, and SOCKS5
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently

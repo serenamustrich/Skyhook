@@ -542,6 +542,10 @@ pub enum OutboundConfig {
         #[serde(default)]
         grpc_service_name: Option<String>,
         #[serde(default)]
+        transport_headers: BTreeMap<String, String>,
+        #[serde(default)]
+        alpn: Vec<String>,
+        #[serde(default)]
         reality_public_key: Option<String>,
         #[serde(default)]
         reality_short_id: Option<String>,

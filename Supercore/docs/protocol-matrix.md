@@ -17,7 +17,7 @@
 | ShadowsocksR | full | full | full | full | tcp/random_head/http_simple/http_post/tls1.2_ticket | full | `none/dummy`、AES-CTR/CFB、RC4-MD5、ChaCha20/IETF、XChaCha20 共 11 种 stream cipher；origin、verify_simple、auth_simple、auth_sha1/v2/v4、auth_aes128_md5/sha1、auth_chain_a-f、TCP/UDP、多用户、random_head、HTTP simple/post、TLS ticket auth/fastauth 均有真实拨号；auth_sha1_v4 的 UDP 为协议自身不适用边界 |
 | Trojan | full | full | full | full | tcp/ws/grpc/h2/httpupgrade | full | TLS+TCP、UDP、WS、gRPC、H2、HTTPUpgrade 均有 `build_outbounds` 真实 mock 拨号；支持自定义 transport headers、显式/默认 ALPN、UDP over WS/gRPC、gRPC trailer 与 HTTPUpgrade 状态；覆盖 96KB 双向流、半关闭、错误密码、TLS/transport 超时、空密码/未知 network 拨号前拒绝、8192 字节 UDP 边界、空闲 UDP 隧道复用和超时会话淘汰 |
 | VMess | full | full | full | full | tcp/ws/grpc/h2/http/httpupgrade | full | alterId=0 AEAD 与 legacy alterId 均为真实 wire 实现；TCP、UDP、WS、gRPC、H2、HTTP camouflage、HTTPUpgrade、自定义 headers、ALPN、AES-128-GCM/ChaCha20-Poly1305/none 均有独立 mock 对端实拨；覆盖 96KB 多帧双向流、认证 EOF、时钟窗口、错误 UUID/响应认证、8192 字节 UDP 边界、多目的 association 和超时会话淘汰；XHTTP 在拨号前明确返回 unsupported，属于冻结配置边界 |
-| VLESS | full | full | full | partial | tcp/ws/grpc/h2/httpupgrade | partial | Reality/Vision 字段兼容；Vision/Reality 边界字段仍有既定限制 |
+| VLESS | full | full | full | full | tcp/ws/grpc/h2/http/httpupgrade/reality/vision | full | TCP/command-UDP、TLS/无 TLS、WS、gRPC、H2、HTTP camouflage、HTTPUpgrade、自定义 headers 和 ALPN 均有真实拨号；Reality 实现 X25519/HKDF/AES-GCM ClientHello 认证、short ID、时间戳、临时证书 HMAC 校验和 fingerprint profile；Vision 实现双向 padding、TLS record 状态机与独立 direct copy 边界；覆盖 96KB 双向半关闭、多目的 UDP、会话复用和超时淘汰恢复 |
 | Hysteria v1 | parse-only | parse-only | none | none | quic | parse-only | `outbound` 走 `UnsupportedProtocolOutbound`（见 `src/outbound/mod.rs:377-380`），native 拨号当前未实现；doctor `classify_outbound_with_capability` 在 `core/mod.rs:1300-1301` 返回 ParseOnly（`tcp_supported=false`, `udp_supported=false`, `limitations` 包含 `hysteria is recognized in config/subscriptions but native dialing is not implemented yet`）。测试断言：`tests/remaining_protocols.rs::hysteria_v1_dial_returns_unsupported_error` + `hysteria_v1_capability_marks_unsupported` + `hysteria_v1_routes_through_runtime_to_unsupported`。 |
 | Hysteria2 | full | full | partial | partial | quic | partial | wire-format、fragmentation、config 已覆盖；仍缺完整 QUIC/H3 mock server 端到端验证 |
 | TUIC | full | full | partial | partial | quic | partial | v5 wire-format、config、UDP mode 已覆盖；仍缺完整 QUIC mock server 端到端验证 |
@@ -42,10 +42,10 @@
 | WebSocket | full | path/headers/early-data |
 | gRPC | full | serviceName/multi-mode |
 | HTTP/2 | full | host/path |
-| HTTPUpgrade | full | Trojan 与 VMess 均有真实拨号、自定义 headers 和非 101 状态校验 |
+| HTTPUpgrade | full | Trojan、VMess 与 VLESS 均有真实拨号、自定义 headers 和非 101 状态校验 |
 | QUIC | partial | Hysteria2/TUIC 已有实现和协议单元测试，完整 mock server E2E 待补 |
-| XTLS Vision | partial | 基础支持 |
-| Reality | partial | 基础支持 |
+| XTLS Vision | full | VLESS 双向 padding、TLS 1.3 ServerHello 判定、方向独立切换和 direct copy 均有真实 mock 拨号 |
+| Reality | full | X25519/HKDF/AES-GCM ClientHello、short ID、时间窗口、临时证书认证、失败拒绝和 fingerprint profile 均有真实 mock 拨号 |
 | 公共 UDP runtime | full | 有界 association/session、两种 NAT keying、队列背压、空闲淘汰、重放/重组保护与每出站统计；具体协议是否支持 UDP 仍以协议行能力为准 |
 
 ## 实现边界
@@ -61,8 +61,8 @@
   `src/outbound/trojan.rs`。
 - VMess AEAD/legacy alterId、TCP/UDP command、stream framing 和 transport 位于
   `src/outbound/vmess.rs`。
-- VLESS、Reality、Vision、TCP/UDP command 和 transport 位于
-  `src/outbound/vless.rs`。
+- VLESS、Reality、TCP/UDP command 和 transport 位于 `src/outbound/vless.rs`，Vision
+  padding、TLS record 与 direct copy 状态机位于 `src/outbound/vless_vision.rs`。
 - VMess/VLESS 按目标隔离的 session 轮转能力由
   `src/outbound/udp/session_pool.rs` 提供。
 - Hysteria2 的 H3 auth、TCP/UDP framing、Salamander/Gecko obfs 和 reassembly 位于
@@ -81,8 +81,7 @@
 1. **WireGuard**: 用户态 userspace 版本已到位，但字段校验缺失时会走 parse-only/unsupported 限制
 2. **Hysteria v1**: Mihomo 完整支持，Supercore 仍为 `parse-only`
 3. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
-4. **Reality/Vision**: Mihomo 完整支持，Supercore 部分支持
-5. **QUIC E2E**: Hysteria2/TUIC 缺完整本地服务端端到端验证
+4. **QUIC E2E**: Hysteria2/TUIC 缺完整本地服务端端到端验证
 
 ## 已有测试
 
@@ -90,7 +89,7 @@
 - ShadowsocksR: `tests/ssr_real_dial.rs`
 - Snell: `tests/snell_real_dial.rs`
 - Trojan / VMess: `tests/trojan_vmess_real_dial.rs`
-- VLESS: `tests/config_and_runtime.rs`
+- VLESS/Reality/Vision: `src/outbound/tests.rs`、`tests/vless_hy2_tuic.rs`
 - Hysteria2 / TUIC: `tests/vless_hy2_tuic.rs`
 - AnyTLS: `tests/real_subscription_compat.rs`
 - SSR / Snell capability boundaries and WireGuard / AnyTLS / ShadowTLS / Naive / Hysteria v1: `tests/remaining_protocols.rs`

@@ -1,7 +1,11 @@
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use aes_gcm::{
@@ -12,30 +16,36 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use hkdf::Hkdf;
 use rustls::{
-    client::{DangerousClientHelloSessionIdProvider, Resumption},
+    client::{
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        DangerousClientHelloSessionIdProvider, Resumption, WebPkiServerVerifier,
+    },
     crypto::{aws_lc_rs, ActiveKeyExchange, SharedSecret, SupportedKxGroup},
     ffdhe_groups::FfdheGroup,
-    ClientConfig, Error as RustlsError, NamedGroup, ProtocolVersion, RootCertStore,
+    CipherSuite, ClientConfig, DigitallySignedStruct, Error as RustlsError, NamedGroup,
+    ProtocolVersion, RootCertStore, SignatureScheme,
 };
-use rustls_pki_types::ServerName;
-use sha2::Sha256;
+use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use sha2::{Digest, Sha256, Sha512};
+use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     sync::Mutex as TokioMutex,
-    time::timeout,
 };
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::routing::Destination;
 
 use super::{
     transports::{
-        connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_websocket_transport_without_headers,
-        run_dial_phase, tls_client_config, NoCertificateVerification,
+        connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_camouflage_transport,
+        open_http_upgrade_tunnel, open_websocket_transport, run_dial_phase, tls_client_config,
     },
     udp::{udp_session_key, KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    vless_vision::VlessVisionTransport,
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -53,6 +63,8 @@ pub(super) struct VlessOutbound {
     ws_path: Option<String>,
     ws_host: Option<String>,
     grpc_service_name: Option<String>,
+    transport_headers: BTreeMap<String, String>,
+    alpn: Vec<String>,
     reality_public_key: Option<String>,
     reality_short_id: Option<String>,
     reality_fingerprint: Option<String>,
@@ -63,6 +75,11 @@ pub(super) struct VlessOutbound {
 struct VlessUdpSession {
     stream: BoxedStream,
     response_header_read: bool,
+}
+
+struct VlessTlsConfiguration {
+    config: ClientConfig,
+    reality_verified: Option<Arc<AtomicBool>>,
 }
 
 #[async_trait]
@@ -76,20 +93,9 @@ impl Outbound for VlessOutbound {
     }
 
     fn capability(&self) -> OutboundCapability {
-        if self
-            .security
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("reality"))
-            && self
-                .reality_public_key
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
-            OutboundCapability::unsupported("VLESS Reality public key is required")
-        } else {
-            OutboundCapability::tcp_udp("vless-command-udp-session-pool")
+        match self.validated_configuration() {
+            Ok(_) => OutboundCapability::tcp_udp("vless-command-udp-session-pool"),
+            Err(error) => OutboundCapability::unsupported(error.to_string()),
         }
     }
 
@@ -102,46 +108,23 @@ impl Outbound for VlessOutbound {
         destination: &Destination,
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
-        let user_id = Uuid::parse_str(&self.uuid)
-            .map_err(|error| anyhow!("invalid vless uuid for {}: {error}", self.name))?;
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .to_ascii_lowercase();
-        if !matches!(
-            network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http"
-        ) {
-            return Err(anyhow!("unsupported vless network {network}"));
+        let (user_id, network, security, flow) = self.validated_configuration()?;
+        let request = build_vless_request_with_flow(&user_id, destination, flow.as_deref())?;
+        if flow.as_deref() == Some("xtls-rprx-vision") {
+            return self
+                .connect_vision(user_id, &security, &request, timeout_ms)
+                .await;
         }
-        let security = self
-            .security
-            .as_deref()
-            .unwrap_or(if self.tls { "tls" } else { "none" })
-            .to_ascii_lowercase();
-        if !matches!(security.as_str(), "tls" | "none" | "" | "reality") {
-            return Err(anyhow!("unsupported vless security {security}"));
-        }
-        let flow = self
-            .flow
-            .as_deref()
-            .map(str::trim)
-            .filter(|flow| !flow.is_empty());
-        if let Some(flow) = flow {
-            if flow != "xtls-rprx-vision" {
-                return Err(anyhow!("unsupported vless flow {flow}"));
-            }
-            if (!self.tls && security != "reality") || network != "tcp" {
-                return Err(anyhow!(
-                    "vless flow {flow} requires tls/reality over tcp transport"
-                ));
-            }
-        }
-        let request = build_vless_request_with_flow(&user_id, destination, flow)?;
-        let mut stream = self.open_transport(&network, timeout_ms).await?;
-        stream.write_all(&request).await?;
-        read_vless_response_header(&mut stream).await?;
+        let stream = self.open_transport(&network, &security, timeout_ms).await?;
+        let mut stream = self
+            .establish_vless_request(stream, &network, &request, timeout_ms)
+            .await?;
+        run_dial_phase(
+            timeout_ms,
+            "vless response header",
+            read_vless_response_header(&mut stream),
+        )
+        .await??;
         Ok(stream)
     }
 
@@ -151,30 +134,25 @@ impl Outbound for VlessOutbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        let user_id = Uuid::parse_str(&self.uuid)
-            .map_err(|error| anyhow!("invalid vless uuid for {}: {error}", self.name))?;
-        let network = self.network_name()?;
-        let security = self.security_name();
-        if !matches!(security.as_str(), "tls" | "none" | "" | "reality") {
-            return Err(anyhow!("unsupported vless security {security}"));
+        if payload.len() > VLESS_MAX_UDP_PAYLOAD {
+            return Err(anyhow!(
+                "vless udp payload is too large: {} bytes exceeds {}",
+                payload.len(),
+                VLESS_MAX_UDP_PAYLOAD
+            ));
         }
-        if self
-            .flow
-            .as_deref()
-            .map(str::trim)
-            .filter(|flow| !flow.is_empty())
-            .is_some()
-        {
+        let (user_id, network, security, flow) = self.validated_configuration()?;
+        if flow.is_some() {
             return Err(anyhow!("vless udp does not support xtls flow addons"));
         }
 
         let packet = encode_length_prefixed_packet(payload, "vless udp")?;
         let session_handle = self
-            .vless_udp_session(&user_id, destination, &network, timeout_ms)
+            .vless_udp_session(&user_id, destination, &network, &security, timeout_ms)
             .await?;
+        let mut session = session_handle.lock().await;
         let exchange = {
-            let mut session = session_handle.lock().await;
-            timeout(Duration::from_millis(timeout_ms), async {
+            run_dial_phase(timeout_ms, "vless udp exchange", async {
                 session.stream.write_all(&packet).await?;
                 session.stream.flush().await?;
                 if !session.response_header_read {
@@ -184,13 +162,14 @@ impl Outbound for VlessOutbound {
                 read_length_prefixed_packet(&mut session.stream, "vless udp").await
             })
             .await
-            .context("vless udp exchange timed out")?
         };
-        if exchange.is_err() {
+        let failed = !matches!(&exchange, Ok(Ok(_)));
+        if failed {
+            drop(session);
             self.remove_vless_udp_session(destination, &session_handle)
                 .await;
         }
-        exchange
+        exchange?
     }
 }
 
@@ -210,6 +189,8 @@ impl VlessOutbound {
         ws_path: Option<String>,
         ws_host: Option<String>,
         grpc_service_name: Option<String>,
+        transport_headers: BTreeMap<String, String>,
+        alpn: Vec<String>,
         reality_public_key: Option<String>,
         reality_short_id: Option<String>,
         reality_fingerprint: Option<String>,
@@ -229,6 +210,8 @@ impl VlessOutbound {
             ws_path,
             ws_host,
             grpc_service_name,
+            transport_headers,
+            alpn,
             reality_public_key,
             reality_short_id,
             reality_fingerprint,
@@ -237,54 +220,73 @@ impl VlessOutbound {
         }
     }
 
-    fn network_name(&self) -> anyhow::Result<String> {
-        let network = self
-            .network
-            .as_deref()
-            .unwrap_or("tcp")
-            .to_ascii_lowercase();
+    fn validated_configuration(&self) -> anyhow::Result<(Uuid, String, String, Option<String>)> {
+        let user_id = Uuid::parse_str(self.uuid.trim())
+            .map_err(|error| anyhow!("invalid vless uuid: {error}"))?;
+        let network = normalized_vless_network(self.network.as_deref());
+        if network == "xhttp" {
+            return Err(anyhow!(
+                "vless xhttp transport is not implemented; use tcp, ws, grpc, h2, http, or httpupgrade"
+            ));
+        }
         if !matches!(
             network.as_str(),
-            "tcp" | "ws" | "websocket" | "grpc" | "h2" | "http"
+            "tcp" | "ws" | "grpc" | "h2" | "http" | "httpupgrade"
         ) {
             return Err(anyhow!("unsupported vless network {network}"));
         }
-        Ok(network)
-    }
-
-    fn security_name(&self) -> String {
-        self.security
-            .as_deref()
-            .unwrap_or(if self.tls { "tls" } else { "none" })
-            .to_ascii_lowercase()
-    }
-
-    async fn open_transport(&self, network: &str, timeout_ms: u64) -> anyhow::Result<BoxedStream> {
-        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
-        let security = self.security_name();
-        let tls_enabled = self.tls || security == "reality";
-        if security == "reality" && matches!(network, "ws" | "websocket") {
-            return Err(anyhow!(
-                "vless reality does not support websocket transport"
-            ));
+        let security = normalized_vless_security(self.security.as_deref(), self.tls);
+        if !matches!(security.as_str(), "tls" | "none" | "reality") {
+            return Err(anyhow!("unsupported vless security {security}"));
         }
-        if tls_enabled {
-            let server_name = self.sni.as_deref().unwrap_or(&self.server).to_string();
-            let mut tls_config = if security == "reality" {
-                reality_tls_client_config(
-                    self.skip_cert_verify,
-                    self.reality_public_key.as_deref(),
-                    self.reality_short_id.as_deref(),
-                    self.reality_fingerprint.as_deref(),
-                    self.reality_spider_x.as_deref(),
-                )?
-            } else {
-                tls_client_config(self.skip_cert_verify)?
-            };
-            if matches!(network, "grpc" | "h2" | "http") {
-                tls_config.alpn_protocols = vec![b"h2".to_vec()];
+        let flow = self
+            .flow
+            .as_deref()
+            .map(str::trim)
+            .filter(|flow| !flow.is_empty())
+            .map(str::to_ascii_lowercase);
+        if let Some(flow) = flow.as_deref() {
+            if flow != "xtls-rprx-vision" {
+                return Err(anyhow!("unsupported vless flow {flow}"));
             }
-            let connector = TlsConnector::from(Arc::new(tls_config));
+            if security == "none" || network != "tcp" {
+                return Err(anyhow!(
+                    "vless flow {flow} requires tls/reality over tcp transport"
+                ));
+            }
+        }
+        if security == "reality" {
+            let public_key = self
+                .reality_public_key
+                .as_deref()
+                .ok_or_else(|| anyhow!("vless reality public key is required"))?;
+            decode_reality_public_key(public_key)?;
+            decode_reality_short_id(self.reality_short_id.as_deref())?;
+            validate_reality_fingerprint(self.reality_fingerprint.as_deref())?;
+            validate_reality_spider_x(self.reality_spider_x.as_deref())?;
+            if network == "ws" {
+                return Err(anyhow!(
+                    "vless reality does not support websocket transport"
+                ));
+            }
+        }
+        vless_alpn_protocols(&network, &self.alpn)?;
+        Ok((user_id, network, security, flow))
+    }
+
+    async fn open_transport(
+        &self,
+        network: &str,
+        security: &str,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BoxedStream> {
+        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
+        let tls_enabled = security != "none";
+        if tls_enabled {
+            let server_name = nonempty_or(self.sni.as_deref(), &self.server).to_string();
+            let tls_config = self.tls_configuration(network, security)?;
+            let reality_verified = tls_config.reality_verified;
+            let connector = TlsConnector::from(Arc::new(tls_config.config));
             let tls_server_name = ServerName::try_from(server_name.clone())
                 .map_err(|error| anyhow!("invalid vless server name: {error}"))?;
             let stream = run_dial_phase(
@@ -294,11 +296,13 @@ impl VlessOutbound {
             )
             .await?
             .context("vless tls handshake failed")?;
-            if network == "ws" || network == "websocket" {
-                return open_websocket_transport_without_headers(
+            ensure_reality_authenticated(reality_verified.as_ref())?;
+            if network == "ws" {
+                return open_websocket_transport(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
+                    nonempty_or(self.ws_host.as_deref(), &server_name),
                     self.ws_path.as_deref().unwrap_or("/"),
+                    &self.transport_headers,
                     timeout_ms,
                 )
                 .await;
@@ -306,18 +310,29 @@ impl VlessOutbound {
             if network == "grpc" {
                 return open_grpc_tunnel(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
+                    nonempty_or(self.ws_host.as_deref(), &server_name),
                     self.grpc_service_name.as_deref(),
                     timeout_ms,
                 )
                 .await
                 .map(|stream| Box::new(stream) as BoxedStream);
             }
-            if matches!(network, "h2" | "http") {
+            if network == "h2" {
                 return open_h2_tunnel(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&server_name),
+                    nonempty_or(self.ws_host.as_deref(), &server_name),
                     self.ws_path.as_deref().unwrap_or("/"),
+                    timeout_ms,
+                )
+                .await
+                .map(|stream| Box::new(stream) as BoxedStream);
+            }
+            if network == "httpupgrade" {
+                return open_http_upgrade_tunnel(
+                    stream,
+                    nonempty_or(self.ws_host.as_deref(), &server_name),
+                    self.ws_path.as_deref().unwrap_or("/"),
+                    &self.transport_headers,
                     timeout_ms,
                 )
                 .await
@@ -326,11 +341,12 @@ impl VlessOutbound {
             Ok(Box::new(stream))
         } else {
             let stream = tcp;
-            if network == "ws" || network == "websocket" {
-                return open_websocket_transport_without_headers(
+            if network == "ws" {
+                return open_websocket_transport(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
+                    nonempty_or(self.ws_host.as_deref(), &self.server),
                     self.ws_path.as_deref().unwrap_or("/"),
+                    &self.transport_headers,
                     timeout_ms,
                 )
                 .await;
@@ -338,18 +354,29 @@ impl VlessOutbound {
             if network == "grpc" {
                 return open_grpc_tunnel(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
+                    nonempty_or(self.ws_host.as_deref(), &self.server),
                     self.grpc_service_name.as_deref(),
                     timeout_ms,
                 )
                 .await
                 .map(|stream| Box::new(stream) as BoxedStream);
             }
-            if matches!(network, "h2" | "http") {
+            if network == "h2" {
                 return open_h2_tunnel(
                     stream,
-                    self.ws_host.as_deref().unwrap_or(&self.server),
+                    nonempty_or(self.ws_host.as_deref(), &self.server),
                     self.ws_path.as_deref().unwrap_or("/"),
+                    timeout_ms,
+                )
+                .await
+                .map(|stream| Box::new(stream) as BoxedStream);
+            }
+            if network == "httpupgrade" {
+                return open_http_upgrade_tunnel(
+                    stream,
+                    nonempty_or(self.ws_host.as_deref(), &self.server),
+                    self.ws_path.as_deref().unwrap_or("/"),
+                    &self.transport_headers,
                     timeout_ms,
                 )
                 .await
@@ -359,11 +386,100 @@ impl VlessOutbound {
         }
     }
 
+    fn tls_configuration(
+        &self,
+        network: &str,
+        security: &str,
+    ) -> anyhow::Result<VlessTlsConfiguration> {
+        let (mut config, reality_verified) = if security == "reality" {
+            let (config, verified) = reality_tls_client_config(
+                self.skip_cert_verify,
+                self.reality_public_key.as_deref(),
+                self.reality_short_id.as_deref(),
+                self.reality_fingerprint.as_deref(),
+                self.reality_spider_x.as_deref(),
+            )?;
+            (config, Some(verified))
+        } else {
+            (tls_client_config(self.skip_cert_verify)?, None)
+        };
+        config.alpn_protocols = if security == "reality"
+            && network == "tcp"
+            && self.alpn.iter().all(|value| value.trim().is_empty())
+        {
+            reality_fingerprint_alpn(self.reality_fingerprint.as_deref())?
+        } else {
+            vless_alpn_protocols(network, &self.alpn)?
+        };
+        Ok(VlessTlsConfiguration {
+            config,
+            reality_verified,
+        })
+    }
+
+    async fn connect_vision(
+        &self,
+        user_id: Uuid,
+        security: &str,
+        request: &[u8],
+        timeout_ms: u64,
+    ) -> anyhow::Result<BoxedStream> {
+        let tcp = connect_tcp(&format!("{}:{}", self.server, self.port), timeout_ms).await?;
+        let server_name = nonempty_or(self.sni.as_deref(), &self.server).to_string();
+        let tls_server_name = ServerName::try_from(server_name)
+            .map_err(|error| anyhow!("invalid vless server name: {error}"))?;
+        let tls_config = self.tls_configuration("tcp", security)?;
+        let reality_verified = tls_config.reality_verified;
+        let mut transport =
+            VlessVisionTransport::open(tcp, tls_config.config, tls_server_name, timeout_ms).await?;
+        ensure_reality_authenticated(reality_verified.as_ref())?;
+        run_dial_phase(timeout_ms, "vless vision request write", async {
+            transport.tls_mut().write_all(request).await?;
+            transport.tls_mut().flush().await
+        })
+        .await??;
+        run_dial_phase(
+            timeout_ms,
+            "vless vision response header",
+            read_vless_response_header(transport.tls_mut()),
+        )
+        .await??;
+        Ok(Box::new(transport.into_stream(user_id)))
+    }
+
+    async fn establish_vless_request(
+        &self,
+        mut stream: BoxedStream,
+        network: &str,
+        request: &[u8],
+        timeout_ms: u64,
+    ) -> anyhow::Result<BoxedStream> {
+        if network == "http" {
+            let stream = open_http_camouflage_transport(
+                stream,
+                nonempty_or(self.ws_host.as_deref(), &self.server),
+                self.ws_path.as_deref().unwrap_or("/"),
+                &self.transport_headers,
+                request,
+                timeout_ms,
+            )
+            .await?;
+            return Ok(Box::new(stream));
+        }
+        run_dial_phase(timeout_ms, "vless request write", async {
+            stream.write_all(request).await?;
+            stream.flush().await
+        })
+        .await??;
+        Ok(stream)
+    }
+
     async fn vless_udp_session(
         &self,
         user_id: &Uuid,
         destination: &Destination,
         network: &str,
+        security: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<VlessUdpSession>>> {
         let key = udp_session_key(
@@ -372,13 +488,24 @@ impl VlessOutbound {
             self.udp_nat_mode(),
             Some(destination),
         );
+        {
+            let mut pool = self.udp_sessions.lock().await;
+            let session_count = pool.len(&key);
+            if let Some(session) = pool.next(&key) {
+                let available = session.try_lock().is_ok();
+                if available || session_count >= UDP_SESSION_POOL_SIZE {
+                    return Ok(session);
+                }
+            }
+        }
+
+        let session = Arc::new(TokioMutex::new(
+            self.open_vless_udp_session(user_id, destination, network, security, timeout_ms)
+                .await?,
+        ));
         let mut pool = self.udp_sessions.lock().await;
         if pool.len(&key) < UDP_SESSION_POOL_SIZE {
-            let session = Arc::new(TokioMutex::new(
-                self.open_vless_udp_session(user_id, destination, network, timeout_ms)
-                    .await?,
-            ));
-            pool.push(key, Arc::clone(&session));
+            pool.push(key.clone(), Arc::clone(&session));
             return Ok(session);
         }
         pool.next(&key)
@@ -390,17 +517,15 @@ impl VlessOutbound {
         user_id: &Uuid,
         destination: &Destination,
         network: &str,
+        security: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<VlessUdpSession> {
-        let mut stream = self.open_transport(network, timeout_ms).await?;
+        let stream = self.open_transport(network, security, timeout_ms).await?;
         let request =
             build_vless_request_with_command_and_flow(user_id, destination, None, VLESS_CMD_UDP)?;
-        timeout(Duration::from_millis(timeout_ms), async {
-            stream.write_all(&request).await?;
-            stream.flush().await
-        })
-        .await
-        .context("vless udp session setup timed out")??;
+        let stream = self
+            .establish_vless_request(stream, network, &request, timeout_ms)
+            .await?;
         Ok(VlessUdpSession {
             stream,
             response_header_read: false,
@@ -423,30 +548,111 @@ impl VlessOutbound {
     }
 }
 
+fn nonempty_or<'a>(value: Option<&'a str>, fallback: &'a str) -> &'a str {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback)
+}
+
+fn normalized_vless_network(network: Option<&str>) -> String {
+    match network
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("tcp")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "websocket" => "ws".to_string(),
+        "http-upgrade" => "httpupgrade".to_string(),
+        network => network.to_string(),
+    }
+}
+
+fn normalized_vless_security(security: Option<&str>, tls: bool) -> String {
+    security
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if tls { "tls" } else { "none" })
+        .to_ascii_lowercase()
+}
+
+fn vless_alpn_protocols(network: &str, configured: &[String]) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut protocols = Vec::new();
+    for value in configured {
+        for protocol in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !protocol.is_ascii() || protocol.len() > u8::MAX as usize {
+                return Err(anyhow!("invalid vless ALPN value {protocol:?}"));
+            }
+            if !protocols
+                .iter()
+                .any(|existing: &Vec<u8>| existing.as_slice() == protocol.as_bytes())
+            {
+                protocols.push(protocol.as_bytes().to_vec());
+            }
+        }
+    }
+    if protocols.is_empty() {
+        return Ok(match network {
+            "grpc" | "h2" => vec![b"h2".to_vec()],
+            "ws" | "http" | "httpupgrade" => vec![b"http/1.1".to_vec()],
+            _ => Vec::new(),
+        });
+    }
+    if matches!(network, "grpc" | "h2") && !protocols.iter().any(|value| value.as_slice() == b"h2")
+    {
+        return Err(anyhow!("vless {network} transport requires h2 in ALPN"));
+    }
+    if matches!(network, "ws" | "http" | "httpupgrade")
+        && !protocols
+            .iter()
+            .any(|value| value.as_slice() == b"http/1.1")
+    {
+        return Err(anyhow!(
+            "vless {network} transport requires http/1.1 in ALPN"
+        ));
+    }
+    Ok(protocols)
+}
+
 fn reality_tls_client_config(
     skip_cert_verify: bool,
     public_key: Option<&str>,
     short_id: Option<&str>,
     fingerprint: Option<&str>,
     spider_x: Option<&str>,
-) -> anyhow::Result<ClientConfig> {
+) -> anyhow::Result<(ClientConfig, Arc<AtomicBool>)> {
     let public_key = public_key.ok_or_else(|| anyhow!("vless reality public key is required"))?;
     validate_reality_fingerprint(fingerprint)?;
     validate_reality_spider_x(spider_x)?;
     let mut provider = aws_lc_rs::default_provider();
+    apply_reality_fingerprint(&mut provider.cipher_suites, fingerprint)?;
     provider.kx_groups = vec![&REALITY_X25519_KX_GROUP];
-    let builder = ClientConfig::builder_with_provider(provider.into())
+    let provider = Arc::new(provider);
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let fallback =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+            .build()
+            .context("failed to build vless reality certificate verifier")?;
+    let auth_key = Arc::new(StdMutex::new(None));
+    let verified = Arc::new(AtomicBool::new(false));
+    let verifier = Arc::new(RealityServerVerifier {
+        auth_key: Arc::clone(&auth_key),
+        verified: Arc::clone(&verified),
+        fallback,
+        accept_invalid_fallback: skip_cert_verify,
+    });
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?;
-    let mut config = if skip_cert_verify {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-            .with_no_client_auth()
-    } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(roots).with_no_client_auth()
-    };
+    let mut config = builder
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
     config.alpn_protocols.clear();
     config.resumption = Resumption::disabled();
     config
@@ -454,12 +660,123 @@ fn reality_tls_client_config(
         .set_client_hello_session_id_provider(Arc::new(RealitySessionIdProvider {
             public_key: decode_reality_public_key(public_key)?.to_bytes(),
             short_id: decode_reality_short_id(short_id)?,
+            auth_key,
         }));
-    Ok(config)
+    Ok((config, verified))
+}
+
+fn ensure_reality_authenticated(verified: Option<&Arc<AtomicBool>>) -> anyhow::Result<()> {
+    if verified.is_some_and(|verified| !verified.load(Ordering::Acquire)) {
+        return Err(anyhow!(
+            "vless reality authentication failed: server certificate was not authenticated"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RealityServerVerifier {
+    auth_key: Arc<StdMutex<Option<[u8; 32]>>>,
+    verified: Arc<AtomicBool>,
+    fallback: Arc<WebPkiServerVerifier>,
+    accept_invalid_fallback: bool,
+}
+
+impl RealityServerVerifier {
+    fn verify_reality_certificate(&self, end_entity: &CertificateDer<'_>) -> bool {
+        let Ok(auth_key) = self.auth_key.lock() else {
+            return false;
+        };
+        let Some(auth_key) = auth_key.as_ref() else {
+            return false;
+        };
+        let Ok((remaining, certificate)) = X509Certificate::from_der(end_entity.as_ref()) else {
+            return false;
+        };
+        if !remaining.is_empty() {
+            return false;
+        }
+        let public_key = certificate.public_key().subject_public_key.data.as_ref();
+        let signature = certificate.signature_value.data.as_ref();
+        if public_key.len() != 32 || signature.len() != 64 {
+            return false;
+        }
+        let expected = reality_hmac_sha512(auth_key, public_key);
+        bool::from(expected.as_slice().ct_eq(signature))
+    }
+}
+
+impl ServerCertVerifier for RealityServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        if self.verify_reality_certificate(end_entity) {
+            self.verified.store(true, Ordering::Release);
+            return Ok(ServerCertVerified::assertion());
+        }
+        if self.accept_invalid_fallback {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.fallback
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.fallback.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        self.fallback.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.fallback.supported_verify_schemes()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn reality_hmac_sha512(key: &[u8], input: &[u8]) -> [u8; 64] {
+    const BLOCK_SIZE: usize = 128;
+    let mut normalized = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        normalized[..64].copy_from_slice(&Sha512::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; BLOCK_SIZE];
+    let mut outer_pad = [0x5cu8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha512::new();
+    inner.update(inner_pad);
+    inner.update(input);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha512::new();
+    outer.update(outer_pad);
+    outer.update(inner_hash);
+    outer.finalize().into()
 }
 
 const VLESS_CMD_TCP: u8 = 0x01;
 const VLESS_CMD_UDP: u8 = 0x02;
+const VLESS_MAX_UDP_PAYLOAD: usize = 8192;
 
 #[cfg(test)]
 pub(super) fn build_vless_request(
@@ -582,7 +899,7 @@ fn encode_vless_destination(destination: &Destination, output: &mut Vec<u8>) -> 
     Ok(())
 }
 
-pub(super) const REALITY_CLIENT_VERSION: [u8; 3] = [1, 8, 24];
+pub(super) const REALITY_CLIENT_VERSION: [u8; 3] = [1, 8, 2];
 static REALITY_X25519_KX_GROUP: RealityX25519KxGroup = RealityX25519KxGroup;
 
 #[derive(Debug)]
@@ -655,20 +972,12 @@ fn reality_x25519_shared_secret(
 struct RealitySessionIdProvider {
     public_key: [u8; 32],
     short_id: Vec<u8>,
+    auth_key: Arc<StdMutex<Option<[u8; 32]>>>,
 }
 
 impl DangerousClientHelloSessionIdProvider for RealitySessionIdProvider {
     fn plaintext_session_id(&self) -> [u8; 32] {
-        let unix_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs().min(u32::MAX as u64) as u32)
-            .unwrap_or(0);
-        let mut session_id = [0u8; 32];
-        session_id[..3].copy_from_slice(&REALITY_CLIENT_VERSION);
-        session_id[3] = 0;
-        session_id[4..8].copy_from_slice(&unix_time.to_be_bytes());
-        session_id[8..8 + self.short_id.len()].copy_from_slice(&self.short_id);
-        session_id
+        [0u8; 32]
     }
 
     fn seal_session_id(
@@ -682,12 +991,29 @@ impl DangerousClientHelloSessionIdProvider for RealitySessionIdProvider {
             .ok_or_else(|| {
                 RustlsError::General("Reality X25519 shared secret is not available".into())
             })??;
-        seal_reality_session_id_from_client_hello(
-            shared_secret.secret_bytes(),
+        let unix_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RustlsError::General("system clock is before unix epoch".into()))?
+            .as_secs()
+            .min(u32::MAX as u64) as u32;
+        let shared_secret: [u8; 32] = shared_secret
+            .secret_bytes()
+            .try_into()
+            .map_err(|_| RustlsError::General("Reality shared secret has invalid length".into()))?;
+        let (session_id, auth_key) = seal_reality_session_id(
+            &shared_secret,
+            &self.short_id,
             client_hello_random,
             client_hello_raw,
+            unix_time,
         )
-        .map_err(|error| RustlsError::General(format!("Reality session id failed: {error}")))
+        .map_err(|error| RustlsError::General(format!("Reality session id failed: {error}")))?;
+        *self
+            .auth_key
+            .lock()
+            .map_err(|_| RustlsError::General("Reality auth key lock is poisoned".into()))? =
+            Some(auth_key);
+        Ok(session_id)
     }
 }
 
@@ -732,40 +1058,6 @@ fn build_reality_client_hello_material(
     })
 }
 
-fn seal_reality_session_id_from_client_hello(
-    shared_secret: &[u8],
-    hello_random: &[u8; 32],
-    hello_raw: &[u8],
-) -> anyhow::Result<[u8; 32]> {
-    if shared_secret.len() != 32 {
-        return Err(anyhow!("vless reality shared secret must be 32 bytes"));
-    }
-    if hello_raw.len() < 55 {
-        return Err(anyhow!("vless reality ClientHello is too short"));
-    }
-    let mut shared = [0u8; 32];
-    shared.copy_from_slice(shared_secret);
-    let mut auth_key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(&hello_random[..20]), &shared)
-        .expand(b"REALITY", &mut auth_key)
-        .map_err(|_| anyhow!("failed to derive vless reality auth key"))?;
-
-    let cipher = Aes256Gcm::new_from_slice(&auth_key)
-        .map_err(|_| anyhow!("failed to initialize vless reality aead"))?;
-    let encrypted = cipher
-        .encrypt(
-            aes_gcm::Nonce::from_slice(&hello_random[20..]),
-            aes_gcm::aead::Payload {
-                msg: &hello_raw[39..55],
-                aad: hello_raw,
-            },
-        )
-        .map_err(|_| anyhow!("failed to seal vless reality session id"))?;
-    encrypted
-        .try_into()
-        .map_err(|_| anyhow!("vless reality sealed session id has invalid length"))
-}
-
 pub(super) fn decode_reality_public_key(value: &str) -> anyhow::Result<X25519PublicKey> {
     let value = value.trim();
     if value.is_empty() {
@@ -806,26 +1098,99 @@ pub(super) fn decode_reality_short_id(value: Option<&str>) -> anyhow::Result<Vec
     Ok(output)
 }
 
-fn validate_reality_fingerprint(value: Option<&str>) -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum RealityFingerprintProfile {
+    Native,
+    Chrome,
+    Firefox,
+    Safari,
+    Android,
+    Edge,
+    Qq,
+    Random,
+    Randomized,
+}
+
+fn reality_fingerprint_profile(value: Option<&str>) -> anyhow::Result<RealityFingerprintProfile> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(());
+        return Ok(RealityFingerprintProfile::Native);
     };
-    let supported = matches!(
-        value.to_ascii_lowercase().as_str(),
-        "chrome"
-            | "firefox"
-            | "safari"
-            | "ios"
-            | "android"
-            | "edge"
-            | "qq"
-            | "random"
-            | "randomized"
-    );
-    if supported {
-        Ok(())
+    match value.to_ascii_lowercase().as_str() {
+        "chrome" => Ok(RealityFingerprintProfile::Chrome),
+        "firefox" => Ok(RealityFingerprintProfile::Firefox),
+        "safari" | "ios" => Ok(RealityFingerprintProfile::Safari),
+        "android" => Ok(RealityFingerprintProfile::Android),
+        "edge" => Ok(RealityFingerprintProfile::Edge),
+        "qq" => Ok(RealityFingerprintProfile::Qq),
+        "random" => Ok(RealityFingerprintProfile::Random),
+        "randomized" => Ok(RealityFingerprintProfile::Randomized),
+        _ => Err(anyhow!("unsupported vless reality fingerprint {value}")),
+    }
+}
+
+fn validate_reality_fingerprint(value: Option<&str>) -> anyhow::Result<()> {
+    reality_fingerprint_profile(value).map(|_| ())
+}
+
+fn resolve_random_reality_profile() -> anyhow::Result<RealityFingerprintProfile> {
+    let mut random = [0u8; 1];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow!("Reality fingerprint randomness failed: {error}"))?;
+    Ok(match random[0] % 4 {
+        0 => RealityFingerprintProfile::Chrome,
+        1 => RealityFingerprintProfile::Firefox,
+        2 => RealityFingerprintProfile::Safari,
+        _ => RealityFingerprintProfile::Android,
+    })
+}
+
+fn apply_reality_fingerprint(
+    cipher_suites: &mut [rustls::SupportedCipherSuite],
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut profile = reality_fingerprint_profile(value)?;
+    if matches!(profile, RealityFingerprintProfile::Random) {
+        profile = resolve_random_reality_profile()?;
+    }
+    if matches!(profile, RealityFingerprintProfile::Randomized) {
+        for upper in (1..cipher_suites.len()).rev() {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random)
+                .map_err(|error| anyhow!("Reality fingerprint randomness failed: {error}"))?;
+            let index = (u64::from_be_bytes(random) as usize) % (upper + 1);
+            cipher_suites.swap(upper, index);
+        }
+        return Ok(());
+    }
+    cipher_suites.sort_by_key(|suite| {
+        let suite = suite.suite();
+        match profile {
+            RealityFingerprintProfile::Firefox | RealityFingerprintProfile::Android => {
+                match suite {
+                    CipherSuite::TLS13_AES_128_GCM_SHA256 => 0,
+                    CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 1,
+                    CipherSuite::TLS13_AES_256_GCM_SHA384 => 2,
+                    _ => 100,
+                }
+            }
+            RealityFingerprintProfile::Native => 0,
+            _ => match suite {
+                CipherSuite::TLS13_AES_128_GCM_SHA256 => 0,
+                CipherSuite::TLS13_AES_256_GCM_SHA384 => 1,
+                CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 2,
+                _ => 100,
+            },
+        }
+    });
+    Ok(())
+}
+
+fn reality_fingerprint_alpn(value: Option<&str>) -> anyhow::Result<Vec<Vec<u8>>> {
+    let profile = reality_fingerprint_profile(value)?;
+    if matches!(profile, RealityFingerprintProfile::Native) {
+        Ok(Vec::new())
     } else {
-        Err(anyhow!("unsupported vless reality fingerprint {value}"))
+        Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
 }
 

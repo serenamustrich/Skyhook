@@ -71,6 +71,7 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 webpki-roots = "1"
 x25519-dalek = { version = "3.0.0-rc.0", features = ["getrandom", "static_secrets"] }
+x509-parser = "0.18"
 yamux = "0.14"
 russh = "0.61.2"
 cfb-mode = "0.8.2"
