@@ -10,8 +10,8 @@ use crate::{
 
 use super::super::{
     build_doctor_report, classified_api_error, export_diagnostic_report, invalid_request,
-    openapi_document, task_accepted, task_failure, ApiState, ConfigReloadRequest, StatusResponse,
-    VersionResponse,
+    json_response, openapi_document, paginate_values, stable_value_id, task_accepted, task_failure,
+    ApiState, ConfigReloadRequest, ListQuery, SortOrder, StatusResponse, VersionResponse,
 };
 
 pub(super) async fn api_schema() -> Json<serde_json::Value> {
@@ -58,10 +58,10 @@ pub(super) async fn doctor(State(runtime): State<Arc<Runtime>>) -> Json<serde_js
 }
 
 pub(super) async fn run_doctor(State(state): State<ApiState>) -> Response {
-    let (record, cancellation) = state.tasks.create("doctor_run", Some(3)).await;
+    let (record, cancellation) = state.tasks().create("doctor_run", Some(3)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, "collecting runtime diagnostics")
@@ -100,10 +100,10 @@ pub(super) async fn run_doctor(State(state): State<ApiState>) -> Response {
 }
 
 pub(super) async fn export_diagnostics(State(state): State<ApiState>) -> Response {
-    let (record, cancellation) = state.tasks.create("diagnostic_export", Some(3)).await;
+    let (record, cancellation) = state.tasks().create("diagnostic_export", Some(3)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, "building redacted diagnostic report")
@@ -159,7 +159,7 @@ pub(super) async fn export_diagnostics(State(state): State<ApiState>) -> Respons
 }
 
 pub(super) async fn update_geo(State(state): State<ApiState>) -> Response {
-    let geo_config = state.runtime.base_config().geo;
+    let geo_config = state.runtime().base_config().geo;
     let total = [
         geo_config.geoip_url.as_deref(),
         geo_config.geosite_url.as_deref(),
@@ -168,10 +168,10 @@ pub(super) async fn update_geo(State(state): State<ApiState>) -> Response {
     .flatten()
     .filter(|url| !url.trim().is_empty())
     .count() as u64;
-    let (record, cancellation) = state.tasks.create("geo_update", Some(total)).await;
+    let (record, cancellation) = state.tasks().create("geo_update", Some(total)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, format!("updating {total} geo assets"))
@@ -284,11 +284,41 @@ pub(super) async fn update_geo(State(state): State<ApiState>) -> Response {
     task_accepted(&record)
 }
 
-pub(super) async fn connections(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "traffic": runtime.telemetry().traffic(),
-        "connections": runtime.telemetry().connections().await,
-    }))
+pub(super) async fn connections(State(runtime): State<Arc<Runtime>>, query: ListQuery) -> Response {
+    let items = runtime
+        .telemetry()
+        .connections()
+        .await
+        .into_iter()
+        .map(|connection| serde_json::to_value(connection).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let page = match paginate_values(
+        "connections",
+        items,
+        query,
+        "started_at",
+        SortOrder::Desc,
+        &[
+            "id",
+            "inbound",
+            "destination.host",
+            "outbound",
+            "uploaded",
+            "downloaded",
+            "started_at",
+            "closed_at",
+        ],
+        "id",
+    ) {
+        Ok(page) => page,
+        Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+    };
+    let mut extras = serde_json::Map::new();
+    extras.insert(
+        "traffic".to_string(),
+        serde_json::to_value(runtime.telemetry().traffic()).unwrap_or(serde_json::Value::Null),
+    );
+    json_response(page.envelope("connections", extras))
 }
 
 pub(super) async fn traffic(
@@ -297,10 +327,34 @@ pub(super) async fn traffic(
     Json(runtime.telemetry().traffic())
 }
 
-pub(super) async fn logs(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "logs": runtime.telemetry().logs().await,
-    }))
+pub(super) async fn logs(State(runtime): State<Arc<Runtime>>, query: ListQuery) -> Response {
+    let items = runtime
+        .telemetry()
+        .logs()
+        .await
+        .into_iter()
+        .map(|event| {
+            let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+            let id = stable_value_id("log", &value);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("id".to_string(), serde_json::Value::String(id));
+            }
+            value
+        })
+        .collect();
+    let page = match paginate_values(
+        "logs",
+        items,
+        query,
+        "time",
+        SortOrder::Desc,
+        &["id", "time", "level", "message"],
+        "id",
+    ) {
+        Ok(page) => page,
+        Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+    };
+    json_response(page.envelope("logs", serde_json::Map::new()))
 }
 
 pub(super) async fn config(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {

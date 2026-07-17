@@ -6,14 +6,35 @@ use axum::{
 
 use crate::outbound::error::OutboundErrorKind;
 
-use super::super::{api_error_response, json_response, TaskManager};
+use super::super::{
+    api_error_response, invalid_request, json_response, paginate_values, ListQuery, SortOrder,
+    TaskManager,
+};
 
 pub(super) async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
-pub(super) async fn task_list(State(tasks): State<TaskManager>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "tasks": tasks.list().await }))
+pub(super) async fn task_list(State(tasks): State<TaskManager>, query: ListQuery) -> Response {
+    let items = tasks
+        .list()
+        .await
+        .into_iter()
+        .map(|task| serde_json::to_value(task).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let page = match paginate_values(
+        "tasks",
+        items,
+        query,
+        "created_at",
+        SortOrder::Desc,
+        &["id", "kind", "status", "created_at", "finished_at"],
+        "id",
+    ) {
+        Ok(page) => page,
+        Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+    };
+    json_response(page.envelope("tasks", serde_json::Map::new()))
 }
 
 pub(super) async fn task_status(

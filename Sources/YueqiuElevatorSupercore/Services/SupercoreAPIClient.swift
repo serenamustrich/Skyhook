@@ -28,6 +28,7 @@ enum ProbeTimeoutCalculator {
 }
 
 final class SupercoreAPIClient: @unchecked Sendable {
+    private static let listPageLimit = 500
     private var baseURL: URL
     private var controlToken: String?
     private let baseURLLock = DispatchQueue(label: "YueqiuElevatorSupercore.SupercoreAPIClient.baseURL")
@@ -61,8 +62,11 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getGroups() async throws -> [SupercoreProxyGroup] {
-        let response: SupercoreGroupsResponse = try await request(path: "/v1/groups")
-        return response.groups
+        try await requestAllPages(
+            path: "/v1/groups",
+            items: \SupercoreGroupsResponse.groups,
+            pagination: \SupercoreGroupsResponse.pagination
+        )
     }
 
     func getProxyGroups() async throws -> [ProxyGroup] {
@@ -80,8 +84,11 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getCountries() async throws -> [SupercoreCountryGroup] {
-        let response: SupercoreCountriesResponse = try await request(path: "/v1/countries")
-        return response.countries
+        try await requestAllPages(
+            path: "/v1/countries",
+            items: \SupercoreCountriesResponse.countries,
+            pagination: \SupercoreCountriesResponse.pagination
+        )
     }
 
     func useCountry(code: String) async throws {
@@ -325,8 +332,12 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getConnectionObservations() async throws -> [SmartRuleObservation] {
-        let response: SupercoreConnectionsResponse = try await request(path: "/v1/connections")
-        return response.connections.compactMap { record in
+        let connections: [SupercoreConnectionRecord] = try await requestAllPages(
+            path: "/v1/connections",
+            items: \SupercoreConnectionsResponse.connections,
+            pagination: \SupercoreConnectionsResponse.pagination
+        )
+        return connections.compactMap { record in
             guard let endpoint = SmartRuleEndpointClassifier.classify(host: record.destination.host) else {
                 return nil
             }
@@ -347,18 +358,66 @@ final class SupercoreAPIClient: @unchecked Sendable {
     }
 
     func getLogEvents() async throws -> [SupercoreLogEvent] {
-        let response: SupercoreLogsResponse = try await request(path: "/v1/logs")
-        return response.logs
+        try await requestAllPages(
+            path: "/v1/logs",
+            items: \SupercoreLogsResponse.logs,
+            pagination: \SupercoreLogsResponse.pagination
+        )
     }
 
     func getSubscriptionTraffic() async throws -> [SupercoreSubscriptionTraffic] {
-        let response: SupercoreSubscriptionTrafficResponse = try await request(path: "/v1/traffic/subscriptions")
-        try response.throwIfNeeded()
-        return response.subscriptions
+        var cursor: String?
+        var seenCursors = Set<String>()
+        var subscriptions: [SupercoreSubscriptionTraffic] = []
+        repeat {
+            let response: SupercoreSubscriptionTrafficResponse = try await request(
+                path: "/v1/traffic/subscriptions",
+                queryItems: Self.pageQueryItems(cursor: cursor)
+            )
+            try response.throwIfNeeded()
+            subscriptions.append(contentsOf: response.subscriptions)
+            guard let nextCursor = response.pagination?.nextCursor, !nextCursor.isEmpty else {
+                break
+            }
+            guard seenCursors.insert(nextCursor).inserted else {
+                throw AppError.processFailed("Supercore 分页游标重复")
+            }
+            cursor = nextCursor
+        } while true
+        return subscriptions
     }
 
     func getSmartRules() async throws -> SupercoreSmartRulesSnapshot {
-        try await request(path: "/v1/smart-rules")
+        async let summary: SupercoreSmartRulesSnapshot = request(path: "/v1/smart-rules")
+        async let rules: [SupercoreSmartRule] = requestAllPages(
+            path: "/v1/smart-rules/rules",
+            items: \SupercoreSmartRulesPage.rules,
+            pagination: \SupercoreSmartRulesPage.pagination
+        )
+        async let observations: [SupercoreSmartObservation] = requestAllPages(
+            path: "/v1/smart-rules/observations",
+            items: \SupercoreSmartObservationsPage.observations,
+            pagination: \SupercoreSmartObservationsPage.pagination
+        )
+        async let recommendations: [SupercoreSmartRecommendation] = requestAllPages(
+            path: "/v1/smart-rules/recommendations",
+            items: \SupercoreSmartRecommendationsPage.recommendations,
+            pagination: \SupercoreSmartRecommendationsPage.pagination
+        )
+        let (snapshot, allRules, allObservations, allRecommendations) = try await (
+            summary,
+            rules,
+            observations,
+            recommendations
+        )
+        return SupercoreSmartRulesSnapshot(
+            directOutbound: snapshot.directOutbound,
+            proxyOutbound: snapshot.proxyOutbound,
+            stats: snapshot.stats,
+            rules: allRules,
+            observations: allObservations,
+            recommendations: allRecommendations
+        )
     }
 
     func eventStream(lastEventID: String? = nil) -> AsyncThrowingStream<SupercoreControlEvent, Error> {
@@ -442,12 +501,24 @@ final class SupercoreAPIClient: @unchecked Sendable {
         path: String,
         method: String = "GET",
         timeoutInterval: TimeInterval? = nil,
+        queryItems: [URLQueryItem] = [],
         body: Data? = nil
     ) async throws -> T {
         let (baseURL, controlToken) = baseURLLock.sync {
             (self.baseURL, self.controlToken)
         }
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        var url = baseURL.appendingPathComponent(path)
+        if !queryItems.isEmpty {
+            guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+                throw AppError.unexpectedResponse
+            }
+            components.queryItems = queryItems
+            guard let paginatedURL = components.url else {
+                throw AppError.unexpectedResponse
+            }
+            url = paginatedURL
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         if let controlToken, !controlToken.isEmpty {
             request.setValue("Bearer \(controlToken)", forHTTPHeaderField: "Authorization")
@@ -476,6 +547,40 @@ final class SupercoreAPIClient: @unchecked Sendable {
             )
         }
         return try Self.makeDecoder().decode(T.self, from: data)
+    }
+
+    private func requestAllPages<Response: Decodable, Item>(
+        path: String,
+        items: KeyPath<Response, [Item]>,
+        pagination: KeyPath<Response, SupercorePagination?>
+    ) async throws -> [Item] {
+        var cursor: String?
+        var seenCursors = Set<String>()
+        var output: [Item] = []
+        repeat {
+            let response: Response = try await request(
+                path: path,
+                queryItems: Self.pageQueryItems(cursor: cursor)
+            )
+            output.append(contentsOf: response[keyPath: items])
+            guard let nextCursor = response[keyPath: pagination]?.nextCursor,
+                  !nextCursor.isEmpty else {
+                break
+            }
+            guard seenCursors.insert(nextCursor).inserted else {
+                throw AppError.processFailed("Supercore 分页游标重复")
+            }
+            cursor = nextCursor
+        } while true
+        return output
+    }
+
+    private static func pageQueryItems(cursor: String?) -> [URLQueryItem] {
+        var items = [URLQueryItem(name: "limit", value: String(listPageLimit))]
+        if let cursor, !cursor.isEmpty {
+            items.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        return items
     }
 
     private func requestTask<T: Decodable>(
@@ -819,8 +924,29 @@ struct SupercoreTrafficTotals: Decodable, Sendable {
     }
 }
 
+struct SupercorePagination: Decodable, Sendable, Equatable {
+    let limit: Int
+    let returned: Int
+    let total: Int
+    let nextCursor: String?
+    let sort: String
+    let order: String
+    let filter: String?
+
+    enum CodingKeys: String, CodingKey {
+        case limit
+        case returned
+        case total
+        case nextCursor = "next_cursor"
+        case sort
+        case order
+        case filter
+    }
+}
+
 struct SupercoreGroupsResponse: Decodable, Sendable {
     let groups: [SupercoreProxyGroup]
+    let pagination: SupercorePagination?
 }
 
 struct SupercoreProxyGroup: Decodable, Sendable, Identifiable {
@@ -869,6 +995,7 @@ struct SupercoreGroupMember: Decodable, Sendable, Identifiable {
 
 struct SupercoreCountriesResponse: Decodable, Sendable {
     let countries: [SupercoreCountryGroup]
+    let pagination: SupercorePagination?
 }
 
 struct SupercoreCountryGroup: Decodable, Sendable, Identifiable {
@@ -966,12 +1093,14 @@ struct SupercoreSubscriptionTrafficResponse: Decodable, Sendable {
     let error: String?
     let activeID: String?
     let subscriptions: [SupercoreSubscriptionTraffic]
+    let pagination: SupercorePagination?
 
     enum CodingKeys: String, CodingKey {
         case ok
         case error
         case activeID = "active_id"
         case subscriptions
+        case pagination
     }
 
     func throwIfNeeded() throws {
@@ -981,11 +1110,13 @@ struct SupercoreSubscriptionTrafficResponse: Decodable, Sendable {
 
 struct SupercoreLogsResponse: Decodable, Sendable {
     let logs: [SupercoreLogEvent]
+    let pagination: SupercorePagination?
 }
 
 struct SupercoreConnectionsResponse: Decodable, Sendable {
     let traffic: SupercoreTrafficTotals
     let connections: [SupercoreConnectionRecord]
+    let pagination: SupercorePagination?
 }
 
 struct SupercoreConnectionRecord: Decodable, Sendable {
@@ -1037,6 +1168,21 @@ struct SupercoreSmartRulesSnapshot: Decodable, Sendable {
         case observations
         case recommendations
     }
+}
+
+struct SupercoreSmartRulesPage: Decodable, Sendable {
+    let rules: [SupercoreSmartRule]
+    let pagination: SupercorePagination?
+}
+
+struct SupercoreSmartObservationsPage: Decodable, Sendable {
+    let observations: [SupercoreSmartObservation]
+    let pagination: SupercorePagination?
+}
+
+struct SupercoreSmartRecommendationsPage: Decodable, Sendable {
+    let recommendations: [SupercoreSmartRecommendation]
+    let pagination: SupercorePagination?
 }
 
 struct SupercoreSmartRule: Decodable, Sendable {

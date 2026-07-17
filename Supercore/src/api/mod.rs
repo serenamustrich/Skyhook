@@ -2,19 +2,14 @@ mod auth;
 mod diagnostics;
 mod error;
 mod events;
+mod pagination;
 mod routes;
 mod schema;
 mod tasks;
 
 use std::sync::Arc;
 
-use axum::{
-    extract::FromRef,
-    middleware,
-    routing::{get, post},
-    Router,
-};
-use tower_http::trace::TraceLayer;
+use axum::{extract::FromRef, Router};
 
 use crate::core::Runtime;
 
@@ -22,6 +17,7 @@ use auth::*;
 use diagnostics::{build_doctor_report, export_diagnostic_report};
 use error::*;
 use events::*;
+use pagination::*;
 use routes::build_router_with_tasks;
 #[cfg(test)]
 use routes::collect_group_probe_members;
@@ -34,15 +30,37 @@ struct ApiState {
     tasks: TaskManager,
 }
 
+impl ApiState {
+    fn new(runtime: Arc<Runtime>, tasks: TaskManager) -> Self {
+        Self { runtime, tasks }
+    }
+
+    fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    fn runtime_handle(&self) -> Arc<Runtime> {
+        self.runtime.clone()
+    }
+
+    fn tasks(&self) -> &TaskManager {
+        &self.tasks
+    }
+
+    fn task_manager(&self) -> TaskManager {
+        self.tasks.clone()
+    }
+}
+
 impl FromRef<ApiState> for Arc<Runtime> {
     fn from_ref(state: &ApiState) -> Self {
-        state.runtime.clone()
+        state.runtime_handle()
     }
 }
 
 impl FromRef<ApiState> for TaskManager {
     fn from_ref(state: &ApiState) -> Self {
-        state.tasks.clone()
+        state.task_manager()
     }
 }
 
@@ -261,6 +279,19 @@ mod tests {
             .unwrap();
         let schema: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(schema["openapi"], "3.1.0");
+        assert!(schema["components"]["schemas"]["Pagination"].is_object());
+        assert_eq!(
+            schema["paths"]["/v1/outbounds"]["get"]["parameters"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            schema["paths"]["/v1/outbounds"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["properties"]["pagination"]["$ref"],
+            "#/components/schemas/Pagination"
+        );
+        assert!(schema["paths"]["/v1/status"]["get"]["parameters"].is_null());
 
         let route_source = include_str!("routes/mod.rs");
         for spec in CONTROL_ROUTE_SPECS {
@@ -277,6 +308,150 @@ mod tests {
                 spec.method,
                 spec.path
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routes_share_stable_pagination_and_structured_cursor_errors() {
+        let runtime = Arc::new(Runtime::new(SuperConfig::default()).unwrap());
+        runtime.telemetry().log("info", "older log").await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        runtime.telemetry().log("warn", "newer log").await;
+        let app = build_router(runtime, ControlAuthState { token: None });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/outbounds?limit=1&sort=name&order=asc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = to_bytes(first.into_body(), 256 * 1024).await.unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(first["outbounds"].as_array().map(Vec::len), Some(1));
+        assert!(first["pagination"]["total"].as_u64().unwrap() >= 2);
+        let cursor = first["pagination"]["next_cursor"].as_str().unwrap();
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/outbounds?limit=1&sort=name&order=asc&cursor={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = to_bytes(second.into_body(), 256 * 1024).await.unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(second["outbounds"].as_array().map(Vec::len), Some(1));
+        assert_ne!(
+            first["outbounds"][0]["name"],
+            second["outbounds"][0]["name"]
+        );
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/outbounds?limit=1&sort=name&filter=direct&cursor={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::BAD_REQUEST);
+        let stale = to_bytes(stale.into_body(), 64 * 1024).await.unwrap();
+        let stale: serde_json::Value = serde_json::from_slice(&stale).unwrap();
+        assert_eq!(stale["code"], "invalid_pagination");
+        assert!(stale["message"].as_str().unwrap().contains("stale"));
+
+        let invalid = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs?limit=501")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let invalid = to_bytes(invalid.into_body(), 64 * 1024).await.unwrap();
+        let invalid: serde_json::Value = serde_json::from_slice(&invalid).unwrap();
+        assert_eq!(invalid["code"], "invalid_pagination");
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs?order=sideways")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let malformed = to_bytes(malformed.into_body(), 64 * 1024).await.unwrap();
+        let malformed: serde_json::Value = serde_json::from_slice(&malformed).unwrap();
+        assert_eq!(malformed["code"], "invalid_pagination");
+
+        let logs = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/logs?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs.status(), StatusCode::OK);
+        let logs = to_bytes(logs.into_body(), 64 * 1024).await.unwrap();
+        let logs: serde_json::Value = serde_json::from_slice(&logs).unwrap();
+        assert_eq!(logs["logs"][0]["message"], "newer log");
+        assert_eq!(logs["pagination"]["order"], "desc");
+
+        let summary = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/smart-rules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let summary = to_bytes(summary.into_body(), 64 * 1024).await.unwrap();
+        let summary: serde_json::Value = serde_json::from_slice(&summary).unwrap();
+        assert_eq!(summary["rules"].as_array().map(Vec::len), Some(0));
+        assert_eq!(summary["observations"].as_array().map(Vec::len), Some(0));
+        assert_eq!(summary["recommendations"].as_array().map(Vec::len), Some(0));
+
+        for (path, key) in [
+            ("/v1/smart-rules/rules", "rules"),
+            ("/v1/smart-rules/observations", "observations"),
+            ("/v1/smart-rules/recommendations", "recommendations"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response[key].as_array().map(Vec::len), Some(0));
+            assert_eq!(response["pagination"]["total"], 0);
         }
     }
 

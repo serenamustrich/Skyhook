@@ -293,6 +293,24 @@ pub(super) const CONTROL_ROUTE_SPECS: &[ControlRouteSpec] = &[
     route!("GET", "/v1/rules", "listRules", "routing"),
     route!("GET", "/v1/smart-rules", "listSmartRules", "routing"),
     route!(
+        "GET",
+        "/v1/smart-rules/rules",
+        "listSmartRuleEntries",
+        "routing"
+    ),
+    route!(
+        "GET",
+        "/v1/smart-rules/observations",
+        "listSmartObservations",
+        "routing"
+    ),
+    route!(
+        "GET",
+        "/v1/smart-rules/recommendations",
+        "listSmartRecommendations",
+        "routing"
+    ),
+    route!(
         "POST",
         "/v1/smart-rules",
         "upsertSmartRule",
@@ -361,10 +379,27 @@ pub(super) const CONTROL_ROUTE_SPECS: &[ControlRouteSpec] = &[
     route!("GET", "/v1/events", "events", "events"),
 ];
 
+const PAGINATED_ROUTE_PATHS: &[&str] = &[
+    "/v1/outbounds",
+    "/v1/groups",
+    "/v1/countries",
+    "/v1/subscriptions",
+    "/v1/providers/proxies",
+    "/v1/providers/rules",
+    "/v1/rules",
+    "/v1/smart-rules/rules",
+    "/v1/smart-rules/observations",
+    "/v1/smart-rules/recommendations",
+    "/v1/traffic/subscriptions",
+    "/v1/connections",
+    "/v1/logs",
+    "/v1/tasks",
+];
+
 pub(super) fn openapi_document() -> Value {
     let mut paths = Map::new();
     for route in CONTROL_ROUTE_SPECS {
-        let operation = json!({
+        let mut operation = json!({
             "operationId": route.operation_id,
             "tags": [route.tag],
             "security": if route.write {
@@ -374,6 +409,9 @@ pub(super) fn openapi_document() -> Value {
             },
             "responses": operation_responses(route),
         });
+        if route.method == "GET" && PAGINATED_ROUTE_PATHS.contains(&route.path) {
+            operation["parameters"] = pagination_parameters();
+        }
         let path = paths
             .entry(route.path.to_string())
             .or_insert_with(|| Value::Object(Map::new()));
@@ -423,10 +461,58 @@ pub(super) fn openapi_document() -> Value {
                         "trace_id": { "type": "string" },
                         "status": { "const": "queued" }
                     }
+                },
+                "Pagination": {
+                    "type": "object",
+                    "required": ["limit", "returned", "total", "next_cursor", "sort", "order", "filter"],
+                    "properties": {
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                        "returned": { "type": "integer", "minimum": 0 },
+                        "total": { "type": "integer", "minimum": 0 },
+                        "next_cursor": { "type": ["string", "null"] },
+                        "sort": { "type": "string" },
+                        "order": { "type": "string", "enum": ["asc", "desc"] },
+                        "filter": { "type": ["string", "null"] }
+                    }
                 }
             }
         }
     })
+}
+
+fn pagination_parameters() -> Value {
+    json!([
+        {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 200 }
+        },
+        {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+        },
+        {
+            "name": "filter",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+        },
+        {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+        },
+        {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["asc", "desc"] }
+        }
+    ])
 }
 
 fn operation_responses(route: &ControlRouteSpec) -> Value {
@@ -434,6 +520,15 @@ fn operation_responses(route: &ControlRouteSpec) -> Value {
     let success_status = if route.task { "202" } else { "200" };
     let success_schema = if route.task {
         json!({ "$ref": "#/components/schemas/TaskAccepted" })
+    } else if route.method == "GET" && PAGINATED_ROUTE_PATHS.contains(&route.path) {
+        json!({
+            "type": "object",
+            "required": ["pagination"],
+            "properties": {
+                "pagination": { "$ref": "#/components/schemas/Pagination" }
+            },
+            "additionalProperties": true
+        })
     } else {
         json!({ "type": "object" })
     };

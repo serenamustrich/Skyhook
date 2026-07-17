@@ -10,29 +10,67 @@ use crate::{
 };
 
 use super::super::{
-    api_error_response, classified_api_error, invalid_request, json_response,
+    api_error_response, classified_api_error, invalid_request, json_response, paginate_values,
     publish_subscription_event, task_accepted, task_failure, ActiveSubscriptionConfigRequest,
-    ApiState, SubscriptionImportRequest, SubscriptionUpdateRequest, SubscriptionUseRequest,
+    ApiState, ListQuery, SortOrder, SubscriptionImportRequest, SubscriptionUpdateRequest,
+    SubscriptionUseRequest,
 };
 
 const MAX_SUBSCRIPTION_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-pub(super) async fn subscriptions(State(runtime): State<Arc<Runtime>>) -> Response {
+pub(super) async fn subscriptions(
+    State(runtime): State<Arc<Runtime>>,
+    query: ListQuery,
+) -> Response {
     match runtime.subscription_store().index() {
-        Ok(index) => json_response(serde_json::json!({
-            "ok": true,
-            "index": index,
-        })),
+        Ok(index) => {
+            let items = index
+                .subscriptions
+                .into_iter()
+                .map(|item| serde_json::to_value(item).unwrap_or(serde_json::Value::Null))
+                .collect();
+            let page = match paginate_values(
+                "subscriptions",
+                items,
+                query,
+                "name",
+                SortOrder::Asc,
+                &[
+                    "id",
+                    "name",
+                    "source_format",
+                    "node_count",
+                    "supported_outbound_count",
+                    "unsupported_count",
+                    "created_at",
+                    "updated_at",
+                ],
+                "id",
+            ) {
+                Ok(page) => page,
+                Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+            };
+            json_response(serde_json::json!({
+                "ok": true,
+                "index": {
+                    "version": index.version,
+                    "active_id": index.active_id,
+                    "subscriptions": page.items,
+                },
+                "pagination": page.pagination,
+            }))
+        }
         Err(error) => classified_api_error("subscription_index_read_failed", error),
     }
 }
 
-pub(super) async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) -> Response {
+pub(super) async fn subscription_traffic(
+    State(runtime): State<Arc<Runtime>>,
+    query: ListQuery,
+) -> Response {
     match runtime.subscription_store().index() {
-        Ok(index) => json_response(serde_json::json!({
-            "ok": true,
-            "active_id": index.active_id,
-            "subscriptions": index.subscriptions.into_iter().map(|item| {
+        Ok(index) => {
+            let items = index.subscriptions.into_iter().map(|item| {
                 serde_json::json!({
                     "id": item.id,
                     "name": item.name,
@@ -40,8 +78,29 @@ pub(super) async fn subscription_traffic(State(runtime): State<Arc<Runtime>>) ->
                     "download_total": item.traffic_download_total,
                     "total": item.traffic_upload_total.saturating_add(item.traffic_download_total),
                 })
-            }).collect::<Vec<_>>(),
-        })),
+            }).collect::<Vec<_>>();
+            let page = match paginate_values(
+                "subscription-traffic",
+                items,
+                query,
+                "name",
+                SortOrder::Asc,
+                &["id", "name", "upload_total", "download_total", "total"],
+                "id",
+            ) {
+                Ok(page) => page,
+                Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+            };
+            let mut extras = serde_json::Map::new();
+            extras.insert("ok".to_string(), serde_json::Value::Bool(true));
+            extras.insert(
+                "active_id".to_string(),
+                index
+                    .active_id
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            );
+            json_response(page.envelope("subscriptions", extras))
+        }
         Err(error) => classified_api_error("subscription_traffic_read_failed", error),
     }
 }
@@ -50,10 +109,10 @@ pub(super) async fn import_subscription(
     State(state): State<ApiState>,
     Json(request): Json<SubscriptionImportRequest>,
 ) -> Response {
-    let (record, cancellation) = state.tasks.create("subscription_import", Some(1)).await;
+    let (record, cancellation) = state.tasks().create("subscription_import", Some(1)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, "downloading subscription")
@@ -157,16 +216,16 @@ pub(super) async fn update_subscription(
     if request.id.trim().is_empty() {
         return invalid_request("subscription_id_missing", "subscription id cannot be empty");
     }
-    let store = state.runtime.subscription_store();
+    let store = state.runtime().subscription_store();
     let active_id = match store.index() {
         Ok(index) => index.active_id,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
     };
-    let options = (&state.runtime.config().subscriptions).into();
-    let (record, cancellation) = state.tasks.create("subscription_update", Some(1)).await;
+    let options = (&state.runtime().config().subscriptions).into();
+    let (record, cancellation) = state.tasks().create("subscription_update", Some(1)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks.mark_running(&task_id, "updating subscription").await;
         let operation = store.update_from_url_with(&request.id, options, &cancellation);
@@ -238,19 +297,19 @@ pub(super) async fn update_subscription(
 }
 
 pub(super) async fn update_all_subscriptions(State(state): State<ApiState>) -> Response {
-    let store = state.runtime.subscription_store();
+    let store = state.runtime().subscription_store();
     let total = match store.index() {
         Ok(index) => index.subscriptions.len() as u64,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
     };
-    let options = (&state.runtime.config().subscriptions).into();
+    let options = (&state.runtime().config().subscriptions).into();
     let (record, cancellation) = state
         .tasks
         .create("subscription_update_all", Some(total))
         .await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, format!("updating {total} subscriptions"))

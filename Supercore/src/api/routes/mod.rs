@@ -1,4 +1,15 @@
-use super::*;
+use std::sync::Arc;
+
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
+use tower_http::trace::TraceLayer;
+
+use crate::core::Runtime;
+
+use super::{authorize_writes, task_events, ApiState, ControlAuthState, TaskManager};
 
 pub(super) mod probes;
 pub(super) mod providers;
@@ -14,7 +25,7 @@ pub(super) fn build_router_with_tasks(
     auth: ControlAuthState,
     tasks: TaskManager,
 ) -> Router {
-    let state = ApiState { runtime, tasks };
+    let state = ApiState::new(runtime, tasks);
     Router::new()
         .route("/health", get(tasks::health))
         .route("/v1/schema", get(system::api_schema))
@@ -64,6 +75,15 @@ pub(super) fn build_router_with_tasks(
         .route(
             "/v1/smart-rules",
             get(routing::smart_rules).post(routing::upsert_smart_rule),
+        )
+        .route("/v1/smart-rules/rules", get(routing::smart_rule_list))
+        .route(
+            "/v1/smart-rules/observations",
+            get(routing::smart_observations),
+        )
+        .route(
+            "/v1/smart-rules/recommendations",
+            get(routing::smart_recommendations),
         )
         .route(
             "/v1/smart-rules/enabled",

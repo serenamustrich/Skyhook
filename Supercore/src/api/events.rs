@@ -16,7 +16,7 @@ use super::ApiState;
 pub(super) async fn task_events(
     State(state): State<ApiState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-    let task_stream = BroadcastStream::new(state.tasks.subscribe()).map(|item| match item {
+    let task_stream = BroadcastStream::new(state.tasks().subscribe()).map(|item| match item {
         Ok(event) => {
             let id = event.id.clone();
             let name = event.event;
@@ -28,8 +28,8 @@ pub(super) async fn task_events(
         }
         Err(error) => lagged_event("tasks", error),
     });
-    let telemetry_stream =
-        BroadcastStream::new(state.runtime.telemetry().subscribe_events()).map(|item| match item {
+    let telemetry_stream = BroadcastStream::new(state.runtime().telemetry().subscribe_events())
+        .map(|item| match item {
             Ok(event) => {
                 let id = event.id.clone();
                 let name = event.event.clone();

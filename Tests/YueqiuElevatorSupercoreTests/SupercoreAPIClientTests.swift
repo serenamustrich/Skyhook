@@ -11,6 +11,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             private var _responseBody = Data("{\"ok\":true,\"group\":\"\",\"results\":[]}".utf8)
             private var _responseStatusCode = 200
             private var _queuedResponses: [(Int, Data)] = []
+            private var _pathResponses: [String: (Int, Data)] = [:]
 
             func reset() {
                 lock.lock()
@@ -20,6 +21,7 @@ final class SupercoreAPIClientTests: XCTestCase {
                 _responseBody = Data("{\"ok\":true,\"group\":\"\",\"results\":[]}".utf8)
                 _responseStatusCode = 200
                 _queuedResponses = []
+                _pathResponses = [:]
             }
 
             func setLastRequest(_ request: URLRequest?, body: Data?) {
@@ -47,6 +49,12 @@ final class SupercoreAPIClientTests: XCTestCase {
                 _queuedResponses.append((statusCode, body))
             }
 
+            func setResponse(path: String, statusCode: Int, body: Data) {
+                lock.lock()
+                defer { lock.unlock() }
+                _pathResponses[path] = (statusCode, body)
+            }
+
             func lastRequest() -> URLRequest? {
                 lock.lock()
                 defer { lock.unlock() }
@@ -71,9 +79,12 @@ final class SupercoreAPIClientTests: XCTestCase {
                 return _responseStatusCode
             }
 
-            func nextResponse() -> (Int, Data) {
+            func nextResponse(path: String?) -> (Int, Data) {
                 lock.lock()
                 defer { lock.unlock() }
+                if let path, let response = _pathResponses[path] {
+                    return response
+                }
                 if !_queuedResponses.isEmpty {
                     return _queuedResponses.removeFirst()
                 }
@@ -105,6 +116,10 @@ final class SupercoreAPIClientTests: XCTestCase {
             captureState.enqueueResponse(statusCode: statusCode, body: body)
         }
 
+        static func setResponse(path: String, statusCode: Int = 200, body: Data) {
+            captureState.setResponse(path: path, statusCode: statusCode, body: body)
+        }
+
         static func reset() {
             captureState.reset()
         }
@@ -121,7 +136,7 @@ final class SupercoreAPIClientTests: XCTestCase {
             guard let client else { return }
             let requestBody = captureBody(from: request)
             Self.captureState.setLastRequest(request, body: requestBody)
-            let (statusCode, responseBody) = Self.captureState.nextResponse()
+            let (statusCode, responseBody) = Self.captureState.nextResponse(path: request.url?.path)
             let response = HTTPURLResponse(
                 url: request.url!,
                 statusCode: statusCode,
@@ -208,6 +223,94 @@ final class SupercoreAPIClientTests: XCTestCase {
             request.value(forHTTPHeaderField: "Authorization"),
             "Bearer 0123456789abcdef0123456789abcdef"
         )
+    }
+
+    func testListClientFollowsOpaquePaginationCursorAndMergesEveryPage() async throws {
+        let first = """
+        {
+          "groups": [{
+            "name": "A", "kind": "select", "auto_select": false,
+            "selected_member": null, "selection_reason": "manual", "members": []
+          }],
+          "pagination": {
+            "limit": 500, "returned": 1, "total": 2,
+            "next_cursor": "cursor-1", "sort": "name", "order": "asc", "filter": null
+          }
+        }
+        """
+        let second = """
+        {
+          "groups": [{
+            "name": "B", "kind": "url-test", "auto_select": true,
+            "selected_member": null, "selection_reason": "latency", "members": []
+          }],
+          "pagination": {
+            "limit": 500, "returned": 1, "total": 2,
+            "next_cursor": null, "sort": "name", "order": "asc", "filter": null
+          }
+        }
+        """
+        SupercoreProbeGroupCaptureProtocol.enqueueResponse(body: Data(first.utf8))
+        SupercoreProbeGroupCaptureProtocol.enqueueResponse(body: Data(second.utf8))
+
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        let groups = try await client.getGroups()
+
+        XCTAssertEqual(groups.map(\.name), ["A", "B"])
+        let request = try XCTUnwrap(SupercoreProbeGroupCaptureProtocol.lastRequest)
+        let components = try XCTUnwrap(URLComponents(url: request.url!, resolvingAgainstBaseURL: false))
+        let query = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).map { ($0.name, $0.value) })
+        XCTAssertEqual(query["limit"]!, "500")
+        XCTAssertEqual(query["cursor"]!, "cursor-1")
+    }
+
+    func testSmartRuleClientMergesSummaryAndPagedCollections() async throws {
+        func page(_ collection: String, items: String, total: Int) -> Data {
+            Data("""
+            {
+              "\(collection)": \(items),
+              "pagination": {
+                "limit": 500, "returned": \(total), "total": \(total),
+                "next_cursor": null, "sort": "value", "order": "asc", "filter": null
+              }
+            }
+            """.utf8)
+        }
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/smart-rules",
+            body: Data("""
+            {
+              "direct_outbound": "direct", "proxy_outbound": "proxy", "stats": {},
+              "rules": [], "observations": [], "recommendations": []
+            }
+            """.utf8)
+        )
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/smart-rules/rules",
+            body: page(
+                "rules",
+                items: "[{\"target\":\"domain\",\"value\":\"example.com\",\"outbound\":\"direct\",\"enabled\":true}]",
+                total: 1
+            )
+        )
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/smart-rules/observations",
+            body: page("observations", items: "[]", total: 0)
+        )
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/smart-rules/recommendations",
+            body: page("recommendations", items: "[]", total: 0)
+        )
+
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        let snapshot = try await client.getSmartRules()
+
+        XCTAssertEqual(snapshot.directOutbound, "direct")
+        XCTAssertEqual(snapshot.proxyOutbound, "proxy")
+        XCTAssertEqual(snapshot.rules.count, 1)
+        XCTAssertEqual(snapshot.rules.first?.value, "example.com")
+        XCTAssertTrue(snapshot.observations.isEmpty)
+        XCTAssertTrue(snapshot.recommendations.isEmpty)
     }
 
     func testStructuredAPIErrorUsesStableCodeAndTrace() async throws {

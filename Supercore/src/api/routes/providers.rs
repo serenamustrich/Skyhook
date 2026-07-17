@@ -10,58 +10,85 @@ use crate::{
 };
 
 use super::super::{
-    classified_api_error, invalid_request, publish_subscription_event, task_accepted, task_failure,
-    ApiState, ProviderUpdateRequest,
+    classified_api_error, invalid_request, json_response, paginate_values,
+    publish_subscription_event, task_accepted, task_failure, ApiState, ListQuery,
+    ProviderUpdateRequest, SortOrder,
 };
 
 pub(super) async fn proxy_providers(
     State(runtime): State<Arc<Runtime>>,
-) -> Json<serde_json::Value> {
-    let subscriptions = runtime
+    query: ListQuery,
+) -> Response {
+    let items = runtime
         .subscription_store()
         .index()
         .map(|index| index.subscriptions)
-        .unwrap_or_default();
-    Json(serde_json::json!({
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| serde_json::to_value(item).unwrap_or(serde_json::Value::Null))
+        .collect();
+    let page = match paginate_values(
+        "proxy-providers",
+        items,
+        query,
+        "name",
+        SortOrder::Asc,
+        &["id", "name", "node_count", "updated_at"],
+        "id",
+    ) {
+        Ok(page) => page,
+        Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+    };
+    json_response(serde_json::json!({
         "providers": {
             "subscriptions": {
                 "name": "subscriptions",
                 "type": "Subscription",
-                "subscriptions": subscriptions,
+                "subscriptions": page.items,
                 "vehicleType": "HTTP",
             }
-        }
+        },
+        "pagination": page.pagination,
     }))
 }
 
-pub(super) async fn rule_providers(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
-    let providers = runtime
+pub(super) async fn rule_providers(
+    State(runtime): State<Arc<Runtime>>,
+    query: ListQuery,
+) -> Response {
+    let items = runtime
         .config()
         .rule_sets
         .into_iter()
         .map(|provider| {
-            (
-                provider.name.clone(),
-                serde_json::json!({
-                    "name": provider.name,
-                    "behavior": provider.behavior,
-                    "ruleCount": provider.rules.len(),
-                    "rules": provider.rules,
-                    "vehicleType": "Inline",
-                }),
-            )
+            serde_json::json!({
+                "name": provider.name,
+                "behavior": provider.behavior,
+                "ruleCount": provider.rules.len(),
+                "vehicleType": "Inline",
+            })
         })
-        .collect::<serde_json::Map<_, _>>();
-    Json(serde_json::json!({
-        "providers": providers,
-    }))
+        .collect();
+    let page = match paginate_values(
+        "rule-providers",
+        items,
+        query,
+        "name",
+        SortOrder::Asc,
+        &["name", "behavior", "ruleCount"],
+        "name",
+    ) {
+        Ok(page) => page,
+        Err(error) => return invalid_request("invalid_pagination", error.to_string()),
+    };
+    json_response(page.envelope("providers", serde_json::Map::new()))
 }
 
 pub(super) async fn update_providers(
     State(state): State<ApiState>,
     request: Option<Json<ProviderUpdateRequest>>,
 ) -> Response {
-    let store = state.runtime.subscription_store();
+    let store = state.runtime().subscription_store();
     let index = match store.index() {
         Ok(index) => index,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
@@ -90,7 +117,7 @@ pub(super) async fn update_providers(
 }
 
 pub(super) async fn update_all_providers(State(state): State<ApiState>) -> Response {
-    let targets = match state.runtime.subscription_store().index() {
+    let targets = match state.runtime().subscription_store().index() {
         Ok(index) => index.subscriptions,
         Err(error) => return classified_api_error("subscription_index_read_failed", error),
     };
@@ -99,10 +126,10 @@ pub(super) async fn update_all_providers(State(state): State<ApiState>) -> Respo
 
 async fn queue_provider_updates(state: ApiState, targets: Vec<SubscriptionMeta>) -> Response {
     let total = targets.len() as u64;
-    let (record, cancellation) = state.tasks.create("provider_update", Some(total)).await;
+    let (record, cancellation) = state.tasks().create("provider_update", Some(total)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(

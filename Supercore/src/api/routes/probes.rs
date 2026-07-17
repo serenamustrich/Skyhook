@@ -24,11 +24,11 @@ pub(super) async fn probe_outbounds(
             names: request.names,
         })
         .unwrap_or_default();
-    let total = state.runtime.probe_target_count(&options);
-    let (record, cancellation) = state.tasks.create("probe_outbounds", Some(total)).await;
+    let total = state.runtime().probe_target_count(&options);
+    let (record, cancellation) = state.tasks().create("probe_outbounds", Some(total)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, format!("probing {total} outbounds"))
@@ -78,7 +78,7 @@ pub(super) async fn probe_group_body(
     State(state): State<ApiState>,
     Json(request): Json<ProbeGroupRequest>,
 ) -> Response {
-    let config = state.runtime.config();
+    let config = state.runtime().config();
     let member_names = collect_group_probe_members(&config, &request.group);
     if member_names.is_empty() {
         return invalid_request(
@@ -94,10 +94,10 @@ pub(super) async fn probe_group_body(
         concurrency: request.concurrency,
         names: Some(member_names),
     };
-    let (record, cancellation) = state.tasks.create("probe_group", Some(total)).await;
+    let (record, cancellation) = state.tasks().create("probe_group", Some(total)).await;
     let task_id = record.id.clone();
-    let runtime = state.runtime.clone();
-    let tasks = state.tasks.clone();
+    let runtime = state.runtime_handle();
+    let tasks = state.task_manager();
     tokio::spawn(async move {
         tasks
             .mark_running(&task_id, format!("probing group {group}"))
