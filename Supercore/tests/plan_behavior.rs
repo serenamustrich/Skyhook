@@ -121,6 +121,10 @@ fn test_wireguard_config_validation() {
         allowed_ips: vec!["0.0.0.0/0".to_string()],
         reserved: vec![],
         mtu: Some(1420),
+        persistent_keepalive: None,
+        remote_dns_resolve: false,
+        dns: vec![],
+        peers: vec![],
     };
     assert_eq!(config.name(), "wg-test");
 }

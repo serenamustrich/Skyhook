@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 
 use crate::outbound::context::IpVersionStrategy;
 
@@ -702,10 +702,18 @@ pub enum OutboundConfig {
         ipv6: Vec<String>,
         #[serde(default)]
         allowed_ips: Vec<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_wireguard_reserved")]
         reserved: Vec<u8>,
         #[serde(default)]
         mtu: Option<u16>,
+        #[serde(default, alias = "persistent-keepalive")]
+        persistent_keepalive: Option<u16>,
+        #[serde(default, alias = "remote-dns-resolve")]
+        remote_dns_resolve: bool,
+        #[serde(default)]
+        dns: Vec<String>,
+        #[serde(default)]
+        peers: Vec<WireGuardPeerConfig>,
     },
     Ssh {
         name: String,
@@ -774,6 +782,57 @@ pub enum OutboundConfig {
         kind: String,
         members: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireGuardPeerConfig {
+    pub server: String,
+    pub port: u16,
+    #[serde(alias = "public-key", alias = "publicKey")]
+    pub public_key: String,
+    #[serde(
+        default,
+        alias = "pre-shared-key",
+        alias = "preshared-key",
+        alias = "presharedKey"
+    )]
+    pub preshared_key: Option<String>,
+    #[serde(default, alias = "allowed-ips", alias = "allowedIPs")]
+    pub allowed_ips: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_wireguard_reserved")]
+    pub reserved: Vec<u8>,
+    #[serde(default, alias = "persistent-keepalive")]
+    pub persistent_keepalive: Option<u16>,
+}
+
+fn deserialize_wireguard_reserved<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ReservedValue {
+        Bytes(Vec<u8>),
+        Text(String),
+    }
+
+    match ReservedValue::deserialize(deserializer)? {
+        ReservedValue::Bytes(bytes) => Ok(bytes),
+        ReservedValue::Text(text) => {
+            use base64::Engine;
+
+            let text = text.trim();
+            if text.contains(',') {
+                return text
+                    .split(',')
+                    .map(|item| item.trim().parse::<u8>().map_err(D::Error::custom))
+                    .collect();
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(D::Error::custom)
+        }
+    }
 }
 
 fn default_shadowsocks_udp_over_tcp_version() -> u8 {

@@ -37,6 +37,7 @@ futures = "0.3"
 h2 = "0.4"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
+hickory-proto = "0.25"
 hkdf = "0.12"
 http = "1"
 ipnet = { version = "2", features = ["serde"] }
@@ -68,6 +69,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tproxy-config = "7.0.7"
 tun2proxy = "0.8.1"
+ts_netstack_smoltcp = { version = "0.4", features = ["tokio"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 webpki-roots = "1"

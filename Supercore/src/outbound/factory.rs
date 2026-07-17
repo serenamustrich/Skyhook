@@ -449,6 +449,10 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             allowed_ips,
             reserved,
             mtu,
+            persistent_keepalive,
+            remote_dns_resolve,
+            dns,
+            peers,
         } => Arc::new(WireGuardOutbound::new(
             name.clone(),
             server.clone(),
@@ -461,6 +465,10 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             allowed_ips.clone(),
             reserved.clone(),
             mtu.unwrap_or(1420),
+            *persistent_keepalive,
+            *remote_dns_resolve,
+            dns.clone(),
+            peers.clone(),
         )),
         OutboundConfig::Ssh {
             name,

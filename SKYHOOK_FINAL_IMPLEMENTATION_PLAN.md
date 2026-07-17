@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.22（完成 `NEXT-011D` Hysteria2/TUIC 收口）
+> 计划版本：v1.23（完成 `NEXT-011E` WireGuard 收口）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-011E`。
+> M2 进行中，当前直接执行点为 `NEXT-011F`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -387,7 +387,7 @@ M1 Outbound 第一批已实现、验证并提交：
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
 1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`、
-   `NEXT-011D` 已完成；执行 `NEXT-011E` 收口 WireGuard。
+   `NEXT-011E` 已完成；执行 `NEXT-011F` 收口 AnyTLS/ShadowTLS/Naive。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1209,7 +1209,14 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        不把认证或用户数据置于可重放 early data。`cargo check --all-targets`、186 项 lib、
        19 项 VLESS/Hysteria2/TUIC 集成、8 项 Hysteria2 和 9 项 TUIC 专项均通过。
        本批新增 Clippy 项已清零；全仓严格 Clippy 的历史风格债务保留到 M11 统一治理。
-   - [ ] `NEXT-011E`：WireGuard 完整能力收口。
+   - [x] `NEXT-011E`：WireGuard 完整能力收口。
+     - 使用 BoringTun 完成 Noise 握手、会话计数器、重放保护、定时 rekey 和 persistent
+       keepalive；网络包通过有界 userspace netstack 提供真实 TCP/UDP socket，不再拼接伪 IP 头。
+     - 支持 IPv4/IPv6 tunnel address、MTU、reserved、pre-shared key、隧道内 DNS、最多
+       32 个 Peer 和 allowed IP 最长前缀选路；订阅完整保留主/附加 Peer 字段并拒绝非法值。
+     - 本地双端 E2E 覆盖 IPv4/IPv6 TCP、96KB 数据、UDP 会话复用、远程 DNS、双 Peer、
+       最长前缀、DNS UDP-to-TCP fallback、保活和重复密文拒绝；`cargo check --all-targets`、192 项 lib、21 项
+       plan behavior 和 29 项 remaining protocols 回归通过。
    - [ ] `NEXT-011F`：AnyTLS/ShadowTLS/Naive 完整能力收口。
    - [ ] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
 

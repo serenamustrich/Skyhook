@@ -9,7 +9,7 @@ use url::Url;
 use crate::{
     config::{
         OutboundCommonConfig, OutboundConfig, ShadowsocksPluginConfig, SmuxBrutalConfig,
-        SmuxConfig, SmuxProtocol,
+        SmuxConfig, SmuxProtocol, WireGuardPeerConfig,
     },
     outbound::context::IpVersionStrategy,
 };
@@ -488,7 +488,12 @@ impl SubscriptionNode {
                 )?,
                 preshared_key: first_param(
                     &self.params,
-                    &["preshared-key", "preshared_key", "presharedKey"],
+                    &[
+                        "pre-shared-key",
+                        "preshared-key",
+                        "preshared_key",
+                        "presharedKey",
+                    ],
                 ),
                 ip: string_list_param(&self.params, &["ip", "address"]),
                 ipv6: string_list_param(&self.params, &["ipv6"]),
@@ -497,14 +502,30 @@ impl SubscriptionNode {
                     &["allowed-ips", "allowed_ips", "allowedIPs"],
                 ),
                 reserved: first_param(&self.params, &["reserved"])
-                    .map(|value| {
-                        value
-                            .split(',')
-                            .filter_map(|part| part.trim().parse::<u8>().ok())
-                            .collect()
-                    })
+                    .map(|value| parse_wireguard_reserved_param(&value))
+                    .transpose()?
                     .unwrap_or_default(),
-                mtu: first_param(&self.params, &["mtu"]).and_then(|value| value.parse().ok()),
+                mtu: first_param(&self.params, &["mtu"])
+                    .map(|value| parse_u16_text(&value, "wireguard mtu"))
+                    .transpose()?,
+                persistent_keepalive: first_param(
+                    &self.params,
+                    &["persistent-keepalive", "persistent_keepalive"],
+                )
+                .map(|value| parse_u16_text(&value, "wireguard persistent keepalive"))
+                .transpose()?,
+                remote_dns_resolve: bool_param_any(
+                    &self.params,
+                    &["remote-dns-resolve", "remote_dns_resolve"],
+                ),
+                dns: string_list_param(&self.params, &["dns"]),
+                peers: self
+                    .params
+                    .get("peers")
+                    .map(|value| serde_yaml::from_str::<Vec<WireGuardPeerConfig>>(value))
+                    .transpose()
+                    .context("invalid wireguard peers configuration")?
+                    .unwrap_or_default(),
             }),
             NodeProtocol::AnyTls => Ok(OutboundConfig::AnyTls {
                 name: self.name.clone(),
@@ -991,6 +1012,13 @@ fn parse_clash_proxy(value: &Value) -> anyhow::Result<SubscriptionNode> {
             parse_clash_http_upgrade_opts(value, &mut params);
             continue;
         }
+        if key == "peers" && matches!(&protocol, NodeProtocol::WireGuard) {
+            params.insert(
+                key.to_string(),
+                serde_yaml::to_string(value).context("failed to preserve wireguard peers")?,
+            );
+            continue;
+        }
         if let Some(value) = yaml_scalar_to_string(value) {
             params.insert(key.to_string(), value);
         } else if let Some(values) = yaml_string_list(value) {
@@ -1449,6 +1477,26 @@ fn string_list_param(params: &BTreeMap<String, String>, keys: &[&str]) -> Vec<St
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_wireguard_reserved_param(value: &str) -> anyhow::Result<Vec<u8>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    if value.contains(',') {
+        return value
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<u8>()
+                    .with_context(|| format!("invalid wireguard reserved byte '{part}'"))
+            })
+            .collect();
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .with_context(|| "wireguard reserved must be comma-separated bytes or base64")
 }
 
 fn grpc_service_name(params: &BTreeMap<String, String>) -> Option<String> {
@@ -1987,6 +2035,112 @@ proxies:
             }
             other => panic!("unexpected outbound {other:?}"),
         }
+    }
+
+    #[test]
+    fn converts_complete_wireguard_yaml_without_losing_peer_options() {
+        let private_key = base64::engine::general_purpose::STANDARD.encode([11u8; 32]);
+        let primary_public_key = base64::engine::general_purpose::STANDARD.encode([29u8; 32]);
+        let secondary_public_key = base64::engine::general_purpose::STANDARD.encode([31u8; 32]);
+        let preshared_key = base64::engine::general_purpose::STANDARD.encode([47u8; 32]);
+        let reserved = base64::engine::general_purpose::STANDARD.encode([7u8, 23, 91]);
+        let text = format!(
+            r#"
+proxies:
+  - name: WG-COMPLETE
+    type: wireguard
+    server: 127.0.0.1
+    port: 51820
+    private-key: "{private_key}"
+    public-key: "{primary_public_key}"
+    pre-shared-key: "{preshared_key}"
+    ip: [10.77.0.2/32]
+    ipv6: [fd42:77::2/128]
+    allowed-ips: [10.77.0.0/24, "fd42:77::/64"]
+    reserved: "{reserved}"
+    mtu: 1280
+    persistent-keepalive: 25
+    remote-dns-resolve: true
+    dns: [10.77.0.1, "[fd42:77::1]:53"]
+    peers:
+      - server: 127.0.0.2
+        port: 51821
+        public-key: "{secondary_public_key}"
+        pre-shared-key: "{preshared_key}"
+        allowed-ips: [10.88.0.0/24]
+        reserved: [1, 2, 3]
+        persistent-keepalive: 30
+"#
+        );
+
+        let document = parse_subscription(&text).unwrap();
+        assert!(document.unsupported.is_empty());
+        let outbound = document.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::WireGuard {
+                name,
+                private_key: parsed_private_key,
+                public_key,
+                preshared_key: parsed_preshared_key,
+                ip,
+                ipv6,
+                allowed_ips,
+                reserved,
+                mtu,
+                persistent_keepalive,
+                remote_dns_resolve,
+                dns,
+                peers,
+                ..
+            } => {
+                assert_eq!(name, "WG-COMPLETE");
+                assert_eq!(parsed_private_key, private_key);
+                assert_eq!(public_key, primary_public_key);
+                assert_eq!(
+                    parsed_preshared_key.as_deref(),
+                    Some(preshared_key.as_str())
+                );
+                assert_eq!(ip, vec!["10.77.0.2/32"]);
+                assert_eq!(ipv6, vec!["fd42:77::2/128"]);
+                assert_eq!(allowed_ips, vec!["10.77.0.0/24", "fd42:77::/64"]);
+                assert_eq!(reserved, vec![7, 23, 91]);
+                assert_eq!(mtu, Some(1_280));
+                assert_eq!(persistent_keepalive, Some(25));
+                assert!(remote_dns_resolve);
+                assert_eq!(dns, vec!["10.77.0.1", "[fd42:77::1]:53"]);
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].public_key, secondary_public_key);
+                assert_eq!(peers[0].allowed_ips, vec!["10.88.0.0/24"]);
+                assert_eq!(peers[0].reserved, vec![1, 2, 3]);
+                assert_eq!(peers[0].persistent_keepalive, Some(30));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_wireguard_reserved_instead_of_silently_dropping_it() {
+        let private_key = base64::engine::general_purpose::STANDARD.encode([11u8; 32]);
+        let public_key = base64::engine::general_purpose::STANDARD.encode([29u8; 32]);
+        let text = format!(
+            r#"
+proxies:
+  - name: WG-BAD-RESERVED
+    type: wireguard
+    server: 127.0.0.1
+    port: 51820
+    private-key: "{private_key}"
+    public-key: "{public_key}"
+    ip: [10.77.0.2/32]
+    reserved: 1,not-a-byte,3
+"#
+        );
+
+        let document = parse_subscription(&text).unwrap();
+        let error = document.nodes[0].to_outbound_config().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid wireguard reserved byte 'not-a-byte'"));
     }
 
     #[test]

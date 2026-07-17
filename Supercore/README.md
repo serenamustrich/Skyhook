@@ -117,8 +117,9 @@ Current matrix details are in `docs/protocol-matrix.md`:
 
 - **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **partial**: WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, and SSH while their documented gaps remain
-- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria2, TUIC, and SOCKS5
+- **partial**: AnyTLS, ShadowTLS, Naive, HTTP, and SSH while their documented gaps remain
+- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria2, TUIC,
+  WireGuard, and SOCKS5
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently

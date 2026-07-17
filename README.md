@@ -21,6 +21,8 @@
 - VLESS 支持 TCP/UDP、TLS/无 TLS、WebSocket、gRPC、HTTP/2、HTTP camouflage、
   HTTPUpgrade、自定义请求头和 ALPN；Reality 支持 ClientHello 认证、short ID、临时证书
   校验和 fingerprint profile，Vision 支持双向 padding 与 TLS 1.3 direct copy。
+- WireGuard 使用原生用户态网络栈，支持 IPv4/IPv6、TCP/UDP、隧道内 DNS、MTU、reserved、
+  pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
 - 订阅与 Provider 下载默认使用直连通道，失败时保留已有本地缓存。
 - 支持自定义域名/IP 规则，并让这些规则优先于订阅规则。
