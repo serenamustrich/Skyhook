@@ -8,9 +8,9 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.13（按 2026-07-17 `87dba29` 已提交基线重新核对）
+> 计划版本：v1.14（按 2026-07-17 `2a0b61d` 已提交基线重新核对）
 >
-> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008E`。
+> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-009`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -312,9 +312,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `87dba29` 基线上重新核对：
+2026-07-17 在 `2a0b61d` 基线上重新核对：
 
-- 当前分支为 `main`，已提交代码基线停在 `87dba29`。
+- 当前分支为 `main`，已提交代码基线停在 `2a0b61d`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -357,6 +357,11 @@ M1 Outbound 第一批已实现、验证并提交：
   idle/capacity eviction、流量统计、碎片重组和 SS2022 replay window。HY2/TUIC、SOCKS5、
   Shadowsocks、Trojan、VMess、VLESS 的物理 UDP session pool 已按上下文隔离；原生 UDP/QUIC
   配置 dialer-proxy 时明确报告 capability 限制并拒绝运行，不再静默直连泄漏。
+- `NEXT-008E` 已以 `2a0b61d` 提交：所有增长型列表使用统一的
+  `limit/cursor/filter/sort/order` 契约和 keyset 游标，默认 200、硬上限 500；实时列表前部
+  新增数据不会导致后续页重复或遗漏，游标锚点消失或查询条件变化时返回结构化错误。
+  OpenAPI 3.1 已同步参数与 Pagination schema；Swift client 每页请求 500 条并自动拉全，
+  智能规则改为轻量统计快照加 rules/observations/recommendations 三个独立分页集合。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
@@ -376,21 +381,19 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
-   OpenAPI 3.1 与 Swift client model。
-2. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
+1. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
    mock、config/runtime、plan behavior 和 Swift `/v1` 回归全部通过后，才将 M1 改为
    `IMPLEMENTED`；MPTCP 的外部 profile 真机证据在 M12 补齐后再改为 `VERIFIED`。
-3. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
+2. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
-4. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
+3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
-5. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
+4. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
     多订阅本地切换、Provider、代理组、国家分组、智能规则、App/域名/IP 指定节点、
     按订阅累计流量、连接表、分类日志和 Doctor。
-6. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
+5. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
     profiling、长稳、安全、CI、供应链、开源许可和文档真实性收口。
-7. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
+6. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
     更新中英文 README，完成签名、
     公证、带既定背景和 Finder 布局的 DMG、安全扫描、GitHub 提交与 Release 下载链接。
 
@@ -830,7 +833,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - [x] `NEXT-008C3`：完成 smux、yamux、h2mux、pool limits、padding、only-tcp 和失效剔除。
    - [x] `NEXT-008D`：收口公共 UDP association、NAT、fragmentation/reassembly、replay window、
      backpressure、idle eviction、cancellation 和统计证据。
-   - [ ] `NEXT-008E`：收口 API 统一分页、过滤、稳定排序、游标、state 边界、OpenAPI
+   - [x] `NEXT-008E`：收口 API 统一分页、过滤、稳定排序、游标、state 边界、OpenAPI
      和 Swift model。
 9. [ ] `NEXT-009`：执行 M1 集中验收。
    - `cargo check --all-targets`。
@@ -942,6 +945,28 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 - `cargo test --tests`：Rust lib 142 passed；main 2 passed；全部协议、config/runtime、订阅、
   transport/UDP 集成测试通过；1 个 MPTCP profile 真机测试和 1 个需显式外部订阅 URL 的测试
   按既定门禁 ignored。
+- 私有订阅域名、URL 和 token 扫描：0 命中。
+
+`NEXT-008E` 验证记录：
+
+- 提交：`2a0b61d`。
+- 14 个增长型 GET 集合统一支持 `limit`、`cursor`、`filter`、`sort` 和 `order`；默认
+  limit 200、最大 500，非法数字、未知排序字段、非法枚举和错误游标均返回统一
+  `ApiError` envelope。
+- 游标使用 base64url 编码的 keyset anchor，绑定 endpoint、filter、sort 和 order；实时
+  列表前部新增项不改变后续页，锚点删除或跨查询复用时明确返回 stale error。
+- `/v1/outbounds` 将 health、capability 和 runtime stats 合并为单节点记录；规则和日志使用
+  稳定内容 ID；智能规则大数组拆成 rules、observations、recommendations 三个分页 endpoint，
+  summary 不再重复返回整份增长数据。
+- `ApiState` 仅通过只读 runtime 视图、显式 runtime handle、bounded TaskManager 视图和
+  task handle 暴露所有权；route 模块不再直接访问 state 字段或使用父模块通配 import。
+- OpenAPI 3.1 为全部分页 endpoint 声明 5 个 query 参数，成功响应引用 Pagination schema；
+  schema/router consistency test 覆盖新增路径。
+- Swift client 使用 URLQueryItem 安全编码 opaque cursor，每页 500 条，自动拉全并检测游标
+  重复；智能规则 summary 与三个分页集合并行加载后透明合并。
+- `cargo check --all-targets`：通过且无 warning。
+- Rust API 定向测试：22 passed。
+- Swift 全量测试：98 passed；其中真实双页合并和智能规则 summary/分页集合合并均有定向测试。
 - 私有订阅域名、URL 和 token 扫描：0 命中。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
