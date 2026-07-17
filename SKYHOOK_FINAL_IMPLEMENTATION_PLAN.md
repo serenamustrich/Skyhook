@@ -8,9 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.14（按 2026-07-17 `2a0b61d` 已提交基线重新核对）
+> 计划版本：v1.15（按 2026-07-17 `dae0e55` 已提交基线重新核对）
 >
-> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-009`。
+> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
+> M2 进行中，当前直接执行点为 `NEXT-010A`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -312,9 +313,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `2a0b61d` 基线上重新核对：
+2026-07-17 在 `dae0e55` 基线上重新核对：
 
-- 当前分支为 `main`，已提交代码基线停在 `2a0b61d`。
+- 当前分支为 `main`，已提交代码基线停在 `dae0e55`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -362,29 +363,33 @@ M1 Outbound 第一批已实现、验证并提交：
   新增数据不会导致后续页重复或遗漏，游标锚点消失或查询条件变化时返回结构化错误。
   OpenAPI 3.1 已同步参数与 Pagination schema；Swift client 每页请求 500 条并自动拉全，
   智能规则改为轻量统计快照加 rules/observations/recommendations 三个独立分页集合。
+- `NEXT-009` 已完成 M1 集中验收：`cargo check --all-targets` 无 warning，Rust 全量测试、
+  Swift 98 项回归、OpenAPI/router compatibility、协议矩阵/API 文档和私密订阅扫描均通过；
+  API 测试专用 `Router` import 清理以 `ae7b0df` 提交，分页 API 和公共 UDP 文档以
+  `dae0e55` 提交。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
   - Juicity
   - MASQUE
   - OpenVPN
-- API 读接口尚未形成统一分页、过滤、游标和稳定排序模型。
 - 当前 TUN backend 会明确拒绝 `strict_route`、`auto_detect_interface`、
   `auto_redirect`、GSO、自定义 route/address 和进程过滤等能力，尚不满足最终目标。
 - Swift 三个集中职责文件仍分别约为：
   - `AppState.swift`：3,046 行。
   - `SettingsWindow.swift`：1,614 行。
   - `SupercoreAPIClient.swift`：1,264 行。
-- 因此当前只能确认 M0 为 `VERIFIED`，M1 为 `IN_PROGRESS`，M2-M12 均未达到完成门。
+- 因此当前确认 M0 为 `VERIFIED`，M1 为 `IMPLEMENTED`；M1 的真实 MPTCP 多路径证据保留在
+  M12 发布门，M2 已进入开发，M3-M12 尚未达到完成门。
 
 ### 5.6 当前直接执行队列
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
-   mock、config/runtime、plan behavior 和 Swift `/v1` 回归全部通过后，才将 M1 改为
-   `IMPLEMENTED`；MPTCP 的外部 profile 真机证据在 M12 补齐后再改为 `VERIFIED`。
-2. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
+1. 执行 `NEXT-010A`：完成 Shadowsocks 当前能力与冻结基线逐项核对，补齐缺失 cipher、
+   URI/YAML 字段、TCP/UDP 真实拨号、错误映射和独立互操作 fixture；随后按 `NEXT-010B`
+   和 `NEXT-010C` 收口 ShadowsocksR、Snell。
+2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
@@ -569,19 +574,20 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
    - SS/SSR/Snell、Trojan、VMess 和 VLESS/Reality 已完整迁移。
    - Hysteria2 和 TUIC 已完成迁移；根模块最小化、显式 import 和测试边界已收口。
    - 不在同一个提交中同时重写协议 wire format。
-4. [ ] `Network: complete shared TCP TLS transports and UDP`
+4. [x] `Network: complete shared TCP TLS transports and UDP`
    - 完成 cancellation、deadline、Happy Eyeballs、TLS、transport 和 UDP session 基础。
    - 到此才允许进入 M2/M3 的协议补齐。
 
-这四批全部通过 M1 验收门后，M1 才能从 `IN_PROGRESS` 变为 `VERIFIED`。
+这四批和 `NEXT-009` 已通过本地 M1 验收门，M1 状态为 `IMPLEMENTED`；只有 M12 补齐
+合法 profile 下的 MPTCP 多路径真机证据后，M1 才改为 `VERIFIED`。
 
 ### 8.2 总体执行看板
 
 | 阶段 | 当前状态 | 前置依赖 | 阶段交付物 | 完成证据 |
 |---|---|---|---|---|
 | M0 控制面 | `VERIFIED` | 无 | task、SSE、取消、进度、telemetry | 已提交代码和 Rust/Swift 回归 |
-| M1 基础设施 | `IN_PROGRESS` | M0 | 模块化 Core/API/Outbound、公共 transport/UDP | `NEXT-001` 至 `NEXT-009` 全部通过 |
-| M2 现有协议 | `NOT_STARTED` | M1 | 当前 partial 协议真实 TCP/UDP 拨号 | 每协议 mock E2E + 独立互操作 |
+| M1 基础设施 | `IMPLEMENTED` | M0 | 模块化 Core/API/Outbound、公共 transport/UDP | 本地门通过；MPTCP 真机证据并入 M12 |
+| M2 现有协议 | `IN_PROGRESS` | M1 | 当前 partial 协议真实 TCP/UDP 拨号 | 每协议 mock E2E + 独立互操作 |
 | M3 缺失协议 | `NOT_STARTED` | M1 | 冻结基线协议和内置出站补齐 | 无已知协议落入永久 unsupported |
 | M4 DNS/Fake-IP | `NOT_STARTED` | M1 | 独立 resolver、policy、cache、Fake-IP | DNS 泄漏/循环/恢复测试 |
 | M5 macOS TUN | `NOT_STARTED` | M1、M4 | 虚拟网卡、helper、网络事务和恢复 | 真机异常退出矩阵 |
@@ -691,7 +697,7 @@ M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 
 ## 10. M1：核心模块化和统一基础设施
 
-状态：`IN_PROGRESS`
+状态：`IMPLEMENTED`（MPTCP 真机发布证据并入 M12）
 
 ### 10.1 API 拆分
 
@@ -701,8 +707,8 @@ M0 达到 `VERIFIED` 后再进入大规模模块拆分。
 - 已实现并验证：subscriptions、providers、tasks、system、routing/selection、
   smart-rules 路由拆分，重复 handler/import 清理，OpenAPI 3.1 endpoint 和 schema
   compatibility test。
-- 当前结构批次验证：Rust lib 93 passed、`cargo check --lib` 无 warning。
-- M1 API 剩余功能门：读接口分页/过滤/稳定排序的统一约定，以及 API state 边界复核。
+- 当前结构与功能门均已通过：读接口统一分页/过滤/稳定排序，API state 使用显式只读和
+  bounded handle 边界，OpenAPI/router compatibility 与 Swift 全量回归均已验证。
 
 - 从 `api/mod.rs` 拆出：
   - auth
@@ -739,9 +745,8 @@ tree 已实现并通过 Rust lib 95、`config_and_runtime` 20、`plan_behavior` 
 
 当前进度：trait/factory 已拆分，结构化错误上下文和显式 capability 已接入全部实现；
 SSH/WireGuard、target/SOCKS5、AnyTLS/ShadowTLS、SS/SSR/Snell、Trojan、VMess、
-VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交。当前只剩
-根模块最小化已经完成。当前只剩 `NEXT-008` 的公共网络基础设施收口和 `NEXT-009`
-的 M1 集中验收，本项保持进行中。
+VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交。根模块最小化、
+公共网络基础设施和 M1 集中验收均已完成。
 
 恢复开发后的精确拆分顺序：
 
@@ -790,7 +795,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 7. [x] `NEXT-007`：清空巨型 `outbound/mod.rs`。
    - 只保留模块声明、公共 re-export 和 registry/factory 入口。
    - 删除跨协议隐式 import、重复 target helper 和字符串错误分类。
-8. [ ] `NEXT-008`：完成公共 TCP/TLS、transport、UDP 和通用代理字段。
+8. [x] `NEXT-008`：完成公共 TCP/TLS、transport、UDP 和通用代理字段。
    - cancellation/deadline 必须传播到 DNS、connect、TLS、协议握手和 relay。
    - 补齐 Happy Eyeballs、IP preference、interface bind、TFO/MPTCP 能力边界。
    - 完成 bounded UDP association、idle eviction、backpressure 和流量统计。
@@ -814,7 +819,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - 验证：`cargo check --all-targets` 无 warning；Rust lib 133 passed；transport 21
        passed；`trojan_vmess_real_dial` 19 passed；`vless_hy2_tuic` 19 passed；
        `ss_real_dial` 15 passed；`common_outbound_options` 14 passed、1 ignored。
-   - [ ] `NEXT-008C`：完成 common fields。
+   - [x] `NEXT-008C`：完成 common fields；MPTCP 外部 profile 证据在 M12 验证。
      - [x] `NEXT-008C1`：验收 IP version、interface-name、routing-mark 限制、
        UDP 开关、certificate fingerprint、TFO、dialer-proxy、keepalive 和 QUIC 选项；
        覆盖订阅解析、runtime merge、capability、链路循环与真实拨号测试。
@@ -835,7 +840,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      backpressure、idle eviction、cancellation 和统计证据。
    - [x] `NEXT-008E`：收口 API 统一分页、过滤、稳定排序、游标、state 边界、OpenAPI
      和 Swift model。
-9. [ ] `NEXT-009`：执行 M1 集中验收。
+9. [x] `NEXT-009`：执行 M1 集中验收。
    - `cargo check --all-targets`。
    - Rust lib、协议定向 integration、config/runtime、plan behavior。
    - transport/UDP mock tests。
@@ -946,6 +951,19 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
   transport/UDP 集成测试通过；1 个 MPTCP profile 真机测试和 1 个需显式外部订阅 URL 的测试
   按既定门禁 ignored。
 - 私有订阅域名、URL 和 token 扫描：0 命中。
+
+`NEXT-009` 验证记录：
+
+- 提交：`ae7b0df`、`dae0e55`。
+- `cargo check --all-targets`：通过且无 warning。
+- `cargo test --tests`：Rust lib 145 passed；main 2 passed；全部协议、transport/UDP、
+  config/runtime、plan behavior、subscription/provider 和 API 集成测试通过。
+- 按发布门设计保留 2 个 ignored：MPTCP 合法 profile 真机用例，以及必须显式提供外部
+  订阅 URL 的互操作用例。
+- Swift 全量回归：98 passed，覆盖控制 API 自动分页、双页合并、智能规则摘要与三类分页
+  明细合并。
+- OpenAPI 3.1 与注册路由一致性测试通过；中英文功能 README、核心 API 文档和协议矩阵已更新。
+- `git diff --check` 通过；私有订阅域名、URL 和 token 扫描 0 命中。
 
 `NEXT-008E` 验证记录：
 
@@ -1112,7 +1130,23 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 
 ## 11. M2：完成当前 partial 协议
 
-状态：`NOT_STARTED`
+状态：`IN_PROGRESS`
+
+### 11.0 当前执行批次
+
+1. [ ] `NEXT-010A`：Shadowsocks 完整能力收口。
+   - 以冻结协议基线核对 cipher、SIP022/SIP023、URI/YAML、plugin 和 transport 字段。
+   - 补齐缺失的标准 cipher 与字段校验，TCP/UDP capability 必须来自真实实现。
+   - 真实本地对端覆盖双向数据、大包、错误密钥、重放、超时、取消和 server close。
+   - 增加不依赖 Skyhook 编解码器自证的公开向量或独立 fixture。
+2. [ ] `NEXT-010B`：ShadowsocksR 完整能力收口。
+   - 核对 cipher、protocol、obfs、多用户、TCP/UDP 组合并前置拒绝非法组合。
+   - 扩大独立 fixture，覆盖错误密码、错误参数和响应方向状态。
+3. [ ] `NEXT-010C`：Snell 完整能力收口。
+   - 核对 v1-v5、UDP-over-TCP、obfs、reuse/pool 和协议自身的 not-applicable 边界。
+   - 补齐并发、半关闭、空闲淘汰、陈旧连接和错误 PSK 的独立互操作证据。
+4. [ ] `NEXT-011`：依次收口 Trojan、VMess、VLESS/Reality/Vision、Hysteria2/TUIC、
+   WireGuard、AnyTLS/ShadowTLS/Naive、HTTP/SOCKS5/SSH，完成 M2 集中验收。
 
 ### 11.1 协议完成标准
 
