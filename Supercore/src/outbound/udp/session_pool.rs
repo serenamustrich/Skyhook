@@ -7,6 +7,7 @@ use std::{
 use tokio::sync::Mutex;
 
 const DEFAULT_CAPACITY: usize = 4;
+const DEFAULT_KEY_CAPACITY: usize = 256;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct SessionEntry<T> {
@@ -23,21 +24,29 @@ pub(crate) struct RoundRobinSessionPool<T> {
 
 pub(crate) struct KeyedRoundRobinSessionPool<T> {
     buckets: HashMap<String, RoundRobinSessionPool<T>>,
+    key_last_used: HashMap<String, Instant>,
     capacity_per_key: usize,
+    key_capacity: usize,
     idle_timeout: Duration,
 }
 
 impl<T> Default for KeyedRoundRobinSessionPool<T> {
     fn default() -> Self {
-        Self::with_limits(DEFAULT_CAPACITY, DEFAULT_IDLE_TIMEOUT)
+        Self::with_limits(DEFAULT_CAPACITY, DEFAULT_KEY_CAPACITY, DEFAULT_IDLE_TIMEOUT)
     }
 }
 
 impl<T> KeyedRoundRobinSessionPool<T> {
-    pub(crate) fn with_limits(capacity_per_key: usize, idle_timeout: Duration) -> Self {
+    pub(crate) fn with_limits(
+        capacity_per_key: usize,
+        key_capacity: usize,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             buckets: HashMap::new(),
+            key_last_used: HashMap::new(),
             capacity_per_key: capacity_per_key.max(1),
+            key_capacity: key_capacity.max(1),
             idle_timeout,
         }
     }
@@ -48,8 +57,21 @@ impl<T> KeyedRoundRobinSessionPool<T> {
     }
 
     pub(crate) fn push(&mut self, key: String, session: Arc<Mutex<T>>) {
+        self.evict_idle();
+        if !self.buckets.contains_key(&key) && self.buckets.len() >= self.key_capacity {
+            if let Some(oldest) = self
+                .key_last_used
+                .iter()
+                .min_by_key(|(_, last_used)| *last_used)
+                .map(|(key, _)| key.clone())
+            {
+                self.buckets.remove(&oldest);
+                self.key_last_used.remove(&oldest);
+            }
+        }
         let capacity = self.capacity_per_key;
         let idle_timeout = self.idle_timeout;
+        self.key_last_used.insert(key.clone(), Instant::now());
         self.buckets
             .entry(key)
             .or_insert_with(|| RoundRobinSessionPool::with_limits(capacity, idle_timeout))
@@ -58,9 +80,14 @@ impl<T> KeyedRoundRobinSessionPool<T> {
 
     pub(crate) fn next(&mut self, key: &str) -> Option<Arc<Mutex<T>>> {
         self.evict_idle();
-        self.buckets
+        let session = self
+            .buckets
             .get_mut(key)
-            .and_then(RoundRobinSessionPool::next)
+            .and_then(RoundRobinSessionPool::next);
+        if session.is_some() {
+            self.key_last_used.insert(key.to_string(), Instant::now());
+        }
+        session
     }
 
     pub(crate) fn remove(&mut self, key: &str, target: &Arc<Mutex<T>>) {
@@ -70,6 +97,7 @@ impl<T> KeyedRoundRobinSessionPool<T> {
         });
         if should_remove {
             self.buckets.remove(key);
+            self.key_last_used.remove(key);
         }
     }
 
@@ -78,6 +106,8 @@ impl<T> KeyedRoundRobinSessionPool<T> {
             bucket.evict_idle();
             !bucket.sessions.is_empty()
         });
+        self.key_last_used
+            .retain(|key, _| self.buckets.contains_key(key));
     }
 }
 
@@ -140,11 +170,6 @@ impl<T> RoundRobinSessionPool<T> {
         self.sessions
             .retain(|entry| !Arc::ptr_eq(&entry.session, target));
         self.normalize_index();
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.sessions.clear();
-        self.next_index = 0;
     }
 
     fn evict_idle(&mut self) {
@@ -224,5 +249,18 @@ mod tests {
         pool.push(session);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(pool.len(), 0);
+    }
+
+    #[test]
+    fn keyed_pool_evicts_oldest_key_at_capacity() {
+        let first = Arc::new(Mutex::new(1));
+        let second = Arc::new(Mutex::new(2));
+        let mut pool = KeyedRoundRobinSessionPool::with_limits(1, 1, Duration::from_secs(60));
+        pool.push("first".into(), first);
+        pool.push("second".into(), Arc::clone(&second));
+
+        assert_eq!(pool.len("first"), 0);
+        assert_eq!(pool.len("second"), 1);
+        assert!(Arc::ptr_eq(&pool.next("second").expect("second"), &second));
     }
 }

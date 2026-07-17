@@ -16,6 +16,13 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 pub type BoxedStream = Box<dyn ProxyStream>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UdpNatMode {
+    EndpointDependent,
+    EndpointIndependent,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct OutboundCapability {
     pub tcp_supported: bool,
@@ -59,6 +66,14 @@ pub trait Outbound: Send + Sync {
     fn kind(&self) -> &'static str;
     fn capability(&self) -> OutboundCapability;
 
+    fn udp_nat_mode(&self) -> UdpNatMode {
+        UdpNatMode::EndpointDependent
+    }
+
+    fn supports_udp_dialer_proxy(&self) -> bool {
+        false
+    }
+
     fn runtime_stats(&self) -> Option<serde_json::Value> {
         None
     }
@@ -88,6 +103,7 @@ pub trait Outbound: Send + Sync {
         }
 
         tokio::select! {
+            biased;
             _ = context.cancellation.cancelled() => {
                 Err(OutboundError::new(
                     OutboundErrorKind::Cancelled,
@@ -100,35 +116,32 @@ pub trait Outbound: Send + Sync {
                 .with_trace_id(context.trace_id.clone())
                 .into())
             }
-            result = tokio::time::timeout(
-                remaining,
-                scope_dial_context(
-                    context,
-                    self.connect(&context.destination, duration_millis(remaining)),
-                ),
+            result = scope_dial_context(
+                context,
+                self.connect(&context.destination, duration_millis(remaining)),
             ) => {
-                match result {
-                    Ok(result) => result.map_err(|error| {
-                        contextualize_error(
-                            error,
-                            "connect",
-                            self.kind(),
-                            self.name(),
-                            &context.destination.authority(),
-                            &context.trace_id,
-                        )
-                    }),
-                    Err(_) => Err(OutboundError::new(
-                        OutboundErrorKind::Timeout,
+                result.map_err(|error| {
+                    contextualize_error(
+                        error,
                         "connect",
-                        format!("dial {} exceeded its deadline", context.destination.authority()),
+                        self.kind(),
+                        self.name(),
+                        &context.destination.authority(),
+                        &context.trace_id,
                     )
-                    .for_protocol(self.kind())
-                    .for_node(self.name())
-                    .for_destination(context.destination.authority())
-                    .with_trace_id(context.trace_id.clone())
-                    .into()),
-                }
+                })
+            }
+            _ = tokio::time::sleep_until(context.deadline.into()) => {
+                Err(OutboundError::new(
+                    OutboundErrorKind::Timeout,
+                    "connect",
+                    format!("dial {} exceeded its deadline", context.destination.authority()),
+                )
+                .for_protocol(self.kind())
+                .for_node(self.name())
+                .for_destination(context.destination.authority())
+                .with_trace_id(context.trace_id.clone())
+                .into())
             },
         }
     }
@@ -172,6 +185,7 @@ pub trait Outbound: Send + Sync {
         }
 
         tokio::select! {
+            biased;
             _ = context.cancellation.cancelled() => {
                 Err(OutboundError::new(
                     OutboundErrorKind::Cancelled,
@@ -184,35 +198,32 @@ pub trait Outbound: Send + Sync {
                 .with_trace_id(context.trace_id.clone())
                 .into())
             }
-            result = tokio::time::timeout(
-                remaining,
-                scope_dial_context(
-                    context,
-                    self.udp_exchange(&context.destination, payload, duration_millis(remaining)),
-                ),
+            result = scope_dial_context(
+                context,
+                self.udp_exchange(&context.destination, payload, duration_millis(remaining)),
             ) => {
-                match result {
-                    Ok(result) => result.map_err(|error| {
-                        contextualize_error(
-                            error,
-                            "udp_exchange",
-                            self.kind(),
-                            self.name(),
-                            &context.destination.authority(),
-                            &context.trace_id,
-                        )
-                    }),
-                    Err(_) => Err(OutboundError::new(
-                        OutboundErrorKind::Timeout,
+                result.map_err(|error| {
+                    contextualize_error(
+                        error,
                         "udp_exchange",
-                        format!("UDP exchange with {} exceeded its deadline", context.destination.authority()),
+                        self.kind(),
+                        self.name(),
+                        &context.destination.authority(),
+                        &context.trace_id,
                     )
-                    .for_protocol(self.kind())
-                    .for_node(self.name())
-                    .for_destination(context.destination.authority())
-                    .with_trace_id(context.trace_id.clone())
-                    .into()),
-                }
+                })
+            }
+            _ = tokio::time::sleep_until(context.deadline.into()) => {
+                Err(OutboundError::new(
+                    OutboundErrorKind::Timeout,
+                    "udp_exchange",
+                    format!("UDP exchange with {} exceeded its deadline", context.destination.authority()),
+                )
+                .for_protocol(self.kind())
+                .for_node(self.name())
+                .for_destination(context.destination.authority())
+                .with_trace_id(context.trace_id.clone())
+                .into())
             },
         }
     }

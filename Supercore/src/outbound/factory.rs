@@ -54,17 +54,14 @@ pub fn build_outbounds_with_options(
             continue;
         }
         let outbound = build_leaf_outbound(config)?;
-        let outbound =
+        let outbound = Arc::new(ConfiguredOutbound::new(
+            outbound,
             common_options
                 .get(config.name())
                 .cloned()
-                .map_or(outbound.clone(), |options| {
-                    Arc::new(ConfiguredOutbound::new(
-                        outbound,
-                        options,
-                        Arc::clone(&registry),
-                    )) as Arc<dyn Outbound>
-                });
+                .unwrap_or_default(),
+            Arc::clone(&registry),
+        )) as Arc<dyn Outbound>;
         insert_leaf(&mut outbounds, config.name(), outbound)?;
     }
 

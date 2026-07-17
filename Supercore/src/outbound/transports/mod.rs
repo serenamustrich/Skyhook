@@ -1,4 +1,5 @@
 mod connection_pool;
+mod deadline;
 mod grpc;
 mod headers;
 mod http2;
@@ -12,6 +13,7 @@ mod tls;
 mod websocket;
 
 pub(crate) use connection_pool::SharedConnectionPool;
+pub(crate) use deadline::run_dial_phase;
 pub(crate) use grpc::open_grpc_tunnel;
 pub(crate) use http2::{open_h2_tunnel, Http2TunnelStream};
 pub(crate) use http_connect::establish_http_connect;

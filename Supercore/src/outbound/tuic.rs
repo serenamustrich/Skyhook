@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::Error,
     net::SocketAddr,
     pin::Pin,
@@ -25,8 +24,10 @@ use super::{
         connect_quic_endpoint, create_quic_endpoint, quic_client_config, random_u16,
         resolve_quic_remote, SharedConnectionPool,
     },
-    udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
-    BoxedStream, Outbound, OutboundCapability,
+    udp::{
+        udp_session_key, FragmentReassembler, KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    },
+    BoxedStream, Outbound, OutboundCapability, UdpNatMode,
 };
 
 pub(super) struct TuicOutbound {
@@ -44,11 +45,7 @@ pub(super) struct TuicOutbound {
     udp_sessions: TokioMutex<TuicUdpPool>,
 }
 
-#[derive(Default)]
-struct TuicUdpPool {
-    mode: Option<String>,
-    sessions: RoundRobinSessionPool<TuicUdpSession>,
-}
+type TuicUdpPool = KeyedRoundRobinSessionPool<TuicUdpSession>;
 
 struct TuicUdpSession {
     shared: Arc<TuicConnection>,
@@ -72,6 +69,10 @@ impl Outbound for TuicOutbound {
             "{}-session-pool",
             self.udp_relay_mode.as_deref().unwrap_or("native")
         ))
+    }
+
+    fn udp_nat_mode(&self) -> UdpNatMode {
+        UdpNatMode::EndpointIndependent
     }
 
     async fn connect(
@@ -114,7 +115,13 @@ impl Outbound for TuicOutbound {
         if !matches!(mode.as_str(), "native" | "quic") {
             return Err(anyhow!("unsupported tuic udp relay mode {mode}"));
         }
-        let session_handle = self.tuic_udp_session(&mode, timeout_ms).await?;
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
+        let session_handle = self.tuic_udp_session(&key, &mode, timeout_ms).await?;
 
         let exchange = {
             let mut session = session_handle.lock().await;
@@ -196,7 +203,7 @@ impl Outbound for TuicOutbound {
             .await
         };
         if exchange.is_err() {
-            self.remove_tuic_udp_session(&session_handle).await;
+            self.remove_tuic_udp_session(&key, &session_handle).await;
         }
         exchange
     }
@@ -259,15 +266,12 @@ impl TuicOutbound {
 
     async fn tuic_udp_session(
         &self,
+        key: &str,
         mode: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<TuicUdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.mode.as_deref() != Some(mode) {
-            pool.sessions.clear();
-            pool.mode = Some(mode.to_string());
-        }
-        if pool.sessions.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len(key) < UDP_SESSION_POOL_SIZE {
             let user_id = Uuid::parse_str(&self.uuid)
                 .map_err(|error| anyhow!("invalid tuic uuid for {}: {error}", self.name))?;
             let connection = self.tuic_connection(&user_id, timeout_ms).await?;
@@ -277,17 +281,16 @@ impl TuicOutbound {
                 associate_id: random_u16()?,
                 next_packet_id: random_u16()?,
             }));
-            pool.sessions.push(session.clone());
+            pool.push(key.to_string(), session.clone());
             return Ok(session);
         }
-        pool.sessions
-            .next()
+        pool.next(key)
             .ok_or_else(|| anyhow!("tuic UDP session pool is unexpectedly empty"))
     }
 
-    async fn remove_tuic_udp_session(&self, target: &Arc<TokioMutex<TuicUdpSession>>) {
+    async fn remove_tuic_udp_session(&self, key: &str, target: &Arc<TokioMutex<TuicUdpSession>>) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.sessions.remove(target);
+        pool.remove(key, target);
     }
 }
 
@@ -395,15 +398,7 @@ pub(super) fn build_tuic_connect_request(destination: &Destination) -> anyhow::R
     Ok(output)
 }
 
-#[derive(Default)]
-pub(super) struct TuicUdpReassembly {
-    packets: HashMap<u16, TuicUdpFragmentSet>,
-}
-
-struct TuicUdpFragmentSet {
-    total: u8,
-    fragments: Vec<Option<Vec<u8>>>,
-}
+pub(super) type TuicUdpReassembly = FragmentReassembler<u16>;
 
 pub(super) fn build_tuic_packet_messages(
     associate_id: u16,
@@ -506,46 +501,9 @@ pub(super) fn parse_tuic_packet_message(
         return Err(anyhow!("tuic udp payload length exceeds packet"));
     }
     let payload = data[cursor..cursor + payload_len].to_vec();
-    if fragment_total == 1 {
-        return Ok(Some(payload));
-    }
-    push_tuic_udp_fragment(reassembly, packet_id, fragment_id, fragment_total, payload)
-}
-
-fn push_tuic_udp_fragment(
-    reassembly: &mut TuicUdpReassembly,
-    packet_id: u16,
-    fragment_id: u8,
-    fragment_total: u8,
-    payload: Vec<u8>,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    if reassembly.packets.len() > 64 {
-        reassembly.packets.clear();
-    }
-    let entry = reassembly
-        .packets
-        .entry(packet_id)
-        .or_insert_with(|| TuicUdpFragmentSet {
-            total: fragment_total,
-            fragments: vec![None; fragment_total as usize],
-        });
-    if entry.total != fragment_total {
-        reassembly.packets.remove(&packet_id);
-        return Err(anyhow!("inconsistent tuic udp fragment count"));
-    }
-    entry.fragments[fragment_id as usize] = Some(payload);
-    if !entry.fragments.iter().all(Option::is_some) {
-        return Ok(None);
-    }
-    let entry = reassembly
-        .packets
-        .remove(&packet_id)
-        .ok_or_else(|| anyhow!("missing tuic udp reassembly entry"))?;
-    let mut output = Vec::new();
-    for fragment in entry.fragments {
-        output.extend_from_slice(&fragment.ok_or_else(|| anyhow!("missing tuic udp fragment"))?);
-    }
-    Ok(Some(output))
+    reassembly
+        .push(packet_id, fragment_id, fragment_total, payload)
+        .context("tuic udp reassembly failed")
 }
 
 fn encode_tuic_address(destination: &Destination, output: &mut Vec<u8>) -> anyhow::Result<()> {

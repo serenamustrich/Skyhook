@@ -28,8 +28,11 @@ use super::{
         random_u16, random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
         SharedConnectionPool,
     },
-    udp::{create_bound_std_udp, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
-    BoxedStream, Outbound, OutboundCapability,
+    udp::{
+        create_bound_std_udp, udp_session_key, FragmentReassembler, KeyedRoundRobinSessionPool,
+        UDP_SESSION_POOL_SIZE,
+    },
+    BoxedStream, Outbound, OutboundCapability, UdpNatMode,
 };
 
 pub(super) struct Hysteria2Outbound {
@@ -46,7 +49,7 @@ pub(super) struct Hysteria2Outbound {
     udp_sessions: TokioMutex<Hysteria2UdpPool>,
 }
 
-type Hysteria2UdpPool = RoundRobinSessionPool<Hysteria2UdpSession>;
+type Hysteria2UdpPool = KeyedRoundRobinSessionPool<Hysteria2UdpSession>;
 
 struct Hysteria2UdpSession {
     shared: Arc<Hysteria2Connection>,
@@ -87,6 +90,10 @@ impl Outbound for Hysteria2Outbound {
         }
     }
 
+    fn udp_nat_mode(&self) -> UdpNatMode {
+        UdpNatMode::EndpointIndependent
+    }
+
     async fn connect(
         &self,
         destination: &Destination,
@@ -123,8 +130,14 @@ impl Outbound for Hysteria2Outbound {
     ) -> anyhow::Result<Vec<u8>> {
         let obfs_config =
             hysteria2_obfs_config(self.obfs.as_deref(), self.obfs_password.as_deref())?;
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
         let session_handle = self
-            .hysteria2_udp_session(obfs_config.as_ref(), timeout_ms)
+            .hysteria2_udp_session(&key, obfs_config.as_ref(), timeout_ms)
             .await?;
 
         let exchange = {
@@ -170,7 +183,8 @@ impl Outbound for Hysteria2Outbound {
             .await
         };
         if exchange.is_err() {
-            self.remove_hysteria2_udp_session(&session_handle).await;
+            self.remove_hysteria2_udp_session(&key, &session_handle)
+                .await;
         }
         exchange
     }
@@ -230,11 +244,12 @@ impl Hysteria2Outbound {
 
     async fn hysteria2_udp_session(
         &self,
+        key: &str,
         obfs_config: Option<&Hysteria2ObfsConfig>,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<Hysteria2UdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len(key) < UDP_SESSION_POOL_SIZE {
             let connection = self.hysteria2_connection(obfs_config, timeout_ms).await?;
             if !connection.udp_supported {
                 return Err(anyhow!("hysteria2 server does not support udp relay"));
@@ -244,16 +259,20 @@ impl Hysteria2Outbound {
                 session_id: random_u32()?,
                 next_packet_id: random_u16()?,
             }));
-            pool.push(session.clone());
+            pool.push(key.to_string(), session.clone());
             return Ok(session);
         }
-        pool.next()
+        pool.next(key)
             .ok_or_else(|| anyhow!("hysteria2 UDP session pool is unexpectedly empty"))
     }
 
-    async fn remove_hysteria2_udp_session(&self, target: &Arc<TokioMutex<Hysteria2UdpSession>>) {
+    async fn remove_hysteria2_udp_session(
+        &self,
+        key: &str,
+        target: &Arc<TokioMutex<Hysteria2UdpSession>>,
+    ) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.remove(target);
+        pool.remove(key, target);
     }
 }
 
@@ -793,15 +812,7 @@ where
     Ok(())
 }
 
-#[derive(Default)]
-pub(super) struct Hysteria2UdpReassembly {
-    packets: HashMap<u16, Hysteria2UdpFragmentSet>,
-}
-
-struct Hysteria2UdpFragmentSet {
-    total: u8,
-    fragments: Vec<Option<Vec<u8>>>,
-}
+pub(super) type Hysteria2UdpReassembly = FragmentReassembler<u16>;
 
 pub(super) fn build_hysteria2_udp_messages(
     session_id: u32,
@@ -896,45 +907,7 @@ pub(super) fn parse_hysteria2_udp_message(
     }
     cursor += address_len;
     let payload = datagram[cursor..].to_vec();
-    if fragment_count == 1 {
-        return Ok(Some(payload));
-    }
-    push_hysteria2_udp_fragment(reassembly, packet_id, fragment_id, fragment_count, payload)
-}
-
-fn push_hysteria2_udp_fragment(
-    reassembly: &mut Hysteria2UdpReassembly,
-    packet_id: u16,
-    fragment_id: u8,
-    fragment_count: u8,
-    payload: Vec<u8>,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    if reassembly.packets.len() > 64 {
-        reassembly.packets.clear();
-    }
-    let entry = reassembly
-        .packets
-        .entry(packet_id)
-        .or_insert_with(|| Hysteria2UdpFragmentSet {
-            total: fragment_count,
-            fragments: vec![None; fragment_count as usize],
-        });
-    if entry.total != fragment_count {
-        reassembly.packets.remove(&packet_id);
-        return Err(anyhow!("inconsistent hysteria2 udp fragment count"));
-    }
-    entry.fragments[fragment_id as usize] = Some(payload);
-    if !entry.fragments.iter().all(Option::is_some) {
-        return Ok(None);
-    }
-    let entry = reassembly
-        .packets
-        .remove(&packet_id)
-        .ok_or_else(|| anyhow!("missing hysteria2 udp reassembly entry"))?;
-    let mut output = Vec::new();
-    for fragment in entry.fragments {
-        output
-            .extend_from_slice(&fragment.ok_or_else(|| anyhow!("missing hysteria2 udp fragment"))?);
-    }
-    Ok(Some(output))
+    reassembly
+        .push(packet_id, fragment_id, fragment_count, payload)
+        .context("hysteria2 udp reassembly failed")
 }

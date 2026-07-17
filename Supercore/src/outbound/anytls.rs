@@ -17,7 +17,7 @@ use crate::routing::Destination;
 use super::{
     io::read_exact_or_eof,
     target::encode_socks5_destination,
-    transports::{connect_tcp, tls_client_config},
+    transports::{connect_tcp, run_dial_phase, tls_client_config},
     util::hex_lower,
     BoxedStream, Outbound, OutboundCapability,
 };
@@ -100,12 +100,12 @@ impl Outbound for AnyTlsOutbound {
         let connector = TlsConnector::from(Arc::new(tls_config));
         let tls_server_name = ServerName::try_from(server_name)
             .map_err(|error| anyhow!("invalid anytls server name: {error}"))?;
-        let mut stream = timeout(
-            Duration::from_millis(timeout_ms),
+        let mut stream = run_dial_phase(
+            timeout_ms,
+            "anytls tls handshake",
             connector.connect(tls_server_name, tcp),
         )
-        .await
-        .context("anytls tls handshake timed out")?
+        .await?
         .context("anytls tls handshake failed")?;
 
         let password_hash: [u8; 32] = Sha256::digest(self.password.as_bytes()).into();

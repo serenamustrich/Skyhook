@@ -32,9 +32,9 @@ use super::{
     io::read_exact_or_eof,
     transports::{
         connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_websocket_transport_without_headers,
-        tls_client_config,
+        run_dial_phase, tls_client_config,
     },
-    udp::{KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    udp::{udp_session_key, KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -73,6 +73,10 @@ impl Outbound for VmessOutbound {
 
     fn capability(&self) -> OutboundCapability {
         OutboundCapability::tcp_udp("vmess-command-udp-session-pool")
+    }
+
+    fn supports_udp_dialer_proxy(&self) -> bool {
+        true
     }
 
     async fn connect(
@@ -179,12 +183,12 @@ impl VmessOutbound {
             let connector = TlsConnector::from(Arc::new(tls_config));
             let tls_server_name = ServerName::try_from(server_name.clone())
                 .map_err(|error| anyhow!("invalid vmess server name: {error}"))?;
-            let stream = timeout(
-                Duration::from_millis(timeout_ms),
+            let stream = run_dial_phase(
+                timeout_ms,
+                "vmess tls handshake",
                 connector.connect(tls_server_name, tcp),
             )
-            .await
-            .context("vmess tls handshake timed out")?
+            .await?
             .context("vmess tls handshake failed")?;
             if network == "ws" || network == "websocket" {
                 return open_websocket_transport_without_headers(
@@ -256,7 +260,12 @@ impl VmessOutbound {
         destination: &Destination,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<VmessUdpSession>>> {
-        let key = destination.authority();
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
         let mut pool = self.udp_sessions.lock().await;
         if pool.len(&key) < UDP_SESSION_POOL_SIZE {
             let session = Arc::new(TokioMutex::new(
@@ -299,7 +308,12 @@ impl VmessOutbound {
         target: &Arc<TokioMutex<VmessUdpSession>>,
     ) {
         let mut pool = self.udp_sessions.lock().await;
-        let key = destination.authority();
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
         pool.remove(&key, target);
     }
 }

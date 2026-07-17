@@ -30,11 +30,14 @@ use crate::{config::ShadowsocksPluginConfig, routing::Destination};
 use super::io::read_exact_or_eof;
 use super::{
     target::{encode_socks5_destination, parse_socks5_destination_prefix},
-    transports::{connect_tcp, open_websocket_transport_without_headers, tls_client_config},
-    udp::{
-        create_bound_udp, resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+    transports::{
+        connect_tcp, open_websocket_transport_without_headers, run_dial_phase, tls_client_config,
     },
-    BoxedStream, Outbound, OutboundCapability,
+    udp::{
+        create_bound_udp, resolve_udp_socket_addr, udp_session_key, KeyedRoundRobinSessionPool,
+        ReplayWindow64, UDP_SESSION_POOL_SIZE,
+    },
+    BoxedStream, Outbound, OutboundCapability, UdpNatMode,
 };
 
 pub(super) struct ShadowsocksOutbound {
@@ -69,10 +72,11 @@ impl ShadowsocksOutbound {
 
     async fn shadowsocks_udp_session(
         &self,
+        key: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<Mutex<ShadowsocksUdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len(key) < UDP_SESSION_POOL_SIZE {
             let server = resolve_udp_socket_addr(&self.server, self.port, timeout_ms).await?;
             let udp = create_bound_udp(server).with_context(|| {
                 format!(
@@ -87,15 +91,19 @@ impl ShadowsocksOutbound {
                 server,
                 ss2022,
             }));
-            pool.push(session.clone());
+            pool.push(key.to_string(), session.clone());
             return Ok(session);
         }
-        pool.next()
+        pool.next(key)
             .ok_or_else(|| anyhow!("shadowsocks UDP session pool is unexpectedly empty"))
     }
 
-    async fn remove_shadowsocks_udp_session(&self, target: &Arc<Mutex<ShadowsocksUdpSession>>) {
-        self.udp_sessions.lock().await.remove(target);
+    async fn remove_shadowsocks_udp_session(
+        &self,
+        key: &str,
+        target: &Arc<Mutex<ShadowsocksUdpSession>>,
+    ) {
+        self.udp_sessions.lock().await.remove(key, target);
     }
 }
 
@@ -118,6 +126,10 @@ impl Outbound for ShadowsocksOutbound {
         } else {
             OutboundCapability::tcp_udp("shadowsocks-aead-udp-session-pool")
         }
+    }
+
+    fn udp_nat_mode(&self) -> UdpNatMode {
+        UdpNatMode::EndpointIndependent
     }
 
     async fn connect(
@@ -176,12 +188,12 @@ impl Outbound for ShadowsocksOutbound {
             let connector = TlsConnector::from(Arc::new(tls_config));
             let tls_server_name = ServerName::try_from(server_name)
                 .map_err(|error| anyhow!("invalid shadowsocks plugin server name: {error}"))?;
-            let tls = timeout(
-                Duration::from_millis(timeout_ms),
+            let tls = run_dial_phase(
+                timeout_ms,
+                "shadowsocks plugin tls handshake",
                 connector.connect(tls_server_name, tcp),
             )
-            .await
-            .context("shadowsocks plugin tls handshake timed out")?
+            .await?
             .context("shadowsocks plugin tls handshake failed")?;
             Box::new(tls)
         } else {
@@ -230,7 +242,13 @@ impl Outbound for ShadowsocksOutbound {
         }
 
         let cipher = SsCipher::from_method(&self.method)?;
-        let session_handle = self.shadowsocks_udp_session(timeout_ms).await?;
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
+        let session_handle = self.shadowsocks_udp_session(&key, timeout_ms).await?;
         let mut session = session_handle.lock().await;
         let packet = encode_shadowsocks_udp_packet(
             cipher,
@@ -268,13 +286,14 @@ impl Outbound for ShadowsocksOutbound {
         .await;
         if exchange.is_err() {
             drop(session);
-            self.remove_shadowsocks_udp_session(&session_handle).await;
+            self.remove_shadowsocks_udp_session(&key, &session_handle)
+                .await;
         }
         exchange
     }
 }
 
-type ShadowsocksUdpPool = RoundRobinSessionPool<ShadowsocksUdpSession>;
+type ShadowsocksUdpPool = KeyedRoundRobinSessionPool<ShadowsocksUdpSession>;
 
 struct ShadowsocksUdpSession {
     udp: UdpSocket,
@@ -293,12 +312,7 @@ struct Ss2022ServerSession {
     last_seen: Instant,
 }
 
-#[derive(Default)]
-pub(super) struct Ss2022ReplayWindow {
-    initialized: bool,
-    highest: u64,
-    bitmap: u64,
-}
+pub(super) type Ss2022ReplayWindow = ReplayWindow64;
 
 impl Ss2022UdpState {
     fn new() -> anyhow::Result<Self> {
@@ -351,37 +365,6 @@ impl Ss2022UdpState {
         }
         session.last_seen = now;
         Ok(())
-    }
-}
-
-impl Ss2022ReplayWindow {
-    pub(super) fn accept(&mut self, packet_id: u64) -> bool {
-        if !self.initialized {
-            self.initialized = true;
-            self.highest = packet_id;
-            self.bitmap = 1;
-            return true;
-        }
-        if packet_id > self.highest {
-            let shift = packet_id - self.highest;
-            self.bitmap = if shift >= 64 {
-                1
-            } else {
-                (self.bitmap << shift) | 1
-            };
-            self.highest = packet_id;
-            return true;
-        }
-        let distance = self.highest - packet_id;
-        if distance >= 64 {
-            return false;
-        }
-        let mask = 1u64 << distance;
-        if self.bitmap & mask != 0 {
-            return false;
-        }
-        self.bitmap |= mask;
-        true
     }
 }
 

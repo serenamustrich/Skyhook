@@ -17,11 +17,11 @@ use super::{
     target::{encode_socks5_destination, read_socks5_destination_after_atyp},
     transports::{
         connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
-        open_websocket_transport, tls_client_config,
+        open_websocket_transport, run_dial_phase, tls_client_config,
     },
-    udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    udp::{udp_session_key, KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     util::hex_lower,
-    BoxedStream, Outbound, OutboundCapability,
+    BoxedStream, Outbound, OutboundCapability, UdpNatMode,
 };
 
 pub(super) struct TrojanOutbound {
@@ -40,7 +40,7 @@ pub(super) struct TrojanOutbound {
     udp_sessions: TokioMutex<TrojanUdpPool>,
 }
 
-type TrojanUdpPool = RoundRobinSessionPool<TrojanUdpSession>;
+type TrojanUdpPool = KeyedRoundRobinSessionPool<TrojanUdpSession>;
 
 struct TrojanUdpSession {
     stream: BoxedStream,
@@ -69,6 +69,14 @@ impl Outbound for TrojanOutbound {
         }
     }
 
+    fn udp_nat_mode(&self) -> UdpNatMode {
+        UdpNatMode::EndpointIndependent
+    }
+
+    fn supports_udp_dialer_proxy(&self) -> bool {
+        true
+    }
+
     async fn connect(
         &self,
         destination: &Destination,
@@ -87,7 +95,13 @@ impl Outbound for TrojanOutbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        let session_handle = self.trojan_udp_session(timeout_ms).await?;
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
+        let session_handle = self.trojan_udp_session(&key, timeout_ms).await?;
         let mut session = session_handle.lock().await;
         let packet = encode_trojan_udp_packet(destination, payload)?;
         let exchange = timeout(Duration::from_millis(timeout_ms), async {
@@ -101,7 +115,7 @@ impl Outbound for TrojanOutbound {
         .context("trojan udp exchange timed out")?;
         if exchange.is_err() {
             drop(session);
-            self.remove_trojan_udp_session(&session_handle).await;
+            self.remove_trojan_udp_session(&key, &session_handle).await;
         }
         exchange
     }
@@ -161,12 +175,12 @@ impl TrojanOutbound {
         let connector = TlsConnector::from(Arc::new(tls_config));
         let tls_server_name = ServerName::try_from(server_name.clone())
             .map_err(|error| anyhow!("invalid trojan server name: {error}"))?;
-        let stream = timeout(
-            Duration::from_millis(timeout_ms),
+        let stream = run_dial_phase(
+            timeout_ms,
+            "trojan tls handshake",
             connector.connect(tls_server_name, tcp),
         )
-        .await
-        .context("trojan tls handshake timed out")?
+        .await?
         .context("trojan tls handshake failed")?;
 
         match network.as_str() {
@@ -212,17 +226,18 @@ impl TrojanOutbound {
 
     async fn trojan_udp_session(
         &self,
+        key: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<TrojanUdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len(key) < UDP_SESSION_POOL_SIZE {
             let session = Arc::new(TokioMutex::new(
                 self.open_trojan_udp_session(timeout_ms).await?,
             ));
-            pool.push(session.clone());
+            pool.push(key.to_string(), session.clone());
             return Ok(session);
         }
-        pool.next()
+        pool.next(key)
             .ok_or_else(|| anyhow!("trojan UDP session pool is unexpectedly empty"))
     }
 
@@ -238,9 +253,13 @@ impl TrojanOutbound {
         Ok(TrojanUdpSession { stream })
     }
 
-    async fn remove_trojan_udp_session(&self, target: &Arc<TokioMutex<TrojanUdpSession>>) {
+    async fn remove_trojan_udp_session(
+        &self,
+        key: &str,
+        target: &Arc<TokioMutex<TrojanUdpSession>>,
+    ) {
         let mut pool = self.udp_sessions.lock().await;
-        pool.remove(target);
+        pool.remove(key, target);
     }
 }
 

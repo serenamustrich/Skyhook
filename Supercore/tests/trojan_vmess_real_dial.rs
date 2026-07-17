@@ -1378,7 +1378,10 @@ async fn trojan_tls_handshake_respects_timeout() -> anyhow::Result<()> {
         Ok(_) => return Err(anyhow!("stalled Trojan TLS handshake did not time out")),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("trojan tls handshake timed out"));
+    assert!(
+        error.to_string().contains("trojan tls handshake timed out"),
+        "unexpected timeout error: {error:#}"
+    );
     server.abort();
     Ok(())
 }

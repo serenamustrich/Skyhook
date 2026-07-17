@@ -15,9 +15,10 @@ use super::{
     target::{encode_socks5_destination, parse_socks5_destination_prefix},
     transports::connect_tcp,
     udp::{
-        create_bound_udp, resolve_udp_socket_addr, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE,
+        create_bound_udp, resolve_udp_socket_addr, udp_session_key, KeyedRoundRobinSessionPool,
+        UDP_SESSION_POOL_SIZE,
     },
-    BoxedStream, Outbound, OutboundCapability,
+    BoxedStream, Outbound, OutboundCapability, UdpNatMode,
 };
 
 pub(super) struct Socks5Outbound {
@@ -29,7 +30,7 @@ pub(super) struct Socks5Outbound {
     udp_sessions: Mutex<Socks5UdpPool>,
 }
 
-type Socks5UdpPool = RoundRobinSessionPool<Socks5UdpSession>;
+type Socks5UdpPool = KeyedRoundRobinSessionPool<Socks5UdpSession>;
 
 struct Socks5UdpSession {
     _control: Arc<Mutex<BoxedStream>>,
@@ -57,15 +58,16 @@ impl Socks5Outbound {
 
     async fn socks5_udp_session(
         &self,
+        key: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<Mutex<Socks5UdpSession>>> {
         let mut pool = self.udp_sessions.lock().await;
-        if pool.len() < UDP_SESSION_POOL_SIZE {
+        if pool.len(key) < UDP_SESSION_POOL_SIZE {
             let session = Arc::new(Mutex::new(self.open_socks5_udp_session(timeout_ms).await?));
-            pool.push(session.clone());
+            pool.push(key.to_string(), session.clone());
             return Ok(session);
         }
-        pool.next()
+        pool.next(key)
             .ok_or_else(|| anyhow!("socks5 UDP session pool is unexpectedly empty"))
     }
 
@@ -100,8 +102,8 @@ impl Socks5Outbound {
         })
     }
 
-    async fn remove_socks5_udp_session(&self, target: &Arc<Mutex<Socks5UdpSession>>) {
-        self.udp_sessions.lock().await.remove(target);
+    async fn remove_socks5_udp_session(&self, key: &str, target: &Arc<Mutex<Socks5UdpSession>>) {
+        self.udp_sessions.lock().await.remove(key, target);
     }
 }
 
@@ -117,6 +119,10 @@ impl Outbound for Socks5Outbound {
 
     fn capability(&self) -> OutboundCapability {
         OutboundCapability::tcp_udp("socks5-udp-associate-session-pool")
+    }
+
+    fn udp_nat_mode(&self) -> UdpNatMode {
+        UdpNatMode::EndpointIndependent
     }
 
     async fn connect(
@@ -149,7 +155,13 @@ impl Outbound for Socks5Outbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
-        let session_handle = self.socks5_udp_session(timeout_ms).await?;
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
+        let session_handle = self.socks5_udp_session(&key, timeout_ms).await?;
         let exchange = {
             let session = session_handle.lock().await;
             async {
@@ -181,7 +193,7 @@ impl Outbound for Socks5Outbound {
             .await
         };
         if exchange.is_err() {
-            self.remove_socks5_udp_session(&session_handle).await;
+            self.remove_socks5_udp_session(&key, &session_handle).await;
         }
         exchange
     }

@@ -1,15 +1,14 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use rustls_pki_types::ServerName;
-use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use crate::routing::Destination;
 
 use super::{
-    transports::{connect_tcp, establish_http_connect, tls_client_config},
+    transports::{connect_tcp, establish_http_connect, run_dial_phase, tls_client_config},
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -87,12 +86,12 @@ impl Outbound for NaiveOutbound {
         let connector = TlsConnector::from(Arc::new(tls_config));
         let tls_server_name = ServerName::try_from(server_name)
             .map_err(|error| anyhow!("invalid naive server name: {error}"))?;
-        let mut stream = timeout(
-            Duration::from_millis(timeout_ms),
+        let mut stream = run_dial_phase(
+            timeout_ms,
+            "naive tls handshake",
             connector.connect(tls_server_name, tcp),
         )
-        .await
-        .context("naive tls handshake timed out")?
+        .await?
         .context("naive tls handshake failed")?;
         establish_http_connect(
             &mut stream,

@@ -33,9 +33,9 @@ use crate::routing::Destination;
 use super::{
     transports::{
         connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_websocket_transport_without_headers,
-        tls_client_config, NoCertificateVerification,
+        run_dial_phase, tls_client_config, NoCertificateVerification,
     },
-    udp::{KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
+    udp::{udp_session_key, KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
 };
 
@@ -91,6 +91,10 @@ impl Outbound for VlessOutbound {
         } else {
             OutboundCapability::tcp_udp("vless-command-udp-session-pool")
         }
+    }
+
+    fn supports_udp_dialer_proxy(&self) -> bool {
+        true
     }
 
     async fn connect(
@@ -283,12 +287,12 @@ impl VlessOutbound {
             let connector = TlsConnector::from(Arc::new(tls_config));
             let tls_server_name = ServerName::try_from(server_name.clone())
                 .map_err(|error| anyhow!("invalid vless server name: {error}"))?;
-            let stream = timeout(
-                Duration::from_millis(timeout_ms),
+            let stream = run_dial_phase(
+                timeout_ms,
+                "vless tls handshake",
                 connector.connect(tls_server_name, tcp),
             )
-            .await
-            .context("vless tls handshake timed out")?
+            .await?
             .context("vless tls handshake failed")?;
             if network == "ws" || network == "websocket" {
                 return open_websocket_transport_without_headers(
@@ -362,7 +366,12 @@ impl VlessOutbound {
         network: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TokioMutex<VlessUdpSession>>> {
-        let key = destination.authority();
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
         let mut pool = self.udp_sessions.lock().await;
         if pool.len(&key) < UDP_SESSION_POOL_SIZE {
             let session = Arc::new(TokioMutex::new(
@@ -404,7 +413,12 @@ impl VlessOutbound {
         target: &Arc<TokioMutex<VlessUdpSession>>,
     ) {
         let mut pool = self.udp_sessions.lock().await;
-        let key = destination.authority();
+        let key = udp_session_key(
+            self.kind(),
+            self.name(),
+            self.udp_nat_mode(),
+            Some(destination),
+        );
         pool.remove(&key, target);
     }
 }
