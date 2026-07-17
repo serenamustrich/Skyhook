@@ -578,26 +578,29 @@ impl SubscriptionNode {
                     .transpose()
                     .map_err(|_| anyhow!("vmess node {} has invalid alterId", self.name))?
                     .unwrap_or(0);
-                if alter_id != 0 {
-                    return Err(anyhow!(
-                        "vmess node {} uses legacy alterId {}; only AEAD alterId=0 is supported",
-                        self.name,
-                        alter_id
-                    ));
-                }
-                let network = self
+                let mut network = self
                     .params
                     .get("network")
-                    .or_else(|| self.params.get("type"))
                     .or_else(|| self.params.get("net"))
+                    .or_else(|| self.params.get("type"))
                     .map(|item| item.to_ascii_lowercase())
                     .unwrap_or_else(|| "tcp".to_string());
+                let header_type = self
+                    .params
+                    .get("headerType")
+                    .or_else(|| self.params.get("type"))
+                    .map(|item| item.trim().to_ascii_lowercase());
+                if network == "tcp" && header_type.as_deref() == Some("http") {
+                    network = "http".to_string();
+                }
                 if network != "tcp"
                     && network != "ws"
                     && network != "websocket"
                     && network != "grpc"
                     && network != "h2"
                     && network != "http"
+                    && network != "httpupgrade"
+                    && network != "http-upgrade"
                 {
                     return Err(anyhow!(
                         "vmess node {} uses unsupported network {}",
@@ -636,6 +639,7 @@ impl SubscriptionNode {
                     server: self.server.clone(),
                     port: self.port,
                     uuid,
+                    alter_id,
                     cipher,
                     tls,
                     sni: self
@@ -645,10 +649,10 @@ impl SubscriptionNode {
                         .cloned(),
                     skip_cert_verify: bool_param(&self.params, "skip-cert-verify")
                         || bool_param(&self.params, "allowInsecure"),
-                    network: Some(if network == "websocket" {
-                        "ws".to_string()
-                    } else {
-                        network
+                    network: Some(match network.as_str() {
+                        "websocket" => "ws".to_string(),
+                        "http-upgrade" => "httpupgrade".to_string(),
+                        _ => network,
                     }),
                     ws_path: self.params.get("path").cloned(),
                     ws_host: self
@@ -657,6 +661,8 @@ impl SubscriptionNode {
                         .or_else(|| self.params.get("ws-host"))
                         .cloned(),
                     grpc_service_name: grpc_service_name(&self.params),
+                    transport_headers: transport_headers(&self.params),
+                    alpn: string_list_param(&self.params, &["alpn"]),
                 })
             }
             NodeProtocol::Vless => {
@@ -1270,7 +1276,17 @@ fn parse_vmess_uri(value: &str) -> anyhow::Result<SubscriptionNode> {
         .ok_or_else(|| anyhow!("vmess is missing port"))?;
     let mut params = BTreeMap::new();
     for key in [
-        "id", "aid", "net", "type", "host", "path", "tls", "sni", "alpn", "scy",
+        "id",
+        "aid",
+        "net",
+        "type",
+        "headerType",
+        "host",
+        "path",
+        "tls",
+        "sni",
+        "alpn",
+        "scy",
     ] {
         if let Some(value) = json.get(key).and_then(json_scalar_to_string) {
             params.insert(key.to_string(), value);
@@ -2414,7 +2430,7 @@ proxies:
     }
 
     #[test]
-    fn refuses_legacy_vmess_alter_id() {
+    fn preserves_legacy_vmess_alter_id() {
         let text = r#"
 proxies:
   - name: VM-OLD
@@ -2426,8 +2442,71 @@ proxies:
 "#;
 
         let doc = parse_subscription(text).unwrap();
-        let error = doc.nodes[0].to_outbound_config().unwrap_err();
-        assert!(error.to_string().contains("legacy alterId"));
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Vmess { alter_id, .. } => assert_eq!(alter_id, 64),
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converts_standard_vmess_uri_without_confusing_header_type_for_network() {
+        let json = r#"{"v":"2","ps":"VM-URI","add":"vm.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"64","scy":"aes-128-gcm","net":"ws","type":"none","host":"cdn.example.com","path":"/ray","tls":"tls","sni":"origin.example.com","alpn":"http/1.1"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(json);
+        let doc = parse_subscription(&format!("vmess://{encoded}")).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Vmess {
+                name,
+                server,
+                port,
+                alter_id,
+                cipher,
+                network,
+                ws_path,
+                ws_host,
+                tls,
+                sni,
+                alpn,
+                ..
+            } => {
+                assert_eq!(name, "VM-URI");
+                assert_eq!(server, "vm.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(alter_id, 64);
+                assert_eq!(cipher, "aes-128-gcm");
+                assert_eq!(network.as_deref(), Some("ws"));
+                assert_eq!(ws_path.as_deref(), Some("/ray"));
+                assert_eq!(ws_host.as_deref(), Some("cdn.example.com"));
+                assert!(tls);
+                assert_eq!(sni.as_deref(), Some("origin.example.com"));
+                assert_eq!(alpn, vec!["http/1.1"]);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_standard_vmess_tcp_http_header_to_http_camouflage() {
+        let json = r#"{"v":"2","ps":"VM-HTTP","add":"vm.example.com","port":80,"id":"11111111-1111-1111-1111-111111111111","aid":0,"net":"tcp","type":"http","host":"cdn.example.com","path":"/http"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(json);
+        let doc = parse_subscription(&format!("vmess://{encoded}")).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+
+        match outbound {
+            OutboundConfig::Vmess {
+                network,
+                ws_path,
+                ws_host,
+                ..
+            } => {
+                assert_eq!(network.as_deref(), Some("http"));
+                assert_eq!(ws_path.as_deref(), Some("/http"));
+                assert_eq!(ws_host.as_deref(), Some("cdn.example.com"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
     }
 
     #[test]

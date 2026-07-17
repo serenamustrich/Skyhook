@@ -495,6 +495,8 @@ pub enum OutboundConfig {
         server: String,
         port: u16,
         uuid: String,
+        #[serde(default, alias = "alterId", alias = "aid")]
+        alter_id: u16,
         #[serde(default = "default_vmess_cipher")]
         cipher: String,
         #[serde(default)]
@@ -511,6 +513,10 @@ pub enum OutboundConfig {
         ws_host: Option<String>,
         #[serde(default)]
         grpc_service_name: Option<String>,
+        #[serde(default)]
+        transport_headers: BTreeMap<String, String>,
+        #[serde(default)]
+        alpn: Vec<String>,
     },
     Vless {
         name: String,

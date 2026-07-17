@@ -2,7 +2,7 @@
 //!
 //! 这些测试**只通过公开 API** (`supercore::outbound::build_outbounds` +
 //! `supercore::config::OutboundConfig::{Trojan,Vmess}`) 拨号到 127.0.0.1 mock server，
-//! 在 mock server 侧用公开 crypto crates (aes-gcm / sha2 / sha3 / md5 / crc32c) 解码客户端
+//! 在 mock server 侧用公开 crypto crates (aes-gcm / sha2 / sha3 / md5 / crc32fast) 解码客户端
 //! 发上来的 wire bytes 来验证协议格式正确。
 //!
 //! ## 覆盖矩阵
@@ -18,10 +18,16 @@
 //! | `trojan_udp_over_ws_real_dial` | Trojan | TLS + WebSocket + UDP relay | transport 内 UDP 回环 |
 //! | `vmess_tcp_aead_real_dial` | VMess | TCP (alterId=0, AEAD) | 解密 header + chunk |
 //! | `vmess_alterid_zero_explicit` | VMess | TCP | alterId=0 显式覆盖 |
+//! | `vmess_legacy_alter_id_real_dial` | VMess | TCP (legacy) | alterId 派生认证 + CFB header |
+//! | `vmess_large_bidirectional_stream_and_half_close` | VMess | TCP | 96KB 多帧 + 认证 EOF |
 //! | `vmess_ws_transport_real_dial` | VMess | WebSocket (plain) | Upgrade 握手 + 解密 |
 //! | `vmess_grpc_transport_real_dial` | VMess | gRPC (plain) | h2 + 解密 |
 //! | `vmess_h2_transport_real_dial` | VMess | HTTP/2 (plain) | h2 PUT + 解密 |
+//! | `vmess_http_camouflage_real_dial` | VMess | HTTP/1.1 | 首包伪装 + prefetched response |
+//! | `vmess_http_upgrade_real_dial` | VMess | HTTPUpgrade | 101 + raw stream |
 //! | `vmess_udp_real_dial` | VMess | TCP-tunneled UDP | AEAD chunk 解析 + 回包 |
+//! | `vmess_udp_keeps_destinations_in_separate_associations` | VMess | UDP | 多目的 session 隔离 |
+//! | `vmess_udp_timeout_evicts_stale_session` | VMess | UDP | 超时淘汰与恢复 |
 //!
 //! 所有 test 都使用 `127.0.0.1`，不连接真实互联网。
 
@@ -31,16 +37,18 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use aes::{cipher::BlockDecrypt, Aes128};
 use aes_gcm::{
     aead::{Aead, Payload},
     Aes128Gcm, KeyInit, Nonce,
 };
 use anyhow::anyhow;
 use bytes::{Buf, Bytes, BytesMut};
-use crc32c::crc32c;
+use cfb_mode::cipher::KeyIvInit as _;
+use crc32fast::hash as crc32_ieee;
 use h2::server::handshake as h2_server_handshake;
 use http::{Request, Response};
 use md5::{Digest, Md5};
@@ -50,7 +58,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha1::Sha1;
 use sha2::{Sha224, Sha256};
 use sha3::digest::{ExtendableOutput, Update};
-use sha3::Shake128;
+use sha3::{Shake128, Shake128Reader};
 use supercore::{config::OutboundConfig, outbound::build_outbounds, routing::Destination};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf},
@@ -114,6 +122,10 @@ fn vmess_sha256_16(data: &[u8]) -> [u8; 16] {
     let mut output = [0u8; 16];
     output.copy_from_slice(&digest[..16]);
     output
+}
+
+fn vmess_md5_16(data: &[u8]) -> [u8; 16] {
+    Md5::digest(data).into()
 }
 
 fn vmess_instruction_key(user_id: &[u8; 16]) -> [u8; 16] {
@@ -195,27 +207,29 @@ fn find_http_header_end(data: &[u8]) -> Option<usize> {
 }
 
 struct LengthMask {
-    shake: Shake128,
+    reader: Shake128Reader,
 }
 
 impl LengthMask {
     fn new(seed: &[u8]) -> Self {
         let mut shake = Shake128::default();
         Update::update(&mut shake, seed);
-        Self { shake }
+        Self {
+            reader: shake.finalize_xof(),
+        }
     }
 
     fn next(&mut self) -> u16 {
         let mut mask = [0u8; 2];
-        let mut xof = self.shake.clone().finalize_xof();
         use sha3::digest::XofReader;
-        xof.read(&mut mask);
+        self.reader.read(&mut mask);
         u16::from_be_bytes(mask)
     }
 }
 
 /// 解密 VMess client 端发出的第一个请求 (auth_id + encrypted_len + nonce + encrypted_header)
 /// 返回 (data_iv, data_key, response_auth, command, destination, cipher_method)
+#[derive(Debug)]
 struct VmessDecryptedRequest {
     data_iv: [u8; 16],
     data_key: [u8; 16],
@@ -237,8 +251,18 @@ where
 
     let mut auth_id = [0u8; 16];
     reader.read_exact(&mut auth_id).await?;
-
-    // AES-ECB auth ID verification skipped; trust the timestamp window.
+    let auth_key = vmess_kdf(&instruction_key, &[b"AES Auth ID Encryption"]);
+    let auth_cipher = Aes128::new_from_slice(&auth_key[..16])?;
+    let mut auth_plaintext = auth_id;
+    auth_cipher.decrypt_block((&mut auth_plaintext).into());
+    let timestamp = u64::from_be_bytes(auth_plaintext[..8].try_into()?);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if now.abs_diff(timestamp) > 120 {
+        return Err(anyhow!("VMess AuthID clock skew exceeds 120 seconds"));
+    }
+    if auth_plaintext[12..] != crc32_ieee(&auth_plaintext[..12]).to_be_bytes() {
+        return Err(anyhow!("VMess AuthID CRC32 IEEE mismatch"));
+    }
 
     let mut encrypted_len = [0u8; 2 + 16]; // 18 bytes (2 len + 16 tag)
     reader.read_exact(&mut encrypted_len).await?;
@@ -279,7 +303,11 @@ where
         &encrypted_header,
     )?;
 
-    // Header layout (matches supercore's own in-file test reader):
+    parse_vmess_request_header(&header)
+}
+
+fn parse_vmess_request_header(header: &[u8]) -> anyhow::Result<VmessDecryptedRequest> {
+    // Header layout (matches the public VMess request format):
     //   byte 0         = version (0x01)
     //   bytes 1..17    = data_iv (16)
     //   bytes 17..33   = data_key (16)
@@ -379,11 +407,122 @@ where
     })
 }
 
+async fn read_legacy_vmess_request<R>(
+    reader: &mut R,
+    primary_user_id: &[u8; 16],
+    alter_id_count: u16,
+) -> anyhow::Result<VmessDecryptedRequest>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut authentication = [0u8; 16];
+    reader.read_exact(&mut authentication).await?;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let accepted_user_ids = legacy_vmess_user_ids(primary_user_id, alter_id_count);
+    let timestamp = (now.saturating_sub(120)..=now.saturating_add(120))
+        .find(|timestamp| {
+            accepted_user_ids.iter().any(|user_id| {
+                legacy_vmess_hmac_md5(user_id, &timestamp.to_be_bytes()) == authentication
+            })
+        })
+        .ok_or_else(|| anyhow!("legacy vmess authentication id did not match clock window"))?;
+
+    let instruction_key = vmess_instruction_key(primary_user_id);
+    let timestamp_iv = legacy_vmess_timestamp_iv(timestamp);
+    let mut decryptor =
+        cfb_mode::BufDecryptor::<Aes128>::new_from_slices(&instruction_key, &timestamp_iv)
+            .map_err(|_| anyhow!("invalid legacy vmess header key or iv"))?;
+
+    let mut header = vec![0u8; 41];
+    reader.read_exact(&mut header).await?;
+    decryptor.decrypt(&mut header);
+    let padding_len = (header[35] >> 4) as usize;
+    let address_len = match header[40] {
+        0x01 => 4,
+        0x02 => {
+            let mut length = [0u8; 1];
+            reader.read_exact(&mut length).await?;
+            decryptor.decrypt(&mut length);
+            header.push(length[0]);
+            length[0] as usize
+        }
+        0x03 => 16,
+        other => return Err(anyhow!("unsupported legacy vmess atyp {other}")),
+    };
+    let mut tail = vec![0u8; address_len + padding_len + 4];
+    reader.read_exact(&mut tail).await?;
+    decryptor.decrypt(&mut tail);
+    header.extend_from_slice(&tail);
+    parse_vmess_request_header(&header)
+}
+
+fn legacy_vmess_user_ids(primary_user_id: &[u8; 16], alter_id_count: u16) -> Vec<[u8; 16]> {
+    let mut accepted = Vec::with_capacity(alter_id_count as usize + 1);
+    accepted.push(*primary_user_id);
+    let mut current = *primary_user_id;
+    for _ in 0..alter_id_count {
+        current = legacy_vmess_next_user_id(&current);
+        accepted.push(current);
+    }
+    accepted
+}
+
+fn legacy_vmess_next_user_id(user_id: &[u8; 16]) -> [u8; 16] {
+    let mut input = user_id.to_vec();
+    input.extend_from_slice(b"16167dc8-16b6-4e6d-b8bb-65dd68113a81");
+    let mut next: [u8; 16] = Md5::digest(&input).into();
+    if &next == user_id {
+        input.extend_from_slice(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
+        next = Md5::digest(&input).into();
+    }
+    next
+}
+
+fn legacy_vmess_timestamp_iv(timestamp: u64) -> [u8; 16] {
+    let timestamp = timestamp.to_be_bytes();
+    let mut input = [0u8; 32];
+    for chunk in input.chunks_exact_mut(timestamp.len()) {
+        chunk.copy_from_slice(&timestamp);
+    }
+    Md5::digest(input).into()
+}
+
+fn legacy_vmess_hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
+    let key = if key.len() > 64 {
+        Md5::digest(key).to_vec()
+    } else {
+        key.to_vec()
+    };
+    let mut inner = [0x36u8; 64];
+    let mut outer = [0x5cu8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner[index] ^= *byte;
+        outer[index] ^= *byte;
+    }
+    let mut inner_input = inner.to_vec();
+    inner_input.extend_from_slice(data);
+    let inner_hash = Md5::digest(inner_input);
+    let mut outer_input = outer.to_vec();
+    outer_input.extend_from_slice(&inner_hash);
+    Md5::digest(outer_input).into()
+}
+
 /// Server-side 解密 VMess chunk (post-handshake)
 fn vmess_decrypt_chunk(
     cipher_method: u8,
     data_key: &[u8; 16],
     data_iv: &[u8; 16],
+    body_with_tag: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    vmess_decrypt_chunk_at(cipher_method, data_key, data_iv, 0, body_with_tag)
+}
+
+fn vmess_decrypt_chunk_at(
+    cipher_method: u8,
+    data_key: &[u8; 16],
+    data_iv: &[u8; 16],
+    counter: u16,
     body_with_tag: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     // Chunk format: 2-byte masked length + body (with 16-byte tag if AEAD)
@@ -397,8 +536,7 @@ fn vmess_decrypt_chunk(
     // Construct nonce: first 2 bytes = counter (big-endian), rest = data_iv[2..12]
     let mut nonce = [0u8; 12];
     nonce[2..].copy_from_slice(&data_iv[2..12]);
-    // Counter is 0 for the first chunk sent by client
-    nonce[0..2].copy_from_slice(&0u16.to_be_bytes());
+    nonce[0..2].copy_from_slice(&counter.to_be_bytes());
 
     // For AEAD methods use aes-gcm
     if cipher_method == 3 {
@@ -465,6 +603,23 @@ where
     vmess_decrypt_chunk(cipher_method, data_key, data_iv, &body)
 }
 
+async fn read_legacy_vmess_first_chunk<R>(
+    reader: &mut R,
+    cipher_method: u8,
+    data_key: &[u8; 16],
+    data_iv: &[u8; 16],
+) -> anyhow::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut length = [0u8; 2];
+    reader.read_exact(&mut length).await?;
+    let body_length = u16::from_be_bytes(length) as usize;
+    let mut body = vec![0u8; body_length];
+    reader.read_exact(&mut body).await?;
+    vmess_decrypt_chunk(cipher_method, data_key, data_iv, &body)
+}
+
 /// Build a server-side VMess response header (encrypted with response_header_key/iv)
 async fn build_vmess_response_header(
     response_header_key: &[u8; 16],
@@ -494,6 +649,19 @@ async fn build_vmess_response_header(
     Ok(out)
 }
 
+fn build_legacy_vmess_response_header(
+    response_header_key: &[u8; 16],
+    response_header_iv: &[u8; 16],
+    response_authentication: u8,
+) -> anyhow::Result<Vec<u8>> {
+    let mut header = vec![response_authentication, 0x00, 0x00, 0x00];
+    let mut encryptor =
+        cfb_mode::BufEncryptor::<Aes128>::new_from_slices(response_header_key, response_header_iv)
+            .map_err(|_| anyhow!("invalid legacy vmess response key or iv"))?;
+    encryptor.encrypt(&mut header);
+    Ok(header)
+}
+
 /// Server-side VMess chunk writer
 fn vmess_write_chunk(
     cipher_method: u8,
@@ -502,11 +670,23 @@ fn vmess_write_chunk(
     length_mask_seed: &[u8],
     payload: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
+    let mut mask = LengthMask::new(length_mask_seed);
+    vmess_write_chunk_at(cipher_method, key, iv, 0, mask.next(), payload)
+}
+
+fn vmess_write_chunk_at(
+    cipher_method: u8,
+    key: &[u8],
+    iv: &[u8],
+    counter: u16,
+    length_mask: u16,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let body_with_tag = match cipher_method {
         3 => {
             let mut nonce = [0u8; 12];
             nonce[2..].copy_from_slice(&iv[2..12]);
-            nonce[0..2].copy_from_slice(&0u16.to_be_bytes());
+            nonce[0..2].copy_from_slice(&counter.to_be_bytes());
             Aes128Gcm::new_from_slice(key)
                 .map_err(|_| anyhow!("aes key"))?
                 .encrypt(Nonce::from_slice(&nonce), payload)
@@ -516,7 +696,7 @@ fn vmess_write_chunk(
             use chacha20poly1305::ChaCha20Poly1305;
             let mut nonce = [0u8; 12];
             nonce[2..].copy_from_slice(&iv[2..12]);
-            nonce[0..2].copy_from_slice(&0u16.to_be_bytes());
+            nonce[0..2].copy_from_slice(&counter.to_be_bytes());
             ChaCha20Poly1305::new_from_slice(key)
                 .map_err(|_| anyhow!("chacha key"))?
                 .encrypt(chacha20poly1305::Nonce::from_slice(&nonce), payload)
@@ -526,12 +706,97 @@ fn vmess_write_chunk(
         m => return Err(anyhow!("unsupported vmess cipher method {m}")),
     };
 
-    let mut mask = LengthMask::new(length_mask_seed);
-    let masked_len = (body_with_tag.len() as u16) ^ mask.next();
+    let masked_len = (body_with_tag.len() as u16) ^ length_mask;
     let mut out = Vec::with_capacity(2 + body_with_tag.len());
     out.extend_from_slice(&masked_len.to_be_bytes());
     out.extend_from_slice(&body_with_tag);
     Ok(out)
+}
+
+fn vmess_write_unmasked_chunk(
+    cipher_method: u8,
+    key: &[u8],
+    iv: &[u8],
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut chunk = vmess_write_chunk(cipher_method, key, iv, &[], payload)?;
+    let body = chunk.split_off(2);
+    let mut output = Vec::with_capacity(2 + body.len());
+    output.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    output.extend_from_slice(&body);
+    Ok(output)
+}
+
+struct StatefulVmessChunkReader {
+    cipher_method: u8,
+    key: [u8; 16],
+    iv: [u8; 16],
+    length_mask: LengthMask,
+    counter: u16,
+}
+
+impl StatefulVmessChunkReader {
+    fn new(cipher_method: u8, key: [u8; 16], iv: [u8; 16]) -> Self {
+        Self {
+            cipher_method,
+            key,
+            iv,
+            length_mask: LengthMask::new(&iv),
+            counter: 0,
+        }
+    }
+
+    async fn read<R>(&mut self, reader: &mut R) -> anyhow::Result<Option<Vec<u8>>>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut masked_length = [0u8; 2];
+        reader.read_exact(&mut masked_length).await?;
+        let body_length = (u16::from_be_bytes(masked_length) ^ self.length_mask.next()) as usize;
+        let mut body = vec![0u8; body_length];
+        reader.read_exact(&mut body).await?;
+        let plaintext =
+            vmess_decrypt_chunk_at(self.cipher_method, &self.key, &self.iv, self.counter, &body)?;
+        self.counter = self.counter.wrapping_add(1);
+        if plaintext.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(plaintext))
+        }
+    }
+}
+
+struct StatefulVmessChunkWriter {
+    cipher_method: u8,
+    key: Vec<u8>,
+    iv: [u8; 16],
+    length_mask: LengthMask,
+    counter: u16,
+}
+
+impl StatefulVmessChunkWriter {
+    fn new(cipher_method: u8, key: Vec<u8>, iv: [u8; 16]) -> Self {
+        Self {
+            cipher_method,
+            key,
+            iv,
+            length_mask: LengthMask::new(&iv),
+            counter: 0,
+        }
+    }
+
+    fn write(&mut self, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let chunk = vmess_write_chunk_at(
+            self.cipher_method,
+            &self.key,
+            &self.iv,
+            self.counter,
+            self.length_mask.next(),
+            payload,
+        )?;
+        self.counter = self.counter.wrapping_add(1);
+        Ok(chunk)
+    }
 }
 
 /// Self-signed TLS cert builder + acceptor
@@ -1943,6 +2208,26 @@ const TEST_UUID_BYTES: [u8; 16] = [
 ];
 const TEST_UUID_STR: &str = "11111111-1111-1111-1111-111111111111";
 
+fn vmess_tcp_test_config(name: &str, port: u16) -> OutboundConfig {
+    OutboundConfig::Vmess {
+        name: name.to_string(),
+        server: "127.0.0.1".to_string(),
+        port,
+        uuid: TEST_UUID_STR.to_string(),
+        alter_id: 0,
+        cipher: "auto".to_string(),
+        tls: false,
+        sni: None,
+        skip_cert_verify: false,
+        network: None,
+        ws_path: None,
+        ws_host: None,
+        grpc_service_name: None,
+        transport_headers: BTreeMap::new(),
+        alpn: Vec::new(),
+    }
+}
+
 async fn serve_vmess_tcp_inner(
     listener: TcpListener,
     expected_cipher: u8,
@@ -2020,6 +2305,57 @@ async fn serve_vmess_tcp_inner(
     Ok(())
 }
 
+async fn serve_multi_destination_vmess_udp_exchange(
+    mut stream: tokio::net::TcpStream,
+) -> anyhow::Result<Destination> {
+    let request = read_vmess_request(&mut stream, &TEST_UUID_BYTES).await?;
+    assert_eq!(request.command, 0x02, "expected UDP command");
+    let destination = Destination::new(request.destination_host.clone(), request.destination_port);
+    let (expected_payload, response_payload): (&[u8], &[u8]) =
+        match destination.authority().as_str() {
+            "one.example:1001" => (b"one", b"reply-one"),
+            "two.example:2002" => (b"two", b"reply-two"),
+            other => return Err(anyhow!("unexpected VMess UDP destination {other}")),
+        };
+    let payload = read_vmess_first_chunk(
+        &mut stream,
+        request.cipher_method,
+        &request.data_key,
+        &request.data_iv,
+    )
+    .await?;
+    assert_eq!(payload, expected_payload);
+
+    let response_header_key = vmess_sha256_16(&request.data_key);
+    let response_header_iv = vmess_sha256_16(&request.data_iv);
+    stream
+        .write_all(
+            &build_vmess_response_header(
+                &response_header_key,
+                &response_header_iv,
+                request.response_authentication,
+            )
+            .await?,
+        )
+        .await?;
+    let response_key = match request.cipher_method {
+        4 => vmess_chacha_key(&response_header_key).to_vec(),
+        3 => response_header_key.to_vec(),
+        _ => return Err(anyhow!("unsupported cipher")),
+    };
+    stream
+        .write_all(&vmess_write_chunk(
+            request.cipher_method,
+            &response_key,
+            &response_header_iv,
+            &response_header_iv,
+            response_payload,
+        )?)
+        .await?;
+    stream.flush().await?;
+    Ok(destination)
+}
+
 /// VMess TCP AEAD (alterId=0, default cipher chacha20-poly1305)
 #[tokio::test]
 async fn vmess_tcp_aead_real_dial() -> anyhow::Result<()> {
@@ -2042,6 +2378,7 @@ async fn vmess_tcp_aead_real_dial() -> anyhow::Result<()> {
             server: "127.0.0.1".to_string(),
             port: listen_addr.port(),
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "auto".to_string(),
             tls: false,
             sni: None,
@@ -2050,6 +2387,8 @@ async fn vmess_tcp_aead_real_dial() -> anyhow::Result<()> {
             ws_path: None,
             ws_host: None,
             grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )?;
@@ -2068,8 +2407,195 @@ async fn vmess_tcp_aead_real_dial() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn vmess_large_bidirectional_stream_and_half_close() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let upload: Vec<u8> = (0..96 * 1024).map(|index| (index % 251) as u8).collect();
+    let download: Vec<u8> = upload.iter().map(|byte| byte ^ 0x5a).collect();
+    let expected_upload = upload.clone();
+    let expected_download = download.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let request = read_vmess_request(&mut stream, &TEST_UUID_BYTES).await?;
+        let mut reader =
+            StatefulVmessChunkReader::new(request.cipher_method, request.data_key, request.data_iv);
+        let mut received = Vec::with_capacity(expected_upload.len());
+        while received.len() < expected_upload.len() {
+            let chunk = reader
+                .read(&mut stream)
+                .await?
+                .ok_or_else(|| anyhow!("VMess upload ended before 96KB"))?;
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received, expected_upload);
+        assert!(
+            reader.read(&mut stream).await?.is_none(),
+            "VMess half-close did not send an authenticated EOF chunk"
+        );
+
+        let response_header_key = vmess_sha256_16(&request.data_key);
+        let response_header_iv = vmess_sha256_16(&request.data_iv);
+        stream
+            .write_all(
+                &build_vmess_response_header(
+                    &response_header_key,
+                    &response_header_iv,
+                    request.response_authentication,
+                )
+                .await?,
+            )
+            .await?;
+        let response_key = match request.cipher_method {
+            4 => vmess_chacha_key(&response_header_key).to_vec(),
+            3 => response_header_key.to_vec(),
+            _ => return Err(anyhow!("unsupported cipher")),
+        };
+        let mut writer =
+            StatefulVmessChunkWriter::new(request.cipher_method, response_key, response_header_iv);
+        for chunk in expected_download.chunks(8192) {
+            stream.write_all(&writer.write(chunk)?).await?;
+        }
+        stream.write_all(&writer.write(&[])?).await?;
+        stream.flush().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[vmess_tcp_test_config(
+            "vmess-large-stream-test",
+            listen_addr.port(),
+        )],
+        None,
+    )?;
+    let outbound = outbounds.get("vmess-large-stream-test").unwrap();
+    let mut stream = outbound
+        .connect(&Destination::new("large.example", 443), 3000)
+        .await?;
+    stream.write_all(&upload).await?;
+    stream.shutdown().await?;
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response)).await??;
+    assert_eq!(response, download);
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn vmess_wrong_uuid_is_rejected_by_peer() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let wrong_uuid = [0x22; 16];
+        let error = read_vmess_request(&mut stream, &wrong_uuid)
+            .await
+            .expect_err("VMess request authenticated with the wrong UUID");
+        assert!(
+            error.to_string().contains("AuthID"),
+            "unexpected wrong-UUID error: {error}"
+        );
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[vmess_tcp_test_config(
+            "vmess-wrong-uuid-test",
+            listen_addr.port(),
+        )],
+        None,
+    )?;
+    let outbound = outbounds.get("vmess-wrong-uuid-test").unwrap();
+    let mut stream = outbound
+        .connect(&Destination::new("target.example", 443), 3000)
+        .await?;
+    timeout(Duration::from_secs(3), server).await???;
+    let mut byte = [0u8; 1];
+    let read = timeout(Duration::from_secs(3), stream.read(&mut byte)).await??;
+    assert_eq!(read, 0, "wrong UUID connection did not close");
+    Ok(())
+}
+
+/// Legacy VMess with a derived alter ID and unmasked chunk lengths.
+#[tokio::test]
+async fn vmess_legacy_alter_id_real_dial() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let request = read_legacy_vmess_request(&mut stream, &TEST_UUID_BYTES, 1).await?;
+        assert_eq!(request.cipher_method, 3, "expected AES-128-GCM");
+        assert_eq!(request.command, 0x01, "expected TCP command");
+        assert_eq!(request.destination_host, "legacy.example");
+        assert_eq!(request.destination_port, 8443);
+
+        let payload = read_legacy_vmess_first_chunk(
+            &mut stream,
+            request.cipher_method,
+            &request.data_key,
+            &request.data_iv,
+        )
+        .await?;
+        assert_eq!(payload, b"legacy-ping");
+
+        let response_header_key = vmess_md5_16(&request.data_key);
+        let response_header_iv = vmess_md5_16(&request.data_iv);
+        let response_header = build_legacy_vmess_response_header(
+            &response_header_key,
+            &response_header_iv,
+            request.response_authentication,
+        )?;
+        stream.write_all(&response_header).await?;
+        stream
+            .write_all(&vmess_write_unmasked_chunk(
+                request.cipher_method,
+                &response_header_key,
+                &response_header_iv,
+                b"legacy-pong",
+            )?)
+            .await?;
+        stream.flush().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Vmess {
+            name: "vmess-legacy-test".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: listen_addr.port(),
+            uuid: TEST_UUID_STR.to_string(),
+            alter_id: 1,
+            cipher: "aes-128-gcm".to_string(),
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
+            network: None,
+            ws_path: None,
+            ws_host: None,
+            grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
+        }],
+        None,
+    )?;
+    let outbound = outbounds.get("vmess-legacy-test").unwrap();
+    let destination = Destination::new("legacy.example", 8443);
+    let mut stream =
+        timeout(Duration::from_secs(8), outbound.connect(&destination, 8000)).await??;
+    stream.write_all(b"legacy-ping").await?;
+    stream.flush().await?;
+
+    let mut response = [0u8; 11];
+    timeout(Duration::from_secs(3), stream.read_exact(&mut response)).await??;
+    assert_eq!(&response, b"legacy-pong");
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
 /// VMess alterId=0 explicit: alterId=0 是 VMess AEAD 模式的强制要求，
-/// Supercore 不暴露 alterId 配置（always 0），但通过 cipher="none" 可以走无加密 path。
+/// cipher="none" 走无加密 body path。
 #[tokio::test]
 async fn vmess_alterid_zero_explicit() -> anyhow::Result<()> {
     // alterId=0 + cipher=none: server sees raw TCP body with no AEAD overhead.
@@ -2139,6 +2665,7 @@ async fn vmess_alterid_zero_explicit() -> anyhow::Result<()> {
             server: "127.0.0.1".to_string(),
             port: listen_addr.port(),
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "none".to_string(),
             tls: false,
             sni: None,
@@ -2147,6 +2674,8 @@ async fn vmess_alterid_zero_explicit() -> anyhow::Result<()> {
             ws_path: None,
             ws_host: None,
             grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )?;
@@ -2161,6 +2690,236 @@ async fn vmess_alterid_zero_explicit() -> anyhow::Result<()> {
     timeout(Duration::from_secs(3), stream.read_exact(&mut response)).await??;
     assert_eq!(&response, b"pong");
     let _ = timeout(Duration::from_secs(3), server).await??;
+    Ok(())
+}
+
+/// VMess HTTP/1.1 camouflage sends the request header as the first HTTP body.
+#[tokio::test]
+async fn vmess_http_camouflage_real_dial() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut request_bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let header_end = loop {
+            if let Some(header_end) = find_http_header_end(&request_bytes) {
+                break header_end;
+            }
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                return Err(anyhow!("http camouflage request ended before headers"));
+            }
+            request_bytes.extend_from_slice(&buffer[..count]);
+        };
+        let headers = std::str::from_utf8(&request_bytes[..header_end])?;
+        assert!(headers.starts_with("GET /vmess-http HTTP/1.1\r\n"));
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Host: cdn.example.com")));
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("X-Supercore-Test: http")));
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>())
+                })
+            })
+            .transpose()?
+            .ok_or_else(|| anyhow!("http camouflage request missing Content-Length"))?;
+        while request_bytes.len() < header_end + content_length {
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                return Err(anyhow!("http camouflage request body was truncated"));
+            }
+            request_bytes.extend_from_slice(&buffer[..count]);
+        }
+        let mut request_body = &request_bytes[header_end..header_end + content_length];
+        let request = read_vmess_request(&mut request_body, &TEST_UUID_BYTES).await?;
+        assert_eq!(request.cipher_method, 3, "expected AES-128-GCM");
+        assert_eq!(request.destination_host, "http.example");
+        assert_eq!(request.destination_port, 443);
+
+        let response_header_key = vmess_sha256_16(&request.data_key);
+        let response_header_iv = vmess_sha256_16(&request.data_iv);
+        let response_header = build_vmess_response_header(
+            &response_header_key,
+            &response_header_iv,
+            request.response_authentication,
+        )
+        .await?;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        stream.write_all(&response_header).await?;
+        stream.flush().await?;
+
+        let payload = read_vmess_first_chunk(
+            &mut stream,
+            request.cipher_method,
+            &request.data_key,
+            &request.data_iv,
+        )
+        .await?;
+        assert_eq!(payload, b"http-ping");
+        stream
+            .write_all(&vmess_write_chunk(
+                request.cipher_method,
+                &response_header_key,
+                &response_header_iv,
+                &response_header_iv,
+                b"http-pong",
+            )?)
+            .await?;
+        stream.flush().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Vmess {
+            name: "vmess-http-test".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: listen_addr.port(),
+            uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
+            cipher: "aes-128-gcm".to_string(),
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
+            network: Some("http".to_string()),
+            ws_path: Some("/vmess-http".to_string()),
+            ws_host: Some("cdn.example.com".to_string()),
+            grpc_service_name: None,
+            transport_headers: BTreeMap::from([(
+                "X-Supercore-Test".to_string(),
+                "http".to_string(),
+            )]),
+            alpn: Vec::new(),
+        }],
+        None,
+    )?;
+    let outbound = outbounds.get("vmess-http-test").unwrap();
+    let destination = Destination::new("http.example", 443);
+    let mut stream =
+        timeout(Duration::from_secs(8), outbound.connect(&destination, 8000)).await??;
+    stream.write_all(b"http-ping").await?;
+    stream.flush().await?;
+    let mut response = [0u8; 9];
+    timeout(Duration::from_secs(3), stream.read_exact(&mut response)).await??;
+    assert_eq!(&response, b"http-pong");
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn vmess_http_upgrade_real_dial() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut headers = Vec::new();
+        let mut buffer = [0u8; 512];
+        while find_http_header_end(&headers).is_none() {
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                return Err(anyhow!("vmess HTTPUpgrade ended before headers"));
+            }
+            headers.extend_from_slice(&buffer[..count]);
+        }
+        let headers = std::str::from_utf8(&headers)?;
+        assert!(headers.starts_with("GET /vmess-upgrade HTTP/1.1\r\n"));
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Host: cdn.example.com")));
+        assert!(headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("X-Supercore-Test: httpupgrade")));
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\
+                  \r\n",
+            )
+            .await?;
+        stream.flush().await?;
+
+        let request = read_vmess_request(&mut stream, &TEST_UUID_BYTES).await?;
+        assert_eq!(request.destination_host, "upgrade.example");
+        assert_eq!(request.destination_port, 443);
+        let payload = read_vmess_first_chunk(
+            &mut stream,
+            request.cipher_method,
+            &request.data_key,
+            &request.data_iv,
+        )
+        .await?;
+        assert_eq!(payload, b"upgrade-ping");
+
+        let response_header_key = vmess_sha256_16(&request.data_key);
+        let response_header_iv = vmess_sha256_16(&request.data_iv);
+        stream
+            .write_all(
+                &build_vmess_response_header(
+                    &response_header_key,
+                    &response_header_iv,
+                    request.response_authentication,
+                )
+                .await?,
+            )
+            .await?;
+        let response_key = vmess_chacha_key(&response_header_key);
+        stream
+            .write_all(&vmess_write_chunk(
+                request.cipher_method,
+                &response_key,
+                &response_header_iv,
+                &response_header_iv,
+                b"upgrade-pong",
+            )?)
+            .await?;
+        stream.flush().await?;
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Vmess {
+            name: "vmess-http-upgrade-test".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: listen_addr.port(),
+            uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
+            cipher: "auto".to_string(),
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
+            network: Some("httpupgrade".to_string()),
+            ws_path: Some("/vmess-upgrade".to_string()),
+            ws_host: Some("cdn.example.com".to_string()),
+            grpc_service_name: None,
+            transport_headers: BTreeMap::from([(
+                "X-Supercore-Test".to_string(),
+                "httpupgrade".to_string(),
+            )]),
+            alpn: Vec::new(),
+        }],
+        None,
+    )?;
+    let outbound = outbounds.get("vmess-http-upgrade-test").unwrap();
+    let destination = Destination::new("upgrade.example", 443);
+    let mut stream =
+        timeout(Duration::from_secs(8), outbound.connect(&destination, 8000)).await??;
+    stream.write_all(b"upgrade-ping").await?;
+    stream.flush().await?;
+    let mut response = [0u8; 12];
+    timeout(Duration::from_secs(3), stream.read_exact(&mut response)).await??;
+    assert_eq!(&response, b"upgrade-pong");
+    timeout(Duration::from_secs(3), server).await???;
     Ok(())
 }
 
@@ -2283,6 +3042,7 @@ async fn vmess_ws_transport_real_dial() -> anyhow::Result<()> {
             server: "127.0.0.1".to_string(),
             port: listen_addr.port(),
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "auto".to_string(),
             tls: false,
             sni: None,
@@ -2291,6 +3051,8 @@ async fn vmess_ws_transport_real_dial() -> anyhow::Result<()> {
             ws_path: Some("/vmess-ws".to_string()),
             ws_host: Some("cdn.example.com".to_string()),
             grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )?;
@@ -2394,6 +3156,7 @@ async fn vmess_grpc_transport_real_dial() -> anyhow::Result<()> {
             server: "127.0.0.1".to_string(),
             port: listen_addr.port(),
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "auto".to_string(),
             tls: false,
             sni: None,
@@ -2402,6 +3165,8 @@ async fn vmess_grpc_transport_real_dial() -> anyhow::Result<()> {
             ws_path: None,
             ws_host: Some("cdn.example.com".to_string()),
             grpc_service_name: Some("vmess-grpc".to_string()),
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )?;
@@ -2490,6 +3255,7 @@ async fn vmess_h2_transport_real_dial() -> anyhow::Result<()> {
             server: "127.0.0.1".to_string(),
             port: listen_addr.port(),
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "auto".to_string(),
             tls: false,
             sni: None,
@@ -2498,6 +3264,8 @@ async fn vmess_h2_transport_real_dial() -> anyhow::Result<()> {
             ws_path: Some("/vmess-h2".to_string()),
             ws_host: Some("cdn.example.com".to_string()),
             grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )?;
@@ -2575,6 +3343,7 @@ async fn vmess_udp_real_dial() -> anyhow::Result<()> {
             server: "127.0.0.1".to_string(),
             port: listen_addr.port(),
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "auto".to_string(),
             tls: false,
             sni: None,
@@ -2583,6 +3352,8 @@ async fn vmess_udp_real_dial() -> anyhow::Result<()> {
             ws_path: None,
             ws_host: None,
             grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )?;
@@ -2596,6 +3367,144 @@ async fn vmess_udp_real_dial() -> anyhow::Result<()> {
     .await??;
     assert_eq!(response, b"echo");
     let _ = timeout(Duration::from_secs(3), server).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn vmess_oversized_udp_is_rejected_before_dial() -> anyhow::Result<()> {
+    let outbounds = build_outbounds(&[vmess_tcp_test_config("vmess-large-udp", 1)], None)?;
+    let error = outbounds
+        .get("vmess-large-udp")
+        .ok_or_else(|| anyhow!("large-UDP VMess outbound not built"))?
+        .udp_exchange(&Destination::new("udp.example", 443), &[0u8; 8193], 100)
+        .await
+        .expect_err("oversized VMess UDP unexpectedly dialed");
+    assert!(error.to_string().contains("exceeds 8192"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn vmess_udp_timeout_evicts_stale_session() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let mut stalled = Vec::new();
+        for index in 0..5 {
+            let (mut stream, _) = listener.accept().await?;
+            let request = read_vmess_request(&mut stream, &TEST_UUID_BYTES).await?;
+            assert_eq!(request.command, 0x02);
+            let payload = read_vmess_first_chunk(
+                &mut stream,
+                request.cipher_method,
+                &request.data_key,
+                &request.data_iv,
+            )
+            .await?;
+            if index < 4 {
+                assert_eq!(payload, b"timeout");
+                stalled.push(stream);
+                continue;
+            }
+            assert_eq!(payload, b"recovered");
+            let response_header_key = vmess_sha256_16(&request.data_key);
+            let response_header_iv = vmess_sha256_16(&request.data_iv);
+            stream
+                .write_all(
+                    &build_vmess_response_header(
+                        &response_header_key,
+                        &response_header_iv,
+                        request.response_authentication,
+                    )
+                    .await?,
+                )
+                .await?;
+            let response_key = vmess_chacha_key(&response_header_key);
+            stream
+                .write_all(&vmess_write_chunk(
+                    request.cipher_method,
+                    &response_key,
+                    &response_header_iv,
+                    &response_header_iv,
+                    b"recovered",
+                )?)
+                .await?;
+            stream.flush().await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[vmess_tcp_test_config(
+            "vmess-udp-timeout-eviction",
+            listen_addr.port(),
+        )],
+        None,
+    )?;
+    let outbound = outbounds
+        .get("vmess-udp-timeout-eviction")
+        .ok_or_else(|| anyhow!("timeout-eviction VMess outbound not built"))?;
+    let destination = Destination::new("echo.example", 7777);
+    for _ in 0..4 {
+        let error = outbound
+            .udp_exchange(&destination, b"timeout", 30)
+            .await
+            .expect_err("stalled VMess UDP exchange unexpectedly succeeded");
+        let message = error.to_string();
+        assert!(message.contains("vmess udp exchange") && message.contains("timed out"));
+    }
+    let response = outbound
+        .udp_exchange(&destination, b"recovered", 3000)
+        .await?;
+    assert_eq!(response, b"recovered");
+    timeout(Duration::from_secs(3), server).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn vmess_udp_keeps_destinations_in_separate_associations() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listen_addr = listener.local_addr()?;
+    let first_destination = Destination::new("one.example", 1001);
+    let second_destination = Destination::new("two.example", 2002);
+    let server = tokio::spawn(async move {
+        let first = listener.accept().await?.0;
+        let second = listener.accept().await?.0;
+        let first = tokio::spawn(serve_multi_destination_vmess_udp_exchange(first));
+        let second = tokio::spawn(serve_multi_destination_vmess_udp_exchange(second));
+        let first_destination = first.await??;
+        let second_destination = second.await??;
+        assert_ne!(first_destination, second_destination);
+        Ok::<_, anyhow::Error>(())
+    });
+
+    let outbounds = build_outbounds(
+        &[OutboundConfig::Vmess {
+            name: "vmess-multi-udp-test".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: listen_addr.port(),
+            uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
+            cipher: "auto".to_string(),
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
+            network: None,
+            ws_path: None,
+            ws_host: None,
+            grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
+        }],
+        None,
+    )?;
+    let outbound = outbounds.get("vmess-multi-udp-test").unwrap();
+    let (first, second) = tokio::join!(
+        outbound.udp_exchange(&first_destination, b"one", 3000),
+        outbound.udp_exchange(&second_destination, b"two", 3000)
+    );
+    assert_eq!(first?, b"reply-one");
+    assert_eq!(second?, b"reply-two");
+    timeout(Duration::from_secs(3), server).await???;
     Ok(())
 }
 
@@ -2826,6 +3735,7 @@ async fn smoke_outbound_builds() {
             server: "127.0.0.1".to_string(),
             port: 1,
             uuid: TEST_UUID_STR.to_string(),
+            alter_id: 0,
             cipher: "auto".to_string(),
             tls: false,
             sni: None,
@@ -2834,17 +3744,13 @@ async fn smoke_outbound_builds() {
             ws_path: None,
             ws_host: None,
             grpc_service_name: None,
+            transport_headers: BTreeMap::new(),
+            alpn: Vec::new(),
         }],
         None,
     )
     .expect("build vmess outbound");
     assert!(outbounds.contains_key("smoke"));
-}
-
-// Suppress unused warning for helpers that may not be used in every branch
-#[allow(dead_code)]
-fn _silence_crc32c_unused() -> u32 {
-    crc32c(b"unused")
 }
 
 #[allow(dead_code)]

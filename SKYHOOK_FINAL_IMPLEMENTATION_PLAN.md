@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.19（完成 `NEXT-011A` Trojan 收口）
+> 计划版本：v1.20（完成 `NEXT-011B` VMess 收口）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-011B`。
+> M2 进行中，当前直接执行点为 `NEXT-011C`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -386,7 +386,8 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A` 已完成；执行 `NEXT-011B` 收口 VMess。
+1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B` 已完成；执行
+   `NEXT-011C` 收口 VLESS/Reality/Vision。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1166,7 +1167,17 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        UDP over WS/gRPC、gRPC trailer、HTTPUpgrade 状态、96KB 双向流、半关闭、错误密码、
        空闲 UDP 隧道复用、TLS 超时和连续 UDP 超时后恢复；7 项解析/单元回归与
        `cargo check --all-targets` 通过。
-   - [ ] `NEXT-011B`：VMess 完整能力收口。
+   - [x] `NEXT-011B`：VMess 完整能力收口。
+     - 实现 alterId=0 AEAD 与 legacy alterId 的真实认证/请求头/响应头，legacy 使用公开
+       HMAC-MD5、AES-CFB 和非掩码 chunk 格式，AuthID 使用 CRC32 IEEE 并验证时钟窗口。
+     - 支持 TCP/UDP、WS、gRPC、H2、HTTP camouflage、HTTPUpgrade、自定义 transport
+       headers 和 ALPN；XHTTP 在拨号前返回明确 unsupported，不伪装为超时。
+     - 修复标准 `vmess://` JSON 中 `net` 与 header `type` 的字段优先级，并支持
+       `net=tcp + type=http` 映射到 HTTP camouflage。
+     - 14 项真实拨号覆盖 AEAD/legacy、AES/ChaCha/none、TCP/UDP、全部已声明 transport、
+       96KB 多帧双向流、认证 EOF、错误 UUID、8192 字节 UDP 边界、多目的 association 和
+       超时会话淘汰；12 项模块/订阅回归、HTTP camouflage 单测与
+       `cargo check --all-targets` 通过。
    - [ ] `NEXT-011C`：VLESS/Reality/Vision 完整能力收口。
    - [ ] `NEXT-011D`：Hysteria2/TUIC 完整能力收口。
    - [ ] `NEXT-011E`：WireGuard 完整能力收口。

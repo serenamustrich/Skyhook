@@ -38,14 +38,16 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   half-close, and stale pooled-connection retry. v1/v2 UDP remains an explicit protocol boundary.
 - Trojan TCP and pooled UDP outbound over TLS, WebSocket, gRPC, HTTP/2, and HTTPUpgrade, with SNI
   and optional certificate verification bypass. Custom transport headers, explicit ALPN, gRPC
-  trailer errors, and UDP over WebSocket/gRPC are covered; wider server compatibility remains
-  partial as documented in the protocol matrix.
+  trailer errors, UDP over WebSocket/gRPC, half-close, bounded UDP payloads, session reuse, and
+  timeout eviction are covered by real-dial tests.
 - VLESS TCP and command-UDP outbound with TLS, SNI, and response-header stripping.
 - VLESS WebSocket, gRPC, and HTTP/2 transports for common subscription nodes.
   VLESS remains `partial` in matrix terms due transport/Reality-Vision boundary limits.
-- VMess AEAD TCP and command-UDP over TCP, WebSocket, gRPC, and HTTP/2 outbound for modern
-  `alterId=0` subscriptions. All listed paths have public `build_outbounds` end-to-end tests;
-  legacy alterId and broader compatibility combinations remain partial.
+- VMess AEAD and legacy alterId TCP plus command-UDP over TCP, WebSocket, gRPC, HTTP/2,
+  HTTP/1.1 camouflage, and HTTPUpgrade. The AES-128-GCM, ChaCha20-Poly1305, and none body modes,
+  standard `vmess://` JSON, custom transport headers, ALPN, multi-destination UDP associations,
+  authenticated EOF, and stale-session eviction have independent real-dial coverage. XHTTP is an
+  explicit pre-dial unsupported boundary rather than a false timeout.
 - Hysteria2 and TUIC native QUIC TCP outbounds for common subscription nodes.
 - Hysteria2 QUIC datagram UDP exchange with a session pool, UDP fragmentation, and Salamander
   obfuscation.
@@ -108,10 +110,9 @@ Current matrix details are in `docs/protocol-matrix.md`:
 
 - **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **partial**: includes Shadowsocks, SSR, Trojan, VMess, VLESS, Hysteria2, TUIC, Snell, WireGuard,
-  AnyTLS, ShadowTLS, Naive, HTTP, and SSH while their documented gaps remain
-- **full**: currently limited to SOCKS5 as a complete protocol capability; individual paths in
-  partial protocols may still have stable real-dial tests
+- **partial**: VLESS, Hysteria2, TUIC, WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, and SSH while
+  their documented gaps remain
+- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, and SOCKS5
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently
@@ -428,6 +429,7 @@ outbounds:
     server: vm.example.com
     port: 443
     uuid: 11111111-1111-1111-1111-111111111111
+    alter_id: 0
     cipher: auto
     tls: true
     sni: cdn.example.com
@@ -435,10 +437,11 @@ outbounds:
     ws_path: /ray
 ```
 
-VMess AEAD nodes with `alterId=0`, `tcp`, `ws`, `auto`, `aes-128-gcm`,
-`chacha20-poly1305`, or `none` are converted into runnable outbounds. Command-UDP uses a
-per-destination session pool to keep UDP flows warm across packets. Legacy VMess alterId and
-Reality-like extensions are rejected or reported as protocol limitations.
+VMess AEAD nodes with `alterId=0` and legacy nodes with a positive `alterId` are runnable.
+Supported transports are `tcp`, `ws`, `grpc`, `h2`, `http`, and `httpupgrade`; supported body
+ciphers are `auto`, `aes-128-gcm`, `chacha20-poly1305`, and `none`. Command-UDP uses a bounded
+per-destination session pool. `xhttp` is rejected before network dialing with a precise unsupported
+error.
 
 Basic Hysteria2 outbound:
 

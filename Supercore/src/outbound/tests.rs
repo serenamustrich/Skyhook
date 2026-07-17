@@ -20,7 +20,7 @@ use ::shadowsocks::{
 };
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm,
+    Aes128Gcm, Aes256Gcm,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -66,10 +66,10 @@ use super::{
         decode_reality_short_id, seal_reality_session_id, VlessOutbound, REALITY_CLIENT_VERSION,
     },
     vmess::{
-        read_vmess_chunk, vmess_aes128gcm_decrypt, vmess_aes128gcm_encrypt, vmess_fnv1a,
-        vmess_instruction_key, vmess_kdf, vmess_sha256_16, write_vmess_chunk, VmessAeadState,
-        VmessCipher, VmessDownloadState, VmessLengthMask, VmessOutbound, VmessUploadState,
-        VMESS_TAG_LEN,
+        read_vmess_chunk, read_vmess_response_header, vmess_aes128gcm_decrypt,
+        vmess_aes128gcm_encrypt, vmess_fnv1a, vmess_instruction_key, vmess_kdf, vmess_sha256_16,
+        write_vmess_chunk, VmessAeadState, VmessCipher, VmessDownloadState, VmessLengthMask,
+        VmessOutbound, VmessUploadState, VMESS_TAG_LEN,
     },
 };
 
@@ -1307,6 +1307,7 @@ async fn vmess_outbound_supports_tcp_aead_stream() {
             response_header_key: [0u8; 16],
             response_header_iv: [0u8; 16],
             response_authentication: setup.response_authentication,
+            aead_header: true,
             cipher: VmessAeadState::new(setup.cipher, &setup.data_key, &setup.data_iv).unwrap(),
             length_mask: VmessLengthMask::new(&setup.data_iv),
         };
@@ -1342,6 +1343,7 @@ async fn vmess_outbound_supports_tcp_aead_stream() {
         "127.0.0.1".to_string(),
         listen_addr.port(),
         "11111111-1111-1111-1111-111111111111".to_string(),
+        0,
         "auto".to_string(),
         false,
         None,
@@ -1350,6 +1352,8 @@ async fn vmess_outbound_supports_tcp_aead_stream() {
         None,
         None,
         None,
+        BTreeMap::new(),
+        Vec::new(),
     );
     let mut stream = outbound.connect(&destination, 1000).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
@@ -1359,6 +1363,134 @@ async fn vmess_outbound_supports_tcp_aead_stream() {
 
     assert_eq!(&response, b"pong");
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn vmess_rejects_invalid_configuration_before_dial() {
+    let cases = [
+        ("not-a-uuid", "auto", None, Vec::new(), "invalid vmess uuid"),
+        (
+            "11111111-1111-1111-1111-111111111111",
+            "aes-256-gcm",
+            None,
+            Vec::new(),
+            "unsupported vmess cipher",
+        ),
+        (
+            "11111111-1111-1111-1111-111111111111",
+            "auto",
+            Some("quic"),
+            Vec::new(),
+            "unsupported vmess network",
+        ),
+        (
+            "11111111-1111-1111-1111-111111111111",
+            "auto",
+            Some("h2"),
+            vec!["http/1.1".to_string()],
+            "requires h2 in ALPN",
+        ),
+        (
+            "11111111-1111-1111-1111-111111111111",
+            "auto",
+            Some("xhttp"),
+            Vec::new(),
+            "xhttp transport is not implemented",
+        ),
+    ];
+
+    for (uuid, cipher, network, alpn, expected_error) in cases {
+        let outbound = VmessOutbound::new(
+            "invalid-vmess".to_string(),
+            "127.0.0.1".to_string(),
+            9,
+            uuid.to_string(),
+            0,
+            cipher.to_string(),
+            false,
+            None,
+            false,
+            network.map(str::to_string),
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+            alpn,
+        );
+        let capability = outbound.capability();
+        assert!(!capability.tcp_supported);
+        assert!(!capability.udp_supported);
+        assert!(capability.limitations[0].contains(expected_error));
+
+        let error = match outbound
+            .connect(&Destination::new("target.example", 443), 100)
+            .await
+        {
+            Ok(_) => panic!("invalid VMess configuration unexpectedly dialed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected error for {uuid}/{cipher}/{network:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vmess_rejects_bad_response_authentication() {
+    let response_key = [0x31; 16];
+    let response_iv = [0x42; 16];
+    let expected_authentication: u8 = 0x53;
+    let (mut client, mut server) = tokio::io::duplex(1024);
+    write_vmess_response_header_for_test(
+        &mut server,
+        &response_key,
+        &response_iv,
+        expected_authentication.wrapping_add(1),
+    )
+    .await;
+
+    let state = VmessDownloadState {
+        response_header_key: response_key,
+        response_header_iv: response_iv,
+        response_authentication: expected_authentication,
+        aead_header: true,
+        cipher: None,
+        length_mask: VmessLengthMask::new(&response_iv),
+    };
+    let error = read_vmess_response_header(&mut client, &state)
+        .await
+        .expect_err("bad VMess response authentication was accepted");
+    assert!(error.to_string().contains("invalid vmess response auth"));
+}
+
+#[tokio::test]
+async fn vmess_authenticates_empty_eof_chunk() {
+    let response_key = [0x64; 16];
+    let response_iv = [0x75; 16];
+    let mut nonce = [0u8; 12];
+    nonce[2..].copy_from_slice(&response_iv[2..12]);
+    let mut corrupted_tag = Aes128Gcm::new_from_slice(&response_key)
+        .unwrap()
+        .encrypt(aes_gcm::Nonce::from_slice(&nonce), &[][..])
+        .unwrap();
+    *corrupted_tag.last_mut().unwrap() ^= 0x80;
+
+    let mut wire = Vec::with_capacity(2 + corrupted_tag.len());
+    wire.extend_from_slice(&(corrupted_tag.len() as u16).to_be_bytes());
+    wire.extend_from_slice(&corrupted_tag);
+    let mut state = VmessDownloadState {
+        response_header_key: response_key,
+        response_header_iv: response_iv,
+        response_authentication: 0,
+        aead_header: false,
+        cipher: VmessAeadState::new(VmessCipher::Aes128Gcm, &response_key, &response_iv).unwrap(),
+        length_mask: VmessLengthMask::unmasked(),
+    };
+    let error = read_vmess_chunk(&mut Cursor::new(wire), &mut state)
+        .await
+        .expect_err("corrupted VMess EOF tag was accepted");
+    assert!(error.to_string().contains("vmess decrypt failed"));
 }
 
 #[tokio::test]
@@ -1401,6 +1533,7 @@ async fn vmess_outbound_supports_grpc_transport() {
                 response_header_key: [0u8; 16],
                 response_header_iv: [0u8; 16],
                 response_authentication: setup.response_authentication,
+                aead_header: true,
                 cipher: VmessAeadState::new(setup.cipher, &setup.data_key, &setup.data_iv).unwrap(),
                 length_mask: VmessLengthMask::new(&setup.data_iv),
             };
@@ -1436,6 +1569,7 @@ async fn vmess_outbound_supports_grpc_transport() {
         "127.0.0.1".to_string(),
         listen_addr.port(),
         "11111111-1111-1111-1111-111111111111".to_string(),
+        0,
         "auto".to_string(),
         false,
         None,
@@ -1444,6 +1578,8 @@ async fn vmess_outbound_supports_grpc_transport() {
         None,
         Some("cdn.example.com".to_string()),
         Some("vmess".to_string()),
+        BTreeMap::new(),
+        Vec::new(),
     );
     let mut stream =
         tokio::time::timeout(Duration::from_secs(2), outbound.connect(&destination, 1000))
@@ -1501,6 +1637,7 @@ async fn vmess_outbound_supports_h2_transport() {
                 response_header_key: [0u8; 16],
                 response_header_iv: [0u8; 16],
                 response_authentication: setup.response_authentication,
+                aead_header: true,
                 cipher: VmessAeadState::new(setup.cipher, &setup.data_key, &setup.data_iv).unwrap(),
                 length_mask: VmessLengthMask::new(&setup.data_iv),
             };
@@ -1536,6 +1673,7 @@ async fn vmess_outbound_supports_h2_transport() {
         "127.0.0.1".to_string(),
         listen_addr.port(),
         "11111111-1111-1111-1111-111111111111".to_string(),
+        0,
         "auto".to_string(),
         false,
         None,
@@ -1544,6 +1682,8 @@ async fn vmess_outbound_supports_h2_transport() {
         Some("/vmess-h2".to_string()),
         Some("cdn.example.com".to_string()),
         None,
+        BTreeMap::new(),
+        Vec::new(),
     );
     let mut stream =
         tokio::time::timeout(Duration::from_secs(2), outbound.connect(&destination, 1000))
