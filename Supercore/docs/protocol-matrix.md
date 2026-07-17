@@ -29,7 +29,7 @@
 | HTTP | full | full | full | not-applicable | tcp/tls | full | HTTP/HTTPS CONNECT、Basic Auth、SNI/证书策略、IPv4/IPv6 authority、2xx/非 2xx 状态和握手同包预读数据均有真实拨号；HTTP CONNECT 原生仅承载 TCP |
 | SOCKS5 | full | full | full | full | tcp/udp-associate | full | 无认证与用户名密码认证、域名/IPv4/IPv6 CONNECT、UDP ASSOCIATE、relay 来源校验、最大 payload 和 4 会话轮转池均有真实拨号 |
 | SSH | full | full | full | not-applicable | direct-tcpip | full | OpenSSH 公钥/SHA-256 指纹固定、主机密钥算法策略、密码/内联或文件私钥认证、keepalive、并发通道共享会话和服务端断线重连均已实现；SSH 无标准 UDP relay |
-| Mieru | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
+| Mieru | full | full | full | full | tcp/udp | full | 原生 Mieru v3：PBKDF2-HMAC-SHA256、XChaCha20-Poly1305、用户名/密码认证、官方 `mierus://` 与完整 protobuf `mieru://` 分享格式、固定端口和 `port-range`、TCP/UDP underlay、标准/no-wait 握手、off/low/middle/high multiplexing、随机 padding、MTU 分片、累计 ACK、重排、RTT/RTO、快速重传、CUBIC、心跳和 SOCKS5 UDP ASSOCIATE；已与官方 `mita` 服务端完成 TCP/UDP、多路复用、UDP ASSOCIATE 及丢包乱序互通 |
 | Juicity | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
 | MASQUE | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
 | OpenVPN | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
@@ -68,6 +68,8 @@
   `src/outbound/udp/session_pool.rs` 提供。
 - Hysteria v1 的 v3 auth、TCP/UDP framing、fast-open、xplus/wechat-video、会话复用和
   fragmentation/reassembly 位于 `src/outbound/hysteria.rs`。
+- Mieru v3 的认证、stateful/stateless cipher、TCP/UDP underlay、multiplexing、可靠 UDP、
+  MTU 分片、拥塞控制和 SOCKS5 relay 位于 `src/outbound/mieru.rs`。
 - Hysteria2 的 H3 auth、TCP/UDP framing、Salamander/Gecko obfs 和 reassembly 位于
   `src/outbound/hysteria2.rs`。
 - TUIC v5 auth、TCP stream、native/QUIC UDP relay 和 reassembly 位于
@@ -93,7 +95,7 @@
 
 ## 未完成协议边界
 
-1. **Mieru / Juicity / MASQUE / OpenVPN**: 当前仍为 `parse-only`
+1. **Juicity / MASQUE / OpenVPN**: 当前仍为 `parse-only`
 2. **DNS outbound / Rematch / Sudoku / Tailscale / TrustTunnel**: 尚未进入正式出站模型
 3. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
 
@@ -107,6 +109,9 @@
 - Hysteria v1: `tests/hysteria_v1_real_dial.rs`，覆盖真实 QUIC TCP/UDP、错误鉴权、
   fast-open 和认证超时；`src/outbound/hysteria.rs` 覆盖官方 wire、xplus、wechat-video、
   UDP fragmentation/reassembly；另有官方 `hy1` 服务端 TCP/UDP 互通验证
+- Mieru: `src/outbound/mieru.rs` 覆盖 TCP/UDP underlay 真实拨号、stateful/stateless wire、
+  MTU、配置和端口段；`src/subscription/mod.rs` 覆盖官方简单/完整分享格式。另与官方
+  `mita` 服务端完成 TCP/UDP、多会话、UDP ASSOCIATE 和丢包乱序互通验证
 - Hysteria2 / TUIC: `src/outbound/tests.rs`、`tests/vless_hy2_tuic.rs`
 - WireGuard: `src/outbound/wireguard.rs` 的本地双端 E2E，覆盖 IPv4/IPv6、TCP/UDP、
   DNS、96KB 数据、多 Peer、最长前缀、保活、reserved 和重放拒绝

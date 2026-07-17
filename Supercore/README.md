@@ -71,6 +71,10 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 - Hysteria v1 native QUIC TCP and UDP with v3 wire authentication, upload/download negotiation,
   rate-aware congestion control, connection/session reuse, fragmentation, fast-open, xplus, and
   wechat-video packet transport. TCP and UDP interoperate with the official `hy1` server.
+- Mieru v3 over native TCP or reliable UDP underlays with username/password authentication,
+  XChaCha20-Poly1305 encryption, multiplexing, random padding, MTU fragmentation, congestion and
+  retransmission control, SOCKS5 TCP/UDP relay, fixed ports and `port-range`. Both official simple
+  and protobuf share formats are supported, with TCP/UDP interoperability against `mita`.
 - Hysteria2 and TUIC native QUIC TCP outbounds with strict authentication and complete local QUIC
   server end-to-end coverage.
 - Hysteria2 HTTP/3 auth, TCP, QUIC datagram UDP, session reuse, fragmentation, bandwidth-aware
@@ -133,10 +137,10 @@ Supercore no longer treats protocol support as a single boolean.
 
 Current matrix details are in `docs/protocol-matrix.md`:
 
-- **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`
+- **parse-only**: `juicity`, `masque`, `openvpn`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
 - **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria v1, Hysteria2, TUIC,
-  WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, SOCKS5, and SSH
+  WireGuard, AnyTLS, ShadowTLS, Naive, Mieru, HTTP, SOCKS5, and SSH
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently

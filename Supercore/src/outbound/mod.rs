@@ -9,6 +9,7 @@ mod http_proxy;
 mod hysteria;
 mod hysteria2;
 mod io;
+mod mieru;
 mod mux;
 mod naive;
 mod pool;

@@ -673,9 +673,21 @@ impl SubscriptionNode {
                 name: self.name.clone(),
                 server: self.server.clone(),
                 port: self.port,
+                port_range: first_param(&self.params, &["port-range", "port_range"]),
                 username: required_param(&self.params, &["username"], "mieru username")?,
                 password: required_param(&self.params, &["password"], "mieru password")?,
                 transport: first_param(&self.params, &["transport", "protocol"]),
+                mtu: first_param(&self.params, &["mtu"])
+                    .map(|value| parse_u16_text(&value, "mieru mtu"))
+                    .transpose()?,
+                multiplexing: first_param(
+                    &self.params,
+                    &["multiplexing", "multiplexing-level", "multiplexing_level"],
+                ),
+                handshake_mode: first_param(
+                    &self.params,
+                    &["handshake-mode", "handshake_mode", "handshakeMode"],
+                ),
             }),
             NodeProtocol::Juicity => Ok(OutboundConfig::Juicity {
                 name: self.name.clone(),
@@ -1067,7 +1079,18 @@ fn parse_clash_proxy(value: &Value) -> anyhow::Result<SubscriptionNode> {
         .unwrap_or_else(|| NodeProtocol::Unknown("missing".to_string()));
     let server =
         yaml_string(mapping, "server").ok_or_else(|| anyhow!("{name} is missing server"))?;
-    let port = yaml_u16(mapping, "port").ok_or_else(|| anyhow!("{name} is missing port"))?;
+    let port = match yaml_u16(mapping, "port") {
+        Some(port) => port,
+        None if matches!(&protocol, NodeProtocol::Mieru) => {
+            let port_range = yaml_string(mapping, "port-range")
+                .or_else(|| yaml_string(mapping, "port_range"))
+                .ok_or_else(|| anyhow!("{name} is missing port or port-range"))?;
+            *parse_mieru_port_binding(&port_range)?
+                .first()
+                .ok_or_else(|| anyhow!("{name} has an empty port-range"))?
+        }
+        None => return Err(anyhow!("{name} is missing port")),
+    };
     let mut params = BTreeMap::new();
     for (key, value) in mapping {
         let Some(key) = key.as_str() else {
@@ -1260,11 +1283,23 @@ fn parse_uri_subscription(text: &str) -> anyhow::Result<SubscriptionDocument> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        match parse_node_uri(line).and_then(|node| {
-            node.common_options()?;
-            Ok(node)
+        let parsed = if line.starts_with("mierus://")
+            || (line.starts_with("mieru://") && !line.trim_start_matches("mieru://").contains('@'))
+        {
+            parse_mieru_share_nodes(line)
+        } else {
+            parse_node_uri(line).map(|node| vec![node])
+        };
+        match parsed.and_then(|parsed| {
+            for node in &parsed {
+                node.common_options()?;
+                if matches!(&node.protocol, NodeProtocol::Mieru) {
+                    node.to_outbound_config()?;
+                }
+            }
+            Ok(parsed)
         }) {
-            Ok(node) => nodes.push(node),
+            Ok(parsed) => nodes.extend(parsed),
             Err(error) => unsupported.push(UnsupportedItem {
                 item: line.to_string(),
                 reason: error.to_string(),
@@ -1283,6 +1318,393 @@ fn parse_uri_subscription(text: &str) -> anyhow::Result<SubscriptionDocument> {
     })
 }
 
+#[derive(Default)]
+struct MieruSharedProfile {
+    name: String,
+    username: String,
+    password: String,
+    servers: Vec<MieruSharedServer>,
+    mtu: Option<u16>,
+    multiplexing: Option<String>,
+    handshake_mode: Option<String>,
+}
+
+#[derive(Default)]
+struct MieruSharedServer {
+    host: String,
+    bindings: Vec<MieruSharedBinding>,
+}
+
+struct MieruSharedBinding {
+    ports: Vec<u16>,
+    transport: String,
+}
+
+fn parse_mieru_share_nodes(value: &str) -> anyhow::Result<Vec<SubscriptionNode>> {
+    let profiles = if value.starts_with("mierus://") {
+        vec![parse_mieru_simple_profile(value)?]
+    } else {
+        parse_mieru_full_profiles(value)?
+    };
+    let mut nodes = Vec::new();
+    for profile in profiles {
+        if profile.username.is_empty() || profile.password.is_empty() {
+            return Err(anyhow!("mieru profile is missing username or password"));
+        }
+        for server in profile.servers {
+            if server.host.is_empty() {
+                return Err(anyhow!(
+                    "mieru profile contains a server without an address"
+                ));
+            }
+            for binding in server.bindings {
+                for port in binding.ports {
+                    let mut params = BTreeMap::new();
+                    params.insert("username".to_string(), profile.username.clone());
+                    params.insert("password".to_string(), profile.password.clone());
+                    params.insert("transport".to_string(), binding.transport.clone());
+                    if let Some(mtu) = profile.mtu {
+                        params.insert("mtu".to_string(), mtu.to_string());
+                    }
+                    if let Some(multiplexing) = &profile.multiplexing {
+                        params.insert("multiplexing".to_string(), multiplexing.clone());
+                    }
+                    if let Some(handshake_mode) = &profile.handshake_mode {
+                        params.insert("handshake-mode".to_string(), handshake_mode.clone());
+                    }
+                    let transport = binding.transport.to_ascii_lowercase();
+                    let name = if profile.name.is_empty() {
+                        format!("{}-{transport}-{port}", server.host)
+                    } else {
+                        format!("{}-{}-{transport}-{port}", profile.name, server.host)
+                    };
+                    nodes.push(SubscriptionNode {
+                        name,
+                        protocol: NodeProtocol::Mieru,
+                        server: server.host.clone(),
+                        port,
+                        params,
+                    });
+                }
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return Err(anyhow!(
+            "mieru share does not contain a usable server binding"
+        ));
+    }
+    Ok(nodes)
+}
+
+fn parse_mieru_simple_profile(value: &str) -> anyhow::Result<MieruSharedProfile> {
+    let url = Url::parse(value).context("invalid mierus share URL")?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("mierus share is missing host"))?
+        .to_string();
+    let username = percent_decode_lossy(url.username());
+    let password = url.password().map(percent_decode_lossy).unwrap_or_default();
+    let mut profile = MieruSharedProfile {
+        username,
+        password,
+        ..MieruSharedProfile::default()
+    };
+    let mut ports = Vec::new();
+    let mut transports = Vec::new();
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "profile" => profile.name = value.into_owned(),
+            "mtu" => profile.mtu = Some(parse_u16_text(&value, "mieru mtu")?),
+            "multiplexing" => profile.multiplexing = Some(value.into_owned()),
+            "handshake-mode" => profile.handshake_mode = Some(value.into_owned()),
+            "port" => ports.push(parse_mieru_port_binding(&value)?),
+            "protocol" => transports.push(normalize_mieru_share_transport(&value)?),
+            _ => {}
+        }
+    }
+    if ports.len() != transports.len() {
+        return Err(anyhow!(
+            "mierus share has {} port bindings but {} transport bindings",
+            ports.len(),
+            transports.len()
+        ));
+    }
+    let bindings = ports
+        .into_iter()
+        .zip(transports)
+        .map(|(ports, transport)| MieruSharedBinding { ports, transport })
+        .collect();
+    profile.servers.push(MieruSharedServer { host, bindings });
+    Ok(profile)
+}
+
+fn parse_mieru_full_profiles(value: &str) -> anyhow::Result<Vec<MieruSharedProfile>> {
+    let encoded = value
+        .strip_prefix("mieru://")
+        .ok_or_else(|| anyhow!("invalid mieru full share"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded))
+        .context("invalid mieru full share base64")?;
+    let fields = protobuf_fields(&bytes)?;
+    let active = fields.iter().find_map(|(number, value)| {
+        (*number == 2)
+            .then(|| {
+                value
+                    .bytes()
+                    .and_then(|value| std::str::from_utf8(value).ok())
+            })
+            .flatten()
+            .map(ToString::to_string)
+    });
+    let mut profiles = fields
+        .iter()
+        .filter_map(|(number, value)| (*number == 1).then(|| value.bytes()).flatten())
+        .map(parse_mieru_profile_message)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if let Some(active) = active {
+        profiles.retain(|profile| profile.name == active);
+    }
+    if profiles.is_empty() {
+        return Err(anyhow!("mieru full share contains no selected profile"));
+    }
+    Ok(profiles)
+}
+
+fn parse_mieru_profile_message(input: &[u8]) -> anyhow::Result<MieruSharedProfile> {
+    let mut profile = MieruSharedProfile::default();
+    for (number, value) in protobuf_fields(input)? {
+        match number {
+            1 => profile.name = protobuf_string(&value, "mieru profile name")?,
+            2 => {
+                let user = value
+                    .bytes()
+                    .ok_or_else(|| anyhow!("invalid mieru user field"))?;
+                for (number, value) in protobuf_fields(user)? {
+                    match number {
+                        1 => profile.username = protobuf_string(&value, "mieru username")?,
+                        2 => profile.password = protobuf_string(&value, "mieru password")?,
+                        _ => {}
+                    }
+                }
+            }
+            3 => {
+                profile.servers.push(parse_mieru_server_message(
+                    value
+                        .bytes()
+                        .ok_or_else(|| anyhow!("invalid mieru server field"))?,
+                )?);
+            }
+            4 => {
+                let mtu = value
+                    .varint()
+                    .ok_or_else(|| anyhow!("invalid mieru MTU field"))?;
+                profile.mtu = Some(u16::try_from(mtu).context("mieru MTU exceeds u16")?);
+            }
+            5 => {
+                let message = value
+                    .bytes()
+                    .ok_or_else(|| anyhow!("invalid mieru multiplexing field"))?;
+                let level = protobuf_fields(message)?
+                    .into_iter()
+                    .find_map(|(number, value)| (number == 1).then(|| value.varint()).flatten())
+                    .unwrap_or_default();
+                profile.multiplexing = Some(mieru_multiplexing_name(level)?.to_string());
+            }
+            6 => {
+                let mode = value
+                    .varint()
+                    .ok_or_else(|| anyhow!("invalid mieru handshake field"))?;
+                profile.handshake_mode = Some(mieru_handshake_name(mode)?.to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(profile)
+}
+
+fn parse_mieru_server_message(input: &[u8]) -> anyhow::Result<MieruSharedServer> {
+    let mut server = MieruSharedServer::default();
+    for (number, value) in protobuf_fields(input)? {
+        match number {
+            1 if server.host.is_empty() => {
+                server.host = protobuf_string(&value, "mieru server IP")?;
+            }
+            2 => server.host = protobuf_string(&value, "mieru server domain")?,
+            3 => {
+                server.bindings.push(parse_mieru_binding_message(
+                    value
+                        .bytes()
+                        .ok_or_else(|| anyhow!("invalid mieru port binding field"))?,
+                )?);
+            }
+            _ => {}
+        }
+    }
+    Ok(server)
+}
+
+fn parse_mieru_binding_message(input: &[u8]) -> anyhow::Result<MieruSharedBinding> {
+    let mut ports = Vec::new();
+    let mut transport = None;
+    for (number, value) in protobuf_fields(input)? {
+        match number {
+            1 => {
+                let port = value
+                    .varint()
+                    .ok_or_else(|| anyhow!("invalid mieru port field"))?;
+                ports.push(u16::try_from(port).context("mieru port exceeds u16")?);
+            }
+            2 => {
+                transport = Some(match value.varint() {
+                    Some(1) => "udp".to_string(),
+                    Some(2) => "tcp".to_string(),
+                    _ => return Err(anyhow!("invalid mieru transport enum")),
+                });
+            }
+            3 => {
+                ports = parse_mieru_port_binding(&protobuf_string(&value, "mieru port range")?)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(MieruSharedBinding {
+        ports,
+        transport: transport.ok_or_else(|| anyhow!("mieru binding is missing transport"))?,
+    })
+}
+
+fn parse_mieru_port_binding(value: &str) -> anyhow::Result<Vec<u16>> {
+    if let Some((start, end)) = value.split_once('-') {
+        let start = parse_u16_text(start, "mieru port range start")?;
+        let end = parse_u16_text(end, "mieru port range end")?;
+        if start == 0 || start > end || usize::from(end - start) > 4_096 {
+            return Err(anyhow!("invalid or oversized mieru port range {value}"));
+        }
+        return Ok((start..=end).collect());
+    }
+    let port = parse_u16_text(value, "mieru port")?;
+    if port == 0 {
+        return Err(anyhow!("mieru port must be greater than zero"));
+    }
+    Ok(vec![port])
+}
+
+fn normalize_mieru_share_transport(value: &str) -> anyhow::Result<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "tcp" | "stream" => Ok("tcp".to_string()),
+        "udp" | "packet" => Ok("udp".to_string()),
+        value => Err(anyhow!("unsupported mieru share transport {value}")),
+    }
+}
+
+fn mieru_multiplexing_name(value: u64) -> anyhow::Result<&'static str> {
+    match value {
+        0 | 3 => Ok("MULTIPLEXING_MIDDLE"),
+        1 => Ok("MULTIPLEXING_OFF"),
+        2 => Ok("MULTIPLEXING_LOW"),
+        4 => Ok("MULTIPLEXING_HIGH"),
+        _ => Err(anyhow!("invalid mieru multiplexing enum {value}")),
+    }
+}
+
+fn mieru_handshake_name(value: u64) -> anyhow::Result<&'static str> {
+    match value {
+        0 | 1 => Ok("HANDSHAKE_STANDARD"),
+        2 => Ok("HANDSHAKE_NO_WAIT"),
+        _ => Err(anyhow!("invalid mieru handshake enum {value}")),
+    }
+}
+
+enum ProtobufValue<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+}
+
+impl<'a> ProtobufValue<'a> {
+    fn varint(&self) -> Option<u64> {
+        match self {
+            Self::Varint(value) => Some(*value),
+            Self::Bytes(_) => None,
+        }
+    }
+
+    fn bytes(&self) -> Option<&'a [u8]> {
+        match self {
+            Self::Bytes(value) => Some(value),
+            Self::Varint(_) => None,
+        }
+    }
+}
+
+fn protobuf_fields(mut input: &[u8]) -> anyhow::Result<Vec<(u32, ProtobufValue<'_>)>> {
+    let mut fields = Vec::new();
+    while !input.is_empty() {
+        let key = protobuf_varint(&mut input)?;
+        let number = u32::try_from(key >> 3).context("protobuf field number exceeds u32")?;
+        if number == 0 {
+            return Err(anyhow!("protobuf field number must not be zero"));
+        }
+        let value = match key & 7 {
+            0 => ProtobufValue::Varint(protobuf_varint(&mut input)?),
+            1 => {
+                if input.len() < 8 {
+                    return Err(anyhow!("truncated protobuf fixed64 field"));
+                }
+                let value = &input[..8];
+                input = &input[8..];
+                ProtobufValue::Bytes(value)
+            }
+            2 => {
+                let length = usize::try_from(protobuf_varint(&mut input)?)
+                    .context("protobuf field length exceeds usize")?;
+                if input.len() < length {
+                    return Err(anyhow!("truncated protobuf byte field"));
+                }
+                let value = &input[..length];
+                input = &input[length..];
+                ProtobufValue::Bytes(value)
+            }
+            5 => {
+                if input.len() < 4 {
+                    return Err(anyhow!("truncated protobuf fixed32 field"));
+                }
+                let value = &input[..4];
+                input = &input[4..];
+                ProtobufValue::Bytes(value)
+            }
+            wire => return Err(anyhow!("unsupported protobuf wire type {wire}")),
+        };
+        fields.push((number, value));
+    }
+    Ok(fields)
+}
+
+fn protobuf_varint(input: &mut &[u8]) -> anyhow::Result<u64> {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let Some((&byte, rest)) = input.split_first() else {
+            return Err(anyhow!("truncated protobuf varint"));
+        };
+        *input = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(anyhow!("protobuf varint exceeds 64 bits"))
+}
+
+fn protobuf_string(value: &ProtobufValue<'_>, label: &str) -> anyhow::Result<String> {
+    let bytes = value
+        .bytes()
+        .ok_or_else(|| anyhow!("{label} is not length-delimited"))?;
+    std::str::from_utf8(bytes)
+        .with_context(|| format!("{label} is not UTF-8"))
+        .map(ToString::to_string)
+}
+
 fn parse_node_uri(value: &str) -> anyhow::Result<SubscriptionNode> {
     let scheme = value
         .split_once("://")
@@ -1294,9 +1716,8 @@ fn parse_node_uri(value: &str) -> anyhow::Result<SubscriptionNode> {
         "vmess" => parse_vmess_uri(value),
         "http" | "https" | "socks" | "socks5" | "trojan" | "vless" | "hysteria2" | "hy2"
         | "tuic" | "snell" | "hysteria" | "hy" | "wireguard" | "wg" | "anytls" | "shadowtls"
-        | "shadow-tls" | "naive" | "ssh" | "mieru" | "juicity" | "masque" | "openvpn" => {
-            parse_url_like_node(value)
-        }
+        | "shadow-tls" | "naive" | "ssh" | "mieru" | "mierus" | "juicity" | "masque"
+        | "openvpn" => parse_url_like_node(value),
         _ => parse_url_like_node(value).or_else(|_| {
             Ok(SubscriptionNode {
                 name: scheme.clone(),
@@ -1886,7 +2307,7 @@ fn protocol_from_str(value: &str) -> NodeProtocol {
         "shadowtls" | "shadow-tls" => NodeProtocol::ShadowTls,
         "naive" => NodeProtocol::Naive,
         "ssh" => NodeProtocol::Ssh,
-        "mieru" => NodeProtocol::Mieru,
+        "mieru" | "mierus" => NodeProtocol::Mieru,
         "juicity" => NodeProtocol::Juicity,
         "masque" => NodeProtocol::Masque,
         "openvpn" | "open-vpn" => NodeProtocol::OpenVpn,
@@ -3449,6 +3870,153 @@ proxies:
                 assert_eq!(keepalive_max, 5);
             }
             other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_official_mierus_share_with_all_port_bindings() {
+        let uri = "mierus://skyhook%40user:secret@example.com?profile=production&mtu=1400&multiplexing=MULTIPLEXING_HIGH&handshake-mode=HANDSHAKE_NO_WAIT&port=39091&protocol=TCP&port=39092-39093&protocol=UDP";
+        let document = parse_subscription(uri).unwrap();
+        assert!(document.unsupported.is_empty());
+        assert_eq!(document.nodes.len(), 3);
+        assert_eq!(document.nodes[0].port, 39091);
+        assert_eq!(document.nodes[0].params["transport"], "tcp");
+        assert_eq!(document.nodes[1].port, 39092);
+        assert_eq!(document.nodes[2].port, 39093);
+        assert_eq!(document.nodes[1].params["transport"], "udp");
+        match document.nodes[1].to_outbound_config().unwrap() {
+            OutboundConfig::Mieru {
+                username,
+                password,
+                mtu,
+                multiplexing,
+                handshake_mode,
+                ..
+            } => {
+                assert_eq!(username, "skyhook@user");
+                assert_eq!(password, "secret");
+                assert_eq!(mtu, Some(1400));
+                assert_eq!(multiplexing.as_deref(), Some("MULTIPLEXING_HIGH"));
+                assert_eq!(handshake_mode.as_deref(), Some("HANDSHAKE_NO_WAIT"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_clash_mieru_with_only_official_port_range() {
+        let text = r#"
+proxies:
+  - name: Mieru-Range
+    type: mieru
+    server: mieru.example.com
+    port-range: 39091-39093
+    transport: TCP
+    username: skyhook
+    password: secret
+"#;
+        let document = parse_subscription(text).unwrap();
+        assert!(document.unsupported.is_empty());
+        assert_eq!(document.nodes[0].port, 39091);
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Mieru {
+                port,
+                port_range,
+                transport,
+                ..
+            } => {
+                assert_eq!(port, 39091);
+                assert_eq!(port_range.as_deref(), Some("39091-39093"));
+                assert_eq!(transport.as_deref(), Some("TCP"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_official_mieru_protobuf_share_and_active_profile() {
+        let user = proto_message(&[
+            proto_bytes_field(1, b"skyhook-user"),
+            proto_bytes_field(2, b"skyhook-secret"),
+        ]);
+        let tcp_binding = proto_message(&[proto_varint_field(1, 39091), proto_varint_field(2, 2)]);
+        let udp_binding = proto_message(&[
+            proto_varint_field(2, 1),
+            proto_bytes_field(3, b"39092-39093"),
+        ]);
+        let server = proto_message(&[
+            proto_bytes_field(2, b"mieru.example.com"),
+            proto_bytes_field(3, &tcp_binding),
+            proto_bytes_field(3, &udp_binding),
+        ]);
+        let multiplexing = proto_message(&[proto_varint_field(1, 4)]);
+        let profile = proto_message(&[
+            proto_bytes_field(1, b"active"),
+            proto_bytes_field(2, &user),
+            proto_bytes_field(3, &server),
+            proto_varint_field(4, 1400),
+            proto_bytes_field(5, &multiplexing),
+            proto_varint_field(6, 2),
+        ]);
+        let ignored_profile = proto_message(&[proto_bytes_field(1, b"ignored")]);
+        let config = proto_message(&[
+            proto_bytes_field(1, &ignored_profile),
+            proto_bytes_field(1, &profile),
+            proto_bytes_field(2, b"active"),
+        ]);
+        let uri = format!(
+            "mieru://{}",
+            base64::engine::general_purpose::STANDARD.encode(config)
+        );
+
+        let document = parse_subscription(&uri).unwrap();
+        assert!(document.unsupported.is_empty());
+        assert_eq!(document.nodes.len(), 3);
+        assert!(document
+            .nodes
+            .iter()
+            .all(|node| node.server == "mieru.example.com"));
+        assert_eq!(document.nodes[0].params["transport"], "tcp");
+        assert_eq!(document.nodes[1].params["transport"], "udp");
+        assert_eq!(
+            document.nodes[0].params["multiplexing"],
+            "MULTIPLEXING_HIGH"
+        );
+        assert_eq!(
+            document.nodes[0].params["handshake-mode"],
+            "HANDSHAKE_NO_WAIT"
+        );
+    }
+
+    fn proto_message(fields: &[Vec<u8>]) -> Vec<u8> {
+        fields.iter().flatten().copied().collect()
+    }
+
+    fn proto_bytes_field(number: u32, value: &[u8]) -> Vec<u8> {
+        let mut output = proto_varint(u64::from(number) << 3 | 2);
+        output.extend(proto_varint(value.len() as u64));
+        output.extend_from_slice(value);
+        output
+    }
+
+    fn proto_varint_field(number: u32, value: u64) -> Vec<u8> {
+        let mut output = proto_varint(u64::from(number) << 3);
+        output.extend(proto_varint(value));
+        output
+    }
+
+    fn proto_varint(mut value: u64) -> Vec<u8> {
+        let mut output = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                return output;
+            }
         }
     }
 }

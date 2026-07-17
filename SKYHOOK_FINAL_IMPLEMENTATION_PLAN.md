@@ -8,11 +8,11 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.27（完成 M3 Hysteria v1，进入 Mieru）
+> 计划版本：v1.28（完成 M3 Mieru，进入 Juicity）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 已验证，M3 Hysteria v1 已完成，当前直接执行点为 M3 Mieru。按固定范围估算，
-> 当前整体实现进度约 62%。
+> M2 已验证，M3 Hysteria v1 和 Mieru 已完成，当前直接执行点为 M3 Juicity。按固定范围估算，
+> 当前整体实现进度约 64%。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -226,7 +226,7 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 - Outbound 生产模块中的 `use super::*` 已清零；factory、SSH、WireGuard、Snell 和 SSR
   已改为显式依赖，公共十六进制工具和 UDP session pool 容量常量已归入所属模块。
 - API、核心协调和 UI 状态职责仍过度集中。
-- 当前代码中 Mieru、Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
+- 当前代码中 Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
 - Mihomo 当前官方协议列表中的 Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch 尚未进入 Skyhook 正式模型。
 - TUN 当前依赖 `tun2proxy 0.8.1`，不具备最终要求的完整事务恢复能力。
 
@@ -374,8 +374,13 @@ M1 Outbound 第一批已实现、验证并提交：
   4 项真实 QUIC 集成、6 项协议单元、订阅/config/capability 回归通过，并已与官方 `hy1`
   分支 `ac56271` 服务端完成 TCP/UDP 互通。`faketcp` 依赖 Linux packet backend，在 macOS
   上明确拒绝。
+- M3 Mieru 已完成原生 v3 TCP/UDP underlay、PBKDF2-HMAC-SHA256 与 XChaCha20-Poly1305、
+  用户认证、standard/no-wait handshake、multiplexing、random padding、MTU 分片、累计 ACK、
+  RTT/RTO、快速重传、CUBIC、心跳和 SOCKS5 TCP/UDP relay；官方 `mierus://`、protobuf
+  `mieru://`、固定端口和 `port-range` 均已接入。9 项协议单元/实拨、3 项分享与配置回归、
+  49 项既有协议/runtime 回归通过，并与官方 `mita` 服务端完成 TCP/UDP、多会话、UDP
+  ASSOCIATE 及丢包乱序互通。
 - `UnsupportedProtocolOutbound` 仍承载：
-  - Mieru
   - Juicity
   - MASQUE
   - OpenVPN
@@ -392,8 +397,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收，M3 Hysteria v1 已完成；
-   继续依次完成 Mieru、Juicity、MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch。
+1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收，M3 Hysteria v1、Mieru
+   已完成；继续依次完成 Juicity、MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、
+   DNS outbound 和 Rematch。
 2. 按 M3 完成所有 parse-only/缺失协议的真实 TCP/UDP 拨号、认证、传输组合、错误映射和
    互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1470,12 +1476,20 @@ Mihomo 冻结基线有、当前 Skyhook 正式模型缺失：
 
 ### 12.3 Mieru
 
-- 官方配置字段模型。
-- TCP/UDP。
-- authentication。
-- multiplexing/padding。
-- MTU。
-- mock server 或官方实现互操作。
+- [x] 官方配置字段模型、官方简单/完整分享格式、固定端口和 `port-range`。
+- [x] 原生 TCP/UDP underlay 和 TCP/UDP 逻辑会话。
+- [x] PBKDF2-HMAC-SHA256、XChaCha20-Poly1305 与 username/password authentication。
+- [x] standard/no-wait handshake、off/low/middle/high multiplexing 和 random padding。
+- [x] MTU 分片、累计 ACK、乱序恢复、RTT/RTO、快速重传、CUBIC、心跳和失败截止。
+- [x] SOCKS5 CONNECT 与 UDP ASSOCIATE、endpoint-independent UDP 会话复用。
+- [x] 本地 TCP/UDP 真实拨号测试及官方 `mita` TCP/UDP、多路复用、UDP ASSOCIATE、
+  丢包乱序互操作。
+
+实现与证据：
+
+- `Supercore/src/outbound/mieru.rs`
+- `Supercore/src/subscription/mod.rs`
+- `Supercore/docs/protocol-matrix.md`
 
 ### 12.4 Juicity
 

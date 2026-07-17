@@ -26,6 +26,7 @@ deoxys = { version = "0.2.0-rc.3", default-features = false, features = ["alloc"
 zears = "0.2.1"
 ascon-aead = "=0.4.2"
 poly1305 = "0.8.0"
+pbkdf2 = "0.12"
 subtle = "2.5"
 cipher = "0.4"
 clap = { version = "4", features = ["derive"] }

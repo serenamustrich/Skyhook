@@ -766,11 +766,20 @@ pub enum OutboundConfig {
     Mieru {
         name: String,
         server: String,
+        #[serde(default)]
         port: u16,
+        #[serde(default, alias = "port-range", alias = "port_range")]
+        port_range: Option<String>,
         username: String,
         password: String,
         #[serde(default)]
         transport: Option<String>,
+        #[serde(default)]
+        mtu: Option<u16>,
+        #[serde(default)]
+        multiplexing: Option<String>,
+        #[serde(default, alias = "handshake-mode", alias = "handshake_mode")]
+        handshake_mode: Option<String>,
     },
     Juicity {
         name: String,
