@@ -8,9 +8,9 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.11（按 2026-07-17 `350ba26` 已提交基线重新核对）
+> 计划版本：v1.12（按 2026-07-17 `f8ac08a` 已提交基线重新核对）
 >
-> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008B2`。
+> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008D`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -312,9 +312,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `4e343a3` 基线上重新核对：
+2026-07-17 在 `f8ac08a` 基线上重新核对：
 
-- 当前分支为 `main`，已提交代码基线停在 `4e343a3`。
+- 当前分支为 `main`，已提交代码基线停在 `f8ac08a`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -343,7 +343,14 @@ M1 Outbound 第一批已实现、验证并提交：
   sing-mux 物理会话与逻辑流，支持连接/流上限、padding、only-tcp、UDP stream、
   cancellation、坏会话剔除后单次重试，以及 `/v1/outbounds` 运行统计；两个并发逻辑流
   共用一条物理连接已由本地真实对端验证。
-- WebSocket early data 字段尚未接入握手；该能力继续由 `NEXT-008B2` 收口。
+- `NEXT-008B2` 已以 `f8ac08a` 提交：WebSocket early data 支持 URL path、指定 header
+  和 `?ed=N` 兼容入口，首写使用无竞态懒握手并保留握手响应后的预读数据；HTTPUpgrade
+  请求写入和响应头使用同一总 deadline 并支持 cancellation；H2 对 RST、异常 GOAWAY 和
+  graceful GOAWAY 均有不挂死的定向测试；Hysteria2/TUIC 使用单飞初始化、坏连接剔除的
+  共享 QUIC pool，并由本地真实 QUIC 对端验证 16 个并发调用只建立一条连接、失效后只
+  重建一次、清池时连接确实关闭。验证结果：`cargo check --all-targets` 无 warning，Rust
+  lib 133 passed，transport 21 passed，Trojan/VMess 19 passed，VLESS/Hysteria2/TUIC 19
+  passed，Shadowsocks 15 passed，common options 14 passed、1 个 MPTCP entitlement 测试 ignored。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
@@ -363,25 +370,23 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 完成 `NEXT-008B2`：WebSocket early data、HTTPUpgrade 阶段超时、H2 GOAWAY/RST 和 QUIC
-   pool 并发、失效重建、关闭语义的真实 mock-server 测试。
-2. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
+1. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
    统计的独立验收，不允许未实际执行的 session 被记为超时。
-3. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
+2. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
    OpenAPI 3.1 与 Swift client model。
-4. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
+3. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
    mock、config/runtime、plan behavior 和 Swift `/v1` 回归全部通过后，才将 M1 改为
    `IMPLEMENTED`；MPTCP 的外部 profile 真机证据在 M12 补齐后再改为 `VERIFIED`。
-5. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
+4. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
-6. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
+5. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
-7. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
+6. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
     多订阅本地切换、Provider、代理组、国家分组、智能规则、App/域名/IP 指定节点、
     按订阅累计流量、连接表、分类日志和 Doctor。
-8. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
+7. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
     profiling、长稳、安全、CI、供应链、开源许可和文档真实性收口。
-9. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
+8. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
     更新中英文 README，完成签名、
     公证、带既定背景和 Finder 布局的 DMG、安全扫描、GitHub 提交与 Release 下载链接。
 
@@ -793,14 +798,15 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - WebSocket 正确处理 ping、pong、close，不再把控制帧交给业务流。
      - TLS client session cache 已启用。
      - 验证：`cargo check --all-targets` 无 warning；outbound lib 48 passed。
-   - [ ] `NEXT-008B`：完成 transport edge cases 和连接池。
+   - [x] `NEXT-008B`：完成 transport edge cases 和连接池。
      - [x] `NEXT-008B1`：WebSocket fragmentation/ping/pong/close、H2/gRPC drop reset、
        gRPC trailers、QUIC MTU/zero-RTT/congestion policy，以及 Hysteria2/TUIC 复用同一
        已认证 QUIC connection。
-     - [ ] `NEXT-008B2`：WebSocket early data 配置、HTTPUpgrade 显式阶段超时、H2
+     - [x] `NEXT-008B2`：WebSocket early data 配置、HTTPUpgrade 显式阶段超时、H2
        GOAWAY/RST 定向测试和 QUIC pool 并发/失效重建测试。
-     - 验证：`cargo check --all-targets` 无 warning；outbound lib 48 passed；
-       `vless_hy2_tuic` 19 passed。
+     - 验证：`cargo check --all-targets` 无 warning；Rust lib 133 passed；transport 21
+       passed；`trojan_vmess_real_dial` 19 passed；`vless_hy2_tuic` 19 passed；
+       `ss_real_dial` 15 passed；`common_outbound_options` 14 passed、1 ignored。
    - [ ] `NEXT-008C`：完成 common fields。
      - [x] `NEXT-008C1`：验收 IP version、interface-name、routing-mark 限制、
        UDP 开关、certificate fingerprint、TFO、dialer-proxy、keepalive 和 QUIC 选项；
