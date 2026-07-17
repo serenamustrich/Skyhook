@@ -4,7 +4,7 @@ Supercore is a Rust-native proxy core for 玥球电梯.
 
 This is not a Mihomo compatibility wrapper. It has its own config model, routing model, telemetry, and control API.
 
-## Current MVP
+## Features
 
 Protocol capability is described by `docs/protocol-matrix.md` (full/partial/parse-only/unsupported).
 Items in this section are capabilities that exist in the current product; protocol-level completeness is
@@ -64,6 +64,8 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   context. SSH and WireGuard implementations are isolated protocol modules.
 - Shared transport modules for TCP, TLS, HTTP CONNECT, WebSocket, HTTP/2, gRPC, HTTPUpgrade, and
   QUIC client configuration.
+- Shared UDP runtime with bounded associations, endpoint-dependent and endpoint-independent NAT
+  keying, queue backpressure, idle eviction, replay/reassembly guards, and per-outbound statistics.
 - Traceable, cancellable dial contexts propagated through concrete outbounds and proxy groups.
 - Outbound capability reporting for TCP/UDP support, UDP mode, and known protocol limitations.
 - Connection table, traffic totals, event logs, and outbound health.
@@ -163,6 +165,9 @@ is passed.
 - `GET /v1/traffic`
 - `GET /v1/traffic/subscriptions`
 - `GET /v1/smart-rules`
+- `GET /v1/smart-rules/rules`
+- `GET /v1/smart-rules/observations`
+- `GET /v1/smart-rules/recommendations`
 - `POST /v1/smart-rules`
 - `POST /v1/smart-rules/enabled`
 - `POST /v1/smart-rules/delete`
@@ -180,6 +185,14 @@ is passed.
 - `GET /v1/tasks/{id}`
 - `POST /v1/tasks/{id}/cancel`
 - `GET /v1/events`
+
+Collection endpoints accept a common query contract: `limit` (default `200`, maximum `500`), an
+opaque `cursor`, case-insensitive `filter`, endpoint-specific `sort`, and `order=asc|desc`. Their
+response includes `pagination.limit`, `returned`, `total`, `next_cursor`, `sort`, `order`, and
+`filter`. Cursors are tied to the original filter/sort query and return an explicit stale-cursor
+error when their anchor no longer exists. This contract applies to outbounds, groups, countries,
+subscriptions, providers, rules, smart-rule collections, subscription traffic, connections, logs,
+and tasks.
 
 The control listener is restricted to loopback addresses. `GET`, `HEAD`, and `OPTIONS` are
 read-only operations. Every write request must send `Authorization: Bearer <token>`. The macOS App
@@ -287,6 +300,11 @@ member. `GET /v1/countries` returns country buckets inferred from node names and
 
 `GET /v1/traffic/subscriptions` returns lifetime upload/download totals persisted per
 subscription.
+
+`GET /v1/smart-rules` returns the lightweight learning summary. Rules, observations, and
+recommendations are exposed as independently paginated collections through
+`/v1/smart-rules/rules`, `/v1/smart-rules/observations`, and
+`/v1/smart-rules/recommendations`.
 
 `POST /v1/smart-rules` inserts or replaces a smart override:
 

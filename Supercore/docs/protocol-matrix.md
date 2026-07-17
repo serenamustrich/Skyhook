@@ -46,6 +46,7 @@
 | QUIC | partial | Hysteria2/TUIC 已有实现和协议单元测试，完整 mock server E2E 待补 |
 | XTLS Vision | partial | 基础支持 |
 | Reality | partial | 基础支持 |
+| 公共 UDP runtime | full | 有界 association/session、两种 NAT keying、队列背压、空闲淘汰、重放/重组保护与每出站统计；具体协议是否支持 UDP 仍以协议行能力为准 |
 
 ## 实现边界
 
@@ -67,6 +68,8 @@
   `src/outbound/hysteria2.rs`。
 - TUIC v5 auth、TCP stream、native/QUIC UDP relay 和 reassembly 位于
   `src/outbound/tuic.rs`。
+- 跨协议 UDP association、NAT key、session pool、背压、idle eviction、reassembly、
+  replay window 和统计位于 `src/outbound/udp/`；协议私有 wire format 保留在各协议模块。
 - 两者共用的 endpoint 连接生命周期、QUIC varint 和连接超时位于
   `src/outbound/transports/quic.rs`。
 - 跨协议精确读取 helper 位于 `src/outbound/io.rs`；协议私有 crypto/framing 不进入

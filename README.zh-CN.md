@@ -2,7 +2,7 @@
 
 这是一个面向 `YueqiuElevatorSupercore` 的 macOS 桌面客户端与 Rust-native 核心组合，客户端不再调用外部核心，所有代理运行由仓库内的 `Supercore` 提供。
 
-## 已确认能力
+## 功能
 
 - 节点配置：支持常见 Clash 风格的订阅与本地 YAML 配置。
 - 协议支持按能力等级声明（full / partial / parse-only / unsupported）：
@@ -60,6 +60,9 @@ TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未
 - `POST /v1/providers/update-all`
 - `GET /v1/traffic/subscriptions`
 - `GET /v1/smart-rules`
+- `GET /v1/smart-rules/rules`
+- `GET /v1/smart-rules/observations`
+- `GET /v1/smart-rules/recommendations`
 - `POST /v1/smart-rules`
 - `GET /v1/tun`
 - `GET /v1/doctor`
@@ -74,6 +77,16 @@ TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未
 控制接口只允许监听本机 loopback。读取接口可直接访问，所有写操作必须携带
 `Authorization: Bearer <token>`。普通核心进程每次启动使用新的 256-bit Token；TUN
 LaunchDaemon 从 root-only `0600` 文件读取 Token，plist 中不保存明文凭据。
+
+列表接口统一支持 `limit`（默认 200，最大 500）、不透明 `cursor`、不区分大小写的
+`filter`、接口允许的 `sort` 字段和 `order=asc|desc`。响应中的 `pagination` 返回本页数量、
+筛选后总数、下一页游标和实际排序条件。游标与原筛选/排序条件绑定；锚点失效时接口会
+明确返回 stale-cursor 错误。该约定覆盖节点、代理组、国家、订阅、Provider、规则、
+智能规则明细、订阅流量、连接、日志和任务列表。
+
+`GET /v1/smart-rules` 返回轻量统计摘要；规则、观察记录和推荐列表分别从
+`/v1/smart-rules/rules`、`/v1/smart-rules/observations` 和
+`/v1/smart-rules/recommendations` 分页读取。
 
 `POST /v1/probes/group` 使用 JSON body 传递 `group`，避免路径二次编码问题，支持包含 `/`、中文、emoji 的组名。
 
@@ -98,4 +111,3 @@ macOS App 默认使用 SSE 驱动实时速率、增量日志和任务进度；�
 ## 运行提示
 
 - 源码构建后使用仓库内的启动脚本和脚本目录进行启动。
-- 当前以现网可观测与可回归能力为优先，协议功能与文档中的状态保持同步更新。

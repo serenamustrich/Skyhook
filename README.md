@@ -2,13 +2,14 @@
 
 这是一个独立的 macOS 菜单栏代理客户端，核心只使用本仓库的 Rust `Supercore`。它参考旧版玥球电梯的产品能力，但不提供双核心切换，也不依赖外部第三方核心运行时。
 
-## Current MVP
+## 功能
 
 - 导入常见 Clash/YAML 或 URI 订阅链接。
 - 保存多个订阅、订阅 URL、套餐流量和到期信息。
 - 按订阅保存原始订阅、Supercore runtime、节点选择、智能规则和累计流量。
 - 从 App 启动、停止 Supercore。
 - 通过独立 `/v1/*` 控制接口读取代理组、国家分组、节点延迟、日志、流量和智能规则建议。
+- 节点、代理组、订阅、规则、日志和任务等列表支持统一的筛选、排序与游标分页。
 - 选择具体节点、代理组择优、国家自动择优。
 - 后台更新订阅、后台测速，不阻塞当前代理使用。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
@@ -39,7 +40,7 @@ App 数据位置：
 ~/Library/Logs/YueqiuElevator
 ```
 
-## Notes
+## TUN
 
 TUN 模式需要 root/LaunchDaemon 才能完整接管 macOS 路由和 DNS。普通 App 启动可用于 mixed 代理、订阅、测速和界面调试；需要长期免输密码运行 TUN 时，使用 `Supercore/scripts/install_macos_launch_daemon.sh` 走 Supercore 的 LaunchDaemon 路径。
 
