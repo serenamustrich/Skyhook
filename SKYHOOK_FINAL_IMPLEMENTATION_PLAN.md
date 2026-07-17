@@ -8,9 +8,9 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.8（按 2026-07-17 `d59bbd2` 已提交基线和当前未提交工作区重新核对）
+> 计划版本：v1.10（按 2026-07-17 `4e343a3` 已提交基线重新核对）
 >
-> 当前文档状态：`READY_TO_EXECUTE`。M0 已验证，M1 进行中，本轮仅更新计划。
+> 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 进行中，当前直接执行点为 `NEXT-008C3`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -151,6 +151,8 @@
 - `f556713 Core: minimize outbound module root`
 - `1b5c0c9 Network: add context aware socket dialing`
 - `d59bbd2 Network: harden transport lifecycle`
+- `78b76ed Network: apply common outbound options`
+- `4e343a3 Network: add native macOS MPTCP bridge`
 
 已经完成的基础：
 
@@ -310,9 +312,9 @@ M1 Outbound 第一批已实现、验证并提交：
 
 ### 5.5 本次计划审计结论
 
-2026-07-17 在 `d59bbd2` 基线和当前未提交工作区上重新核对：
+2026-07-17 在 `4e343a3` 基线上重新核对：
 
-- 当前分支为 `main`，已提交基线停在 `d59bbd2`。
+- 当前分支为 `main`，已提交代码基线停在 `4e343a3`。
 - `hysteria2.rs` 和 `tuic.rs` 已迁出根模块，factory 通过构造函数创建协议实例。
 - QUIC 公共层统一 remote resolve、bind 地址、endpoint config、连接超时、varint 和
   随机 ID；协议认证、帧格式、obfs 和 UDP association 保持在协议私有模块。
@@ -322,14 +324,23 @@ M1 Outbound 第一批已实现、验证并提交：
   定向回归通过。
 - `NEXT-007` 已把 `outbound/mod.rs` 从 1,924 行缩至 37 行；factory、SSH/WireGuard、
   Snell、SSR 和测试边界均已收口。
-- 当前工作区有 12 个已修改 Rust 文件和 1 个新文件
-  `outbound/configured.rs`，它们属于 `NEXT-008C1`，不得丢弃、重置或拆入无关提交。
-- 该未提交批次已初步接入 common outbound options、UDP 开关、certificate
-  fingerprint、dialer-proxy 链式 TCP 拨号和配置解析；目前只能确认
-  `cargo check --all-targets` 通过，尚未运行本批次定向测试，因此不计为完成。
-- MPTCP 当前仅有明确限制和错误路径；smux 当前只有配置模型且会明确拒绝启用；
-  WebSocket early data 字段尚未接入握手。这三项均必须继续实现，不得用
-  “已解析”或“已报错”代替功能完成。
+- `NEXT-008C1` 已完成 common outbound options、UDP 开关、certificate fingerprint、
+  dialer-proxy 链式 TCP 拨号、配置校验和订阅/runtime merge，并以 `78b76ed` 提交；
+  定向验证结果记录在 10.3 节。
+- `NEXT-008C2` 已以 `4e343a3` 提交，当前状态为
+  `IMPLEMENTED / RELEASE_VERIFICATION_PENDING`：
+  - 使用公开 Network.framework `nw_parameters_set_multipath_service`，不以普通 TCP
+    冒充 MPTCP，也不依赖私有 socket option。
+  - bridge 已覆盖 loopback、双向 512KB、half-close、预取消和 drop 释放；500ms
+    总 deadline 不再因固定预留 750ms 而退化为 1ms 原生连接预算。
+  - MPTCP 与 interface-name、外层 dialer-proxy 和 TFO 的不安全组合在配置期明确拒绝。
+  - 默认 App 构建不携带受限 entitlement，签名有效且核心可以启动；只有提供非 ad-hoc
+    identity 和授权 multipath 的 provisioning profile 时才启用 MPTCP 签名。
+- `NEXT-008C2` 尚未达到 `VERIFIED`：当前机器没有匹配
+  `com.apple.developer.networking.multipath` 的 Apple provisioning profile，真实 Wi-Fi/
+  有线网络多路径切换留在 M12 发布真机门，不能用本地 bridge 测试替代。
+- smux 当前只有配置模型且会明确拒绝启用；WebSocket early data 字段尚未接入握手。
+  这些能力必须继续实现，不得用“已解析”或“已报错”代替功能完成。
 - `UnsupportedProtocolOutbound` 仍承载：
   - Hysteria v1
   - Mieru
@@ -349,35 +360,31 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. 保护当前 13 个未提交文件，完成 `NEXT-008C1`。先为 common options、UDP 开关、
-   certificate fingerprint、未知 outbound 配置和 dialer-proxy 链路增加真实行为测试，
-   通过后才作为一个独立提交。
-2. 完成 `NEXT-008C2`：接入 macOS 真实 MPTCP 拨号，使用可验证的系统 API；平台不支持
-   时返回结构化 capability 限制，不静默降级为普通 TCP。
-3. 完成 `NEXT-008C3`：实现 smux、yamux 和 h2mux 的连接/流生命周期、有界池、健康剔除、
+1. 完成 `NEXT-008C3`：实现 smux、yamux 和 h2mux 的连接/流生命周期、有界池、健康剔除、
    cancellation、流量统计和 only-tcp 语义，并证明多流复用真正发生。
-4. 完成 `NEXT-008B2`：WebSocket early data、HTTPUpgrade 阶段超时、H2 GOAWAY/RST 和 QUIC
+2. 完成 `NEXT-008B2`：WebSocket early data、HTTPUpgrade 阶段超时、H2 GOAWAY/RST 和 QUIC
    pool 并发、失效重建、关闭语义的真实 mock-server 测试。
-5. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
+3. 完成 `NEXT-008D`：公共 UDP association、NAT 模式、碎片、重放窗口、背压、超时清理和
    统计的独立验收，不允许未实际执行的 session 被记为超时。
-6. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
+4. 完成 `NEXT-008E`：统一 API 分页、过滤、稳定排序、游标和 API state 边界，同步
    OpenAPI 3.1 与 Swift client model。
-7. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
+5. 执行 `NEXT-009` M1 集中验收：Rust all-target check、lib、协议定向集成、transport/UDP
    mock、config/runtime、plan behavior 和 Swift `/v1` 回归全部通过后，才将 M1 改为
-   `VERIFIED`。
-8. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
+   `IMPLEMENTED`；MPTCP 的外部 profile 真机证据在 M12 补齐后再改为 `VERIFIED`。
+6. 按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
-9. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
+7. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
-10. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
+8. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
     多订阅本地切换、Provider、代理组、国家分组、智能规则、App/域名/IP 指定节点、
     按订阅累计流量、连接表、分类日志和 Doctor。
-11. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
+9. 按 M10-M11 拆分 Swift 集中状态、完成菜单栏与全部页面交互，然后完成性能基线、
     profiling、长稳、安全、CI、供应链、开源许可和文档真实性收口。
-12. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，更新中英文 README，完成签名、
+10. 按 M12 执行真实订阅/节点/系统代理/TUN/恢复矩阵，补齐 MPTCP profile 真机证据，
+    更新中英文 README，完成签名、
     公证、带既定背景和 Finder 布局的 DMG、安全扫描、GitHub 提交与 Release 下载链接。
 
-在第 12 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
+在第 10 项通过前，不把“能编译”“能解析”或“部分协议能连接”表述为最终完成。
 
 ## 6. 不可违反的开发规则
 
@@ -794,10 +801,21 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
      - 验证：`cargo check --all-targets` 无 warning；outbound lib 48 passed；
        `vless_hy2_tuic` 19 passed。
    - [ ] `NEXT-008C`：完成 common fields。
-     - [x] `NEXT-008C1`：验收当前未提交的 IP version、interface-name、routing-mark 限制、
+     - [x] `NEXT-008C1`：验收 IP version、interface-name、routing-mark 限制、
        UDP 开关、certificate fingerprint、TFO、dialer-proxy、keepalive 和 QUIC 选项；
        覆盖订阅解析、runtime merge、capability、链路循环与真实拨号测试。
-     - [ ] `NEXT-008C2`：完成 macOS MPTCP 真实 socket/系统 API 路径与 capability 验证。
+     - [ ] `NEXT-008C2`：完成 macOS MPTCP 真实系统 API 路径与 capability 验证。
+       当前状态：`IMPLEMENTED / RELEASE_VERIFICATION_PENDING`。
+       - [x] 修复 Network.framework bridge 的默认 TCP 参数栈，先通过禁用 multipath 的
+         loopback、双向大数据、half-close、取消、超时和 drop 测试。
+       - [x] 通过公开 `nw_parameters_set_multipath_service` 启用 MPTCP，保持完整 deadline、
+         cancellation、错误域/错误码和连接状态映射。
+       - [x] 对无 entitlement、系统不支持和运行时被拒绝返回结构化
+         capability/error，不得静默回退普通 TCP。
+       - [x] 区分开发签名和正式 MPTCP 签名；正式包验证 entitlement、profile、nested core
+         与 App 签名一致性，普通开发包不得因受限 entitlement 被 AMFI 终止。
+       - [ ] 在具有合法 profile 的 Apple Silicon 真机验证 Wi-Fi/有线网络路径变化、
+         公网远端 TCP、连接存活、流量连续性和回退行为后，才将本项改为 `VERIFIED`。
      - [ ] `NEXT-008C3`：完成 smux、yamux、h2mux、pool limits、padding、only-tcp 和失效剔除。
    - [ ] `NEXT-008D`：收口公共 UDP association、NAT、fragmentation/reassembly、replay window、
      backpressure、idle eviction、cancellation 和统计证据。
@@ -862,6 +880,18 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 - `remaining_protocols`：29 passed。
 - `subscription_store`：13 passed。
 - 真实订阅 fixture：1 passed；需外部 URL 的用例按设计 ignored。
+
+`NEXT-008C2` 本地实现验证记录：
+
+- Network.framework bridge：4 passed，覆盖双向传输、512KB 背压、half-close、预取消和 drop。
+- `common_outbound_options`：11 passed、1 个真实 entitlement 用例 ignored。
+- outbound lib：53 passed。
+- `config_and_runtime`：20 passed。
+- `remaining_protocols`：29 passed。
+- `cargo check --all-targets`：通过且无 warning。
+- 默认无 profile App：Swift debug、Rust release、嵌套签名和 deep verify 通过；
+  `supercore --help` 正常退出，签名中不含 multipath entitlement。
+- 真实 MPTCP 多路径切换：等待合法 Apple provisioning profile，留在 M12 验收门。
 
 - `Outbound` 的 TCP/UDP/context 方法统一返回 `Result<_, OutboundError>`。
 - 删除业务路径用字符串猜测错误类型。
