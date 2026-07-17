@@ -26,6 +26,7 @@ use super::{
     transports::{
         connect_quic_endpoint, create_quic_endpoint, encode_quic_varint, quic_client_config,
         random_u16, random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
+        SharedConnectionPool,
     },
     udp::{create_bound_std_udp, RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
@@ -41,7 +42,7 @@ pub(super) struct Hysteria2Outbound {
     obfs: Option<String>,
     obfs_password: Option<String>,
     alpn: Option<String>,
-    connection: TokioMutex<Option<Arc<Hysteria2Connection>>>,
+    connection: SharedConnectionPool<Hysteria2Connection>,
     udp_sessions: TokioMutex<Hysteria2UdpPool>,
 }
 
@@ -198,7 +199,7 @@ impl Hysteria2Outbound {
             obfs,
             obfs_password,
             alpn,
-            connection: TokioMutex::new(None),
+            connection: SharedConnectionPool::default(),
             udp_sessions: TokioMutex::new(Hysteria2UdpPool::default()),
         }
     }
@@ -208,28 +209,23 @@ impl Hysteria2Outbound {
         obfs_config: Option<&Hysteria2ObfsConfig>,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<Hysteria2Connection>> {
-        let mut pooled = self.connection.lock().await;
-        if let Some(connection) = pooled
-            .as_ref()
-            .filter(|connection| connection.connection.close_reason().is_none())
-        {
-            return Ok(Arc::clone(connection));
-        }
-        let connection = Arc::new(
-            open_hysteria2_connection(
-                &self.server,
-                self.port,
-                self.sni.as_deref(),
-                self.skip_cert_verify,
-                &self.password,
-                self.alpn.as_deref(),
-                obfs_config,
-                timeout_ms,
+        self.connection
+            .get_or_connect(
+                |connection| connection.connection.close_reason().is_none(),
+                || {
+                    open_hysteria2_connection(
+                        &self.server,
+                        self.port,
+                        self.sni.as_deref(),
+                        self.skip_cert_verify,
+                        &self.password,
+                        self.alpn.as_deref(),
+                        obfs_config,
+                        timeout_ms,
+                    )
+                },
             )
-            .await?,
-        );
-        *pooled = Some(Arc::clone(&connection));
-        Ok(connection)
+            .await
     }
 
     async fn hysteria2_udp_session(

@@ -32,8 +32,8 @@ use crate::routing::Destination;
 
 use super::{
     transports::{
-        connect_tcp, open_grpc_tunnel, open_h2_tunnel, perform_websocket_handshake,
-        spawn_websocket_stream, tls_client_config, NoCertificateVerification,
+        connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_websocket_transport_without_headers,
+        tls_client_config, NoCertificateVerification,
     },
     udp::{KeyedRoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
@@ -283,7 +283,7 @@ impl VlessOutbound {
             let connector = TlsConnector::from(Arc::new(tls_config));
             let tls_server_name = ServerName::try_from(server_name.clone())
                 .map_err(|error| anyhow!("invalid vless server name: {error}"))?;
-            let mut stream = timeout(
+            let stream = timeout(
                 Duration::from_millis(timeout_ms),
                 connector.connect(tls_server_name, tcp),
             )
@@ -291,13 +291,13 @@ impl VlessOutbound {
             .context("vless tls handshake timed out")?
             .context("vless tls handshake failed")?;
             if network == "ws" || network == "websocket" {
-                perform_websocket_handshake(
-                    &mut stream,
+                return open_websocket_transport_without_headers(
+                    stream,
                     self.ws_host.as_deref().unwrap_or(&server_name),
                     self.ws_path.as_deref().unwrap_or("/"),
+                    timeout_ms,
                 )
-                .await?;
-                return Ok(Box::new(spawn_websocket_stream(stream)));
+                .await;
             }
             if network == "grpc" {
                 return open_grpc_tunnel(
@@ -321,15 +321,15 @@ impl VlessOutbound {
             }
             Ok(Box::new(stream))
         } else {
-            let mut stream = tcp;
+            let stream = tcp;
             if network == "ws" || network == "websocket" {
-                perform_websocket_handshake(
-                    &mut stream,
+                return open_websocket_transport_without_headers(
+                    stream,
                     self.ws_host.as_deref().unwrap_or(&self.server),
                     self.ws_path.as_deref().unwrap_or("/"),
+                    timeout_ms,
                 )
-                .await?;
-                return Ok(Box::new(spawn_websocket_stream(stream)));
+                .await;
             }
             if network == "grpc" {
                 return open_grpc_tunnel(

@@ -17,7 +17,7 @@ use super::{
     target::{encode_socks5_destination, read_socks5_destination_after_atyp},
     transports::{
         connect_tcp, open_grpc_tunnel, open_h2_tunnel, open_http_upgrade_tunnel,
-        perform_websocket_handshake_with_headers, spawn_websocket_stream, tls_client_config,
+        open_websocket_transport, tls_client_config,
     },
     udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     util::hex_lower,
@@ -161,7 +161,7 @@ impl TrojanOutbound {
         let connector = TlsConnector::from(Arc::new(tls_config));
         let tls_server_name = ServerName::try_from(server_name.clone())
             .map_err(|error| anyhow!("invalid trojan server name: {error}"))?;
-        let mut stream = timeout(
+        let stream = timeout(
             Duration::from_millis(timeout_ms),
             connector.connect(tls_server_name, tcp),
         )
@@ -172,14 +172,14 @@ impl TrojanOutbound {
         match network.as_str() {
             "tcp" => Ok(Box::new(stream)),
             "ws" | "websocket" => {
-                perform_websocket_handshake_with_headers(
-                    &mut stream,
+                open_websocket_transport(
+                    stream,
                     self.ws_host.as_deref().unwrap_or(&server_name),
                     self.ws_path.as_deref().unwrap_or("/"),
                     &self.transport_headers,
+                    timeout_ms,
                 )
-                .await?;
-                Ok(Box::new(spawn_websocket_stream(stream)))
+                .await
             }
             "grpc" => open_grpc_tunnel(
                 stream,
@@ -202,6 +202,7 @@ impl TrojanOutbound {
                 self.ws_host.as_deref().unwrap_or(&server_name),
                 self.ws_path.as_deref().unwrap_or("/"),
                 &self.transport_headers,
+                timeout_ms,
             )
             .await
             .map(|stream| Box::new(stream) as BoxedStream),

@@ -110,15 +110,15 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
 }
 
 pub(crate) fn tls_client_config(skip_cert_verify: bool) -> anyhow::Result<ClientConfig> {
-    let provider = aws_lc_rs::default_provider();
-    let builder = ClientConfig::builder_with_provider(provider.into())
+    let provider = Arc::new(aws_lc_rs::default_provider());
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?;
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let verifier: Arc<dyn ServerCertVerifier> = if skip_cert_verify {
         Arc::new(NoCertificateVerification)
     } else {
-        WebPkiServerVerifier::builder(Arc::new(roots)).build()?
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build()?
     };
     let verifier = active_dial_context()
         .and_then(|context| context.certificate_fingerprint)

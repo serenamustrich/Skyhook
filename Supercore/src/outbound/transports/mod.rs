@@ -1,3 +1,4 @@
+mod connection_pool;
 mod grpc;
 mod headers;
 mod http2;
@@ -10,6 +11,7 @@ mod tcp;
 mod tls;
 mod websocket;
 
+pub(crate) use connection_pool::SharedConnectionPool;
 pub(crate) use grpc::open_grpc_tunnel;
 pub(crate) use http2::{open_h2_tunnel, Http2TunnelStream};
 pub(crate) use http_connect::establish_http_connect;
@@ -22,9 +24,7 @@ pub(crate) use quic::{
 pub(crate) use socket_options::bind_interface;
 pub(crate) use tcp::{connect_tcp, order_addresses, scope_tcp_dialer};
 pub(crate) use tls::{tls_client_config, NoCertificateVerification};
-pub(crate) use websocket::{
-    perform_websocket_handshake, perform_websocket_handshake_with_headers, spawn_websocket_stream,
-};
+pub(crate) use websocket::{open_websocket_transport, open_websocket_transport_without_headers};
 
 #[cfg(test)]
 pub(crate) use headers::render_transport_headers;

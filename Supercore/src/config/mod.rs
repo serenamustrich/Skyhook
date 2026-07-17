@@ -136,6 +136,9 @@ impl OutboundCommonConfig {
                 bail!("WebSocket early-data header must be a valid HTTP token");
             }
         }
+        if self.websocket_max_early_data > 32 * 1024 {
+            bail!("WebSocket max-early-data must not exceed 32768 bytes");
+        }
         if let Some(smux) = &self.smux {
             if smux.enabled
                 && smux.max_streams > 0

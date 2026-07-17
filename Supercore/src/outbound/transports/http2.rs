@@ -6,12 +6,14 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     time::timeout,
 };
+
+use crate::outbound::context::{active_dial_context, DialContext};
 
 use super::headers::normalize_http_path;
 
@@ -24,12 +26,14 @@ pub(crate) async fn open_h2_tunnel<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (send_request, connection) = timeout(
-        Duration::from_millis(timeout_ms),
+    let context = active_dial_context();
+    let (send_request, connection) = run_h2_phase(
+        context.as_ref(),
+        timeout_ms,
+        "h2 handshake",
         h2::client::Builder::new().handshake(stream),
     )
-    .await
-    .context("h2 handshake timed out")?
+    .await?
     .context("h2 handshake failed")?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
@@ -37,10 +41,14 @@ where
         }
     });
 
-    let mut send_request = timeout(Duration::from_millis(timeout_ms), send_request.ready())
-        .await
-        .context("h2 client readiness timed out")?
-        .context("h2 client is not ready")?;
+    let mut send_request = run_h2_phase(
+        context.as_ref(),
+        timeout_ms,
+        "h2 client readiness",
+        send_request.ready(),
+    )
+    .await?
+    .context("h2 client is not ready")?;
     let path = normalize_http_path(path);
     let uri = format!("https://{host}{path}");
     let request = http::Request::builder()
@@ -61,6 +69,35 @@ where
         read_buffer: BytesMut::new(),
         closed: false,
     })
+}
+
+async fn run_h2_phase<F, T>(
+    context: Option<&DialContext>,
+    timeout_ms: u64,
+    phase: &'static str,
+    future: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = T>,
+{
+    let remaining = context
+        .map(DialContext::remaining_timeout)
+        .unwrap_or_else(|| Duration::from_millis(timeout_ms));
+    if remaining.is_zero() {
+        return Err(anyhow!("{phase} timed out"));
+    }
+    if let Some(context) = context {
+        tokio::select! {
+            _ = context.cancellation.cancelled() => Err(anyhow!("{phase} cancelled")),
+            result = timeout(remaining, future) => {
+                result.map_err(|_| anyhow!("{phase} timed out"))
+            }
+        }
+    } else {
+        timeout(remaining, future)
+            .await
+            .map_err(|_| anyhow!("{phase} timed out"))
+    }
 }
 
 pub(crate) struct Http2TunnelStream {
@@ -236,5 +273,122 @@ impl AsyncWrite for Http2TunnelStream {
             }
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::ErrorKind, time::Duration};
+
+    use bytes::Bytes;
+    use http::Response;
+    use tokio::io::AsyncReadExt;
+
+    use super::open_h2_tunnel;
+
+    #[tokio::test]
+    async fn remote_rst_is_reported_without_hanging() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server)
+                .await
+                .expect("server handshake");
+            let (_request, mut respond) = connection
+                .accept()
+                .await
+                .expect("request available")
+                .expect("request accepted");
+            let response = Response::builder().status(200).body(()).expect("response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("response headers");
+            send.send_reset(h2::Reason::REFUSED_STREAM);
+            let _ = tokio::time::timeout(Duration::from_millis(100), connection.accept()).await;
+        });
+
+        let mut tunnel = open_h2_tunnel(client, "example.com", "/tunnel", 1_000)
+            .await
+            .expect("h2 tunnel");
+        let mut byte = [0u8; 1];
+        let error = tokio::time::timeout(Duration::from_secs(1), tunnel.read(&mut byte))
+            .await
+            .expect("RST handling must not hang")
+            .expect_err("RST must fail the stream");
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert!(
+            error.to_string().contains("h2 response failed")
+                || error.to_string().contains("h2 receive failed"),
+            "unexpected RST error: {error}"
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn remote_goaway_before_response_is_reported_without_hanging() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server)
+                .await
+                .expect("server handshake");
+            let (_request, _respond) = connection
+                .accept()
+                .await
+                .expect("request available")
+                .expect("request accepted");
+            connection.abrupt_shutdown(h2::Reason::ENHANCE_YOUR_CALM);
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                while connection.accept().await.is_some() {}
+            })
+            .await;
+        });
+
+        let mut tunnel = open_h2_tunnel(client, "example.com", "/tunnel", 1_000)
+            .await
+            .expect("h2 tunnel");
+        let mut byte = [0u8; 1];
+        let error = tokio::time::timeout(Duration::from_secs(1), tunnel.read(&mut byte))
+            .await
+            .expect("GOAWAY handling must not hang")
+            .expect_err("GOAWAY must fail the pending response");
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert!(error.to_string().contains("h2 response failed"));
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn graceful_goaway_allows_active_stream_to_finish() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server)
+                .await
+                .expect("server handshake");
+            let (_request, mut respond) = connection
+                .accept()
+                .await
+                .expect("request available")
+                .expect("request accepted");
+            let response = Response::builder().status(200).body(()).expect("response");
+            let mut send = respond
+                .send_response(response, false)
+                .expect("response headers");
+            send.send_data(Bytes::from_static(b"ok"), true)
+                .expect("response body");
+            connection.graceful_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(1), async {
+                while connection.accept().await.is_some() {}
+            })
+            .await;
+        });
+
+        let mut tunnel = open_h2_tunnel(client, "example.com", "/tunnel", 1_000)
+            .await
+            .expect("h2 tunnel");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), tunnel.read_to_end(&mut response))
+            .await
+            .expect("graceful GOAWAY must not hang")
+            .expect("active stream must finish");
+        assert_eq!(response, b"ok");
+        server_task.await.expect("server task");
     }
 }

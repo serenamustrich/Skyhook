@@ -23,7 +23,7 @@ use crate::routing::Destination;
 use super::{
     transports::{
         connect_quic_endpoint, create_quic_endpoint, quic_client_config, random_u16,
-        resolve_quic_remote,
+        resolve_quic_remote, SharedConnectionPool,
     },
     udp::{RoundRobinSessionPool, UDP_SESSION_POOL_SIZE},
     BoxedStream, Outbound, OutboundCapability,
@@ -40,7 +40,7 @@ pub(super) struct TuicOutbound {
     congestion_control: Option<String>,
     udp_relay_mode: Option<String>,
     alpn: Option<String>,
-    connection: TokioMutex<Option<Arc<TuicConnection>>>,
+    connection: SharedConnectionPool<TuicConnection>,
     udp_sessions: TokioMutex<TuicUdpPool>,
 }
 
@@ -227,7 +227,7 @@ impl TuicOutbound {
             congestion_control,
             udp_relay_mode,
             alpn,
-            connection: TokioMutex::new(None),
+            connection: SharedConnectionPool::default(),
             udp_sessions: TokioMutex::new(TuicUdpPool::default()),
         }
     }
@@ -237,29 +237,24 @@ impl TuicOutbound {
         user_id: &Uuid,
         timeout_ms: u64,
     ) -> anyhow::Result<Arc<TuicConnection>> {
-        let mut pooled = self.connection.lock().await;
-        if let Some(connection) = pooled
-            .as_ref()
-            .filter(|connection| connection.connection.close_reason().is_none())
-        {
-            return Ok(Arc::clone(connection));
-        }
-        let connection = Arc::new(
-            open_tuic_connection(
-                &self.server,
-                self.port,
-                self.sni.as_deref(),
-                self.skip_cert_verify,
-                self.alpn.as_deref(),
-                self.congestion_control.as_deref(),
-                user_id,
-                &self.password,
-                timeout_ms,
+        self.connection
+            .get_or_connect(
+                |connection| connection.connection.close_reason().is_none(),
+                || {
+                    open_tuic_connection(
+                        &self.server,
+                        self.port,
+                        self.sni.as_deref(),
+                        self.skip_cert_verify,
+                        self.alpn.as_deref(),
+                        self.congestion_control.as_deref(),
+                        user_id,
+                        &self.password,
+                        timeout_ms,
+                    )
+                },
             )
-            .await?,
-        );
-        *pooled = Some(Arc::clone(&connection));
-        Ok(connection)
+            .await
     }
 
     async fn tuic_udp_session(
