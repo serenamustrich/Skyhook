@@ -445,6 +445,12 @@ pub enum OutboundConfig {
         username: Option<String>,
         #[serde(default)]
         password: Option<String>,
+        #[serde(default)]
+        tls: bool,
+        #[serde(default)]
+        sni: Option<String>,
+        #[serde(default)]
+        skip_cert_verify: bool,
     },
     Socks5 {
         name: String,
@@ -732,6 +738,16 @@ pub enum OutboundConfig {
         private_key: Option<String>,
         #[serde(default)]
         private_key_passphrase: Option<String>,
+        #[serde(default)]
+        host_key: Vec<String>,
+        #[serde(default)]
+        host_key_algorithms: Vec<String>,
+        #[serde(default)]
+        skip_host_key_verify: bool,
+        #[serde(default = "default_ssh_keepalive_interval_ms")]
+        keepalive_interval_ms: u64,
+        #[serde(default = "default_ssh_keepalive_max")]
+        keepalive_max: usize,
     },
     Mieru {
         name: String,
@@ -788,6 +804,14 @@ pub enum OutboundConfig {
         kind: String,
         members: Vec<String>,
     },
+}
+
+fn default_ssh_keepalive_interval_ms() -> u64 {
+    15_000
+}
+
+fn default_ssh_keepalive_max() -> usize {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

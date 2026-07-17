@@ -258,6 +258,9 @@ async fn url_test_group_uses_first_successful_member() {
             port: 1,
             username: None,
             password: None,
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
         },
         OutboundConfig::Direct {
             name: "direct".to_string(),
@@ -300,6 +303,9 @@ async fn select_group_uses_first_successful_member() {
             port: 1,
             username: None,
             password: None,
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
         },
         OutboundConfig::Direct {
             name: "direct".to_string(),

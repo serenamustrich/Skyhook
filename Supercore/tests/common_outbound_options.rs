@@ -321,6 +321,9 @@ async fn dialer_proxy_takes_over_the_underlying_tcp_dial() {
             port: 9,
             username: None,
             password: None,
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
         },
     ];
     let options = BTreeMap::from([(
@@ -351,6 +354,9 @@ fn dialer_proxy_cycles_are_detected_during_runtime_construction() {
             port: 9,
             username: None,
             password: None,
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
         },
         OutboundConfig::Http {
             name: "proxy-b".to_string(),
@@ -358,6 +364,9 @@ fn dialer_proxy_cycles_are_detected_during_runtime_construction() {
             port: 9,
             username: None,
             password: None,
+            tls: false,
+            sni: None,
+            skip_cert_verify: false,
         },
     ];
     let options = BTreeMap::from([

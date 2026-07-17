@@ -4470,6 +4470,7 @@ dependencies = [
  "poly1305 0.8.0",
  "quinn",
  "quinn-proto",
+ "rand 0.10.1",
  "rc4",
  "rcgen",
  "regex",

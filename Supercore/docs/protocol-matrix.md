@@ -26,9 +26,9 @@
 | AnyTLS | full | full | full | full | tcp/UoT-v2 | full | v2 TLS auth、官方 padding 与服务端动态更新、SYNACK、心跳、会话复用、空闲回收、TCP 和 sing-box UoT v2 UDP；独立 TLS 服务端覆盖 96KB TCP、并发流、UDP、单会话复用和超时淘汰 |
 | ShadowTLS | full | full | full | not-applicable | tcp/ss-plugin/dialer-proxy | full | 严格 v3 TLS 1.3 ClientHello HMAC、握手 ApplicationData 校验/XOR 还原、HelloRetryRequest、TLS camouflage、证书与密码错误边界均已实现；独立 SOCKS5 data backend、dialer-proxy 和 Shadowsocks `shadow-tls` SIP003 plugin 有真实拨号。ShadowTLS 原生是 TCP transport，Shadowsocks UDP 通过 UoT 承载 |
 | Naive | full | full | full | not-applicable | h1/h2/h3 | full | 默认 HTTP/2 CONNECT，支持显式 HTTP/3 CONNECT 和 HTTP/1.1 兼容路径；Basic Auth、官方 16-32 字节非索引 header padding、双向前 8 帧 payload padding、H2/H3 单连接多流复用、IPv6 authority、407/证书/状态错误边界均已实现。NaiveProxy 只承载 TCP 流，协议没有 CONNECT-UDP；H3 与仅 TCP 的 dialer-proxy 组合会在拨号前明确拒绝，避免静默直连泄漏 |
-| HTTP | full | full | partial | none | tcp | partial | UDP not implemented |
-| SOCKS5 | full | full | full | full | tcp | full | - |
-| SSH | full | full | partial | none | tcp | partial | SSH-ASSOC/tcp stream path 已支持，UDP 未实现 |
+| HTTP | full | full | full | not-applicable | tcp/tls | full | HTTP/HTTPS CONNECT、Basic Auth、SNI/证书策略、IPv4/IPv6 authority、2xx/非 2xx 状态和握手同包预读数据均有真实拨号；HTTP CONNECT 原生仅承载 TCP |
+| SOCKS5 | full | full | full | full | tcp/udp-associate | full | 无认证与用户名密码认证、域名/IPv4/IPv6 CONNECT、UDP ASSOCIATE、relay 来源校验、最大 payload 和 4 会话轮转池均有真实拨号 |
+| SSH | full | full | full | not-applicable | direct-tcpip | full | OpenSSH 公钥/SHA-256 指纹固定、主机密钥算法策略、密码/内联或文件私钥认证、keepalive、并发通道共享会话和服务端断线重连均已实现；SSH 无标准 UDP relay |
 | Mieru | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
 | Juicity | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
 | MASQUE | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
@@ -79,6 +79,9 @@
   `src/outbound/shadowsocks.rs`。
 - Naive 的 HTTP/1.1、HTTP/2、HTTP/3 CONNECT、Basic Auth、padding、连接复用和错误边界
   位于 `src/outbound/naive.rs`；H3 遇到仅支持 TCP 的 dialer-proxy 时会明确拒绝。
+- HTTP/HTTPS CONNECT、TLS 和响应预读保留位于 `src/outbound/http_proxy.rs` 与
+  `src/outbound/transports/http_connect.rs`；SOCKS5 TCP/UDP 位于 `src/outbound/socks5.rs`；
+  SSH host key policy、认证、会话复用与 direct-tcpip relay 位于 `src/outbound/ssh.rs`。
 - 跨协议 UDP association、NAT key、session pool、背压、idle eviction、reassembly、
   replay window 和统计位于 `src/outbound/udp/`；协议私有 wire format 保留在各协议模块。
 - 两者共用的 endpoint 连接生命周期、QUIC varint 和连接超时位于
@@ -107,4 +110,9 @@
   Shadowsocks plugin、错密码、证书拒绝和 camouflage
 - Naive: `tests/naive_real_dial.rs`，覆盖 H2/H3 单连接双流复用、每流 96KB 数据、Basic Auth、
   header/payload padding 和 407 不重拨；H1 兼容与 UDP 不适用边界位于 `tests/remaining_protocols.rs`
+- HTTP/HTTPS CONNECT: `tests/http_proxy_real_dial.rs`，覆盖 TLS/明文、认证、IPv6、96KB、
+  预读数据、407 和证书拒绝
+- SOCKS5: `tests/socks5_real_dial.rs`，覆盖域名/IPv4/IPv6、96KB、认证拒绝、UDP ASSOCIATE
+  和会话池复用
+- SSH: `tests/ssh_real_dial.rs`，覆盖密码/私钥、host key 拒绝、96KB、并发会话复用和断线重连
 - SSR / Snell capability boundaries and WireGuard 配置边界 / AnyTLS / Hysteria v1: `tests/remaining_protocols.rs`

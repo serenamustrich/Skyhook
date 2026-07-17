@@ -83,6 +83,7 @@ rc4 = "0.1"
 
 [dev-dependencies]
 hmac = "0.12"
+rand = "0.10"
 rcgen = "0.13"
 tower = { version = "0.5", features = ["util"] }
 

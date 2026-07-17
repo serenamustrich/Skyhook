@@ -241,6 +241,12 @@ impl SubscriptionNode {
                 port: self.port,
                 username: self.params.get("username").cloned(),
                 password: self.params.get("password").cloned(),
+                tls: bool_param(&self.params, "tls"),
+                sni: first_param(&self.params, &["sni", "servername", "host"]),
+                skip_cert_verify: bool_param_any(
+                    &self.params,
+                    &["skip-cert-verify", "allowInsecure", "insecure"],
+                ),
             }),
             NodeProtocol::Socks5 => Ok(OutboundConfig::Socks5 {
                 name: self.name.clone(),
@@ -620,6 +626,30 @@ impl SubscriptionNode {
                     &self.params,
                     &["private-key-passphrase", "private_key_passphrase"],
                 ),
+                host_key: string_list_param(&self.params, &["host-key", "host_key", "hostkey"]),
+                host_key_algorithms: string_list_param(
+                    &self.params,
+                    &["host-key-algorithms", "host_key_algorithms"],
+                ),
+                skip_host_key_verify: bool_param_any(
+                    &self.params,
+                    &["skip-host-key-verify", "skip_host_key_verify"],
+                ),
+                keepalive_interval_ms: first_param(
+                    &self.params,
+                    &["keepalive-interval-ms", "keepalive_interval_ms"],
+                )
+                .map(|value| parse_u64_text(&value, "ssh keepalive interval"))
+                .transpose()?
+                .unwrap_or(15_000),
+                keepalive_max: first_param(&self.params, &["keepalive-max", "keepalive_max"])
+                    .map(|value| parse_u64_text(&value, "ssh keepalive max"))
+                    .transpose()?
+                    .map(|value| {
+                        usize::try_from(value).context("ssh keepalive max exceeds platform limits")
+                    })
+                    .transpose()?
+                    .unwrap_or(3),
             }),
             NodeProtocol::Mieru => Ok(OutboundConfig::Mieru {
                 name: self.name.clone(),
@@ -1421,6 +1451,9 @@ fn parse_url_like_node(value: &str) -> anyhow::Result<SubscriptionNode> {
         .port_or_known_default()
         .ok_or_else(|| anyhow!("uri is missing port"))?;
     let mut params = BTreeMap::new();
+    if url.scheme().eq_ignore_ascii_case("https") {
+        params.insert("tls".to_string(), "true".to_string());
+    }
     if !url.username().is_empty() {
         params.insert("username".to_string(), percent_decode_lossy(url.username()));
     }
@@ -3212,6 +3245,101 @@ proxies:
                 assert_eq!(password.as_deref(), Some("p@ss"));
                 assert_eq!(sni.as_deref(), Some("edge.example.com"));
                 assert_eq!(alpn, vec!["h2"]);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_https_proxy_uri_with_tls_and_percent_encoded_auth() {
+        let uri = "https://alice%40team:p%40ss@proxy.example.com:8443?sni=edge.example.com&skip-cert-verify=true#HTTPS-Proxy";
+        let document = parse_subscription(uri).unwrap();
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Http {
+                name,
+                server,
+                port,
+                username,
+                password,
+                tls,
+                sni,
+                skip_cert_verify,
+            } => {
+                assert_eq!(name, "HTTPS-Proxy");
+                assert_eq!(server, "proxy.example.com");
+                assert_eq!(port, 8443);
+                assert_eq!(username.as_deref(), Some("alice@team"));
+                assert_eq!(password.as_deref(), Some("p@ss"));
+                assert!(tls);
+                assert_eq!(sni.as_deref(), Some("edge.example.com"));
+                assert!(skip_cert_verify);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_socks5_uri_with_percent_encoded_auth() {
+        let uri = "socks5://alice%40team:p%40ss@socks.example.com:1080#SOCKS";
+        let document = parse_subscription(uri).unwrap();
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Socks5 {
+                name,
+                server,
+                port,
+                username,
+                password,
+            } => {
+                assert_eq!(name, "SOCKS");
+                assert_eq!(server, "socks.example.com");
+                assert_eq!(port, 1080);
+                assert_eq!(username.as_deref(), Some("alice@team"));
+                assert_eq!(password.as_deref(), Some("p@ss"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ssh_host_key_policy_and_keepalive_options() {
+        let text = r#"
+proxies:
+  - name: SSH-Secure
+    type: ssh
+    server: ssh.example.com
+    port: 22
+    username: alice
+    password: secret
+    host-key:
+      - SHA256:ZmFrZS1maW5nZXJwcmludA
+    host-key-algorithms:
+      - ssh-ed25519
+      - rsa-sha2-256
+    skip-host-key-verify: false
+    keepalive-interval-ms: 2500
+    keepalive-max: 5
+"#;
+        let document = parse_subscription(text).unwrap();
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Ssh {
+                name,
+                username,
+                password,
+                host_key,
+                host_key_algorithms,
+                skip_host_key_verify,
+                keepalive_interval_ms,
+                keepalive_max,
+                ..
+            } => {
+                assert_eq!(name, "SSH-Secure");
+                assert_eq!(username, "alice");
+                assert_eq!(password.as_deref(), Some("secret"));
+                assert_eq!(host_key, vec!["SHA256:ZmFrZS1maW5nZXJwcmludA"]);
+                assert_eq!(host_key_algorithms, vec!["ssh-ed25519", "rsa-sha2-256"]);
+                assert!(!skip_host_key_verify);
+                assert_eq!(keepalive_interval_ms, 2_500);
+                assert_eq!(keepalive_max, 5);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

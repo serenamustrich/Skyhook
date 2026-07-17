@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.25（完成 `NEXT-011F` 的 AnyTLS、ShadowTLS 与 Naive，进入 `NEXT-011G`）
+> 计划版本：v1.26（完成 `NEXT-011G` 与 M2 集中验收，进入 M3 Hysteria v1）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-011G`。
+> M2 已验证，当前直接执行点为 M3 Hysteria v1。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -379,17 +379,17 @@ M1 Outbound 第一批已实现、验证并提交：
   - `AppState.swift`：3,046 行。
   - `SettingsWindow.swift`：1,614 行。
   - `SupercoreAPIClient.swift`：1,264 行。
-- 因此当前确认 M0 为 `VERIFIED`，M1 为 `IMPLEMENTED`；M1 的真实 MPTCP 多路径证据保留在
-  M12 发布门，M2 已进入开发，M3-M12 尚未达到完成门。
+- 因此当前确认 M0、M2 为 `VERIFIED`，M1 为 `IMPLEMENTED`；M1 的真实 MPTCP 多路径证据
+  保留在 M12 发布门，M3 已进入开发，M4-M12 尚未达到完成门。
 
 ### 5.6 当前直接执行队列
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`、
-   `NEXT-011E`、`NEXT-011F` 已完成；继续执行 `NEXT-011G` 的 HTTP、SOCKS5、SSH 与 M2 集中验收。
-2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
-   错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
+1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收；继续执行 M3 Hysteria v1，
+   然后依次完成 Mieru、Juicity、MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch。
+2. 按 M3 完成所有 parse-only/缺失协议的真实 TCP/UDP 拨号、认证、传输组合、错误映射和
+   互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
    App 退出清理和崩溃/断电后恢复，以“退出后不影响 Mac 正常上网”为硬验收门。
 4. 按 M6-M9 完成未启动代理也能测速、500ms 上限、全节点完整调度、后台自动择优、
@@ -586,8 +586,8 @@ M2 和 M3 的协议模块可以在同一阶段内并行编写，但不得绕过�
 |---|---|---|---|---|
 | M0 控制面 | `VERIFIED` | 无 | task、SSE、取消、进度、telemetry | 已提交代码和 Rust/Swift 回归 |
 | M1 基础设施 | `IMPLEMENTED` | M0 | 模块化 Core/API/Outbound、公共 transport/UDP | 本地门通过；MPTCP 真机证据并入 M12 |
-| M2 现有协议 | `IN_PROGRESS` | M1 | 当前 partial 协议真实 TCP/UDP 拨号 | 每协议 mock E2E + 独立互操作 |
-| M3 缺失协议 | `NOT_STARTED` | M1 | 冻结基线协议和内置出站补齐 | 无已知协议落入永久 unsupported |
+| M2 现有协议 | `VERIFIED` | M1 | 当前 partial 协议真实 TCP/UDP 拨号 | 208 lib + 协议实拨 + release 门禁通过 |
+| M3 缺失协议 | `IN_PROGRESS` | M1 | 冻结基线协议和内置出站补齐 | 无已知协议落入永久 unsupported |
 | M4 DNS/Fake-IP | `NOT_STARTED` | M1 | 独立 resolver、policy、cache、Fake-IP | DNS 泄漏/循环/恢复测试 |
 | M5 macOS TUN | `NOT_STARTED` | M1、M4 | 虚拟网卡、helper、网络事务和恢复 | 真机异常退出矩阵 |
 | M6 测速择优 | `NOT_STARTED` | M1、M2 | 未启动代理测速、500ms、后台择优 | 与 Sparkle/Mihomo 固定基准对比 |
@@ -1129,7 +1129,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
 
 ## 11. M2：完成当前 partial 协议
 
-状态：`IN_PROGRESS`
+状态：`VERIFIED`
 
 ### 11.0 当前执行批次
 
@@ -1158,7 +1158,7 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
    - 24 项真实拨号覆盖 v1-v5 TCP、v3-v5 UDP-over-TCP、HTTP/TLS obfs、96KB 双向
      长流量、错误 PSK、server close、4 路并发复用、零帧半关闭和陈旧连接自动重拨；
      连接池容量/空闲淘汰 2 项与 `cargo check --all-targets` 通过。
-4. [ ] `NEXT-011`：依次收口 Trojan、VMess、VLESS/Reality/Vision、Hysteria2/TUIC、
+4. [x] `NEXT-011`：依次收口 Trojan、VMess、VLESS/Reality/Vision、Hysteria2/TUIC、
    WireGuard、AnyTLS/ShadowTLS/Naive、HTTP/SOCKS5/SSH，完成 M2 集中验收。
    - [x] `NEXT-011A`：Trojan 完整能力收口。
      - 完成空密码、未知 network、空 network/SNI 回退和默认 ALPN 校验，配置错误在拨号前返回。
@@ -1231,7 +1231,21 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        dialer-proxy 组合会明确拒绝。独立服务端 E2E 覆盖 H2/H3 单连接双流、每流 96KB、
        认证与 407 不重拨；`cargo check --all-targets`、203 项 lib、28 项 remaining protocols
        和 3 项 Naive 实拨回归通过。本批没有新增 Clippy 错误，全仓历史 Clippy 债务留在 M11。
-   - [ ] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
+   - [x] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
+     - HTTP 支持明文/TLS CONNECT、Basic Auth、SNI/证书策略、IPv4/IPv6 authority、
+       2xx/407 状态和响应同包预读保留；3 项独立实拨覆盖 96KB 双向数据和错误边界。
+     - SOCKS5 支持无认证/用户名密码、域名/IPv4/IPv6 CONNECT、UDP ASSOCIATE、relay
+       来源校验、最大 payload 和 4 会话轮转池；3 项独立实拨覆盖认证拒绝、第五次复用和
+       静默服务端阶段超时。
+     - SSH 支持 OpenSSH host key/SHA-256 指纹固定、算法约束、密码/内联或文件私钥、
+       keepalive、并发 direct-tcpip 共享会话和服务端断线重连；SSH UDP 标记 not-applicable。
+       4 项独立实拨覆盖 96KB、错误 host key、单物理会话和重连。
+     - HTTPS/SOCKS5 URI 与 SSH YAML 字段映射已加入订阅回归；协议矩阵、三个 README 和
+       capability 状态一致。
+     - 集中门禁：`cargo check --all-targets`、208 项 lib、28 项 remaining protocols、
+       20 项 config/runtime、14 项 common outbound options、10 项新增实拨及 release build
+       通过；1 项签名 MPTCP 真机测试按计划留到 M12。严格 Clippy 恢复历史基线
+       23 个 lib/30 个 test-side，本批无新增；敏感订阅与 token 扫描通过。
 
 ### 11.1 协议完成标准
 
@@ -1403,7 +1417,7 @@ Naive：
 
 ## 12. M3：补齐 Mihomo 冻结基线协议
 
-状态：`NOT_STARTED`
+状态：`IN_PROGRESS`
 
 ### 12.1 必须新增或完成
 
@@ -2539,7 +2553,7 @@ README 只写最终功能、安装、使用、架构、协议状态和可复现�
 
 - [x] M0：当前 task/SSE/progress 代码已收口并验证。
 - [x] M1：核心、API、transport、UDP 和 cancellation 基础完成；MPTCP 真机发布证据按计划在 M12 补齐。
-- [ ] M2：当前 partial 协议全部完成真实拨号。
+- [x] M2：当前 partial 协议全部完成真实拨号。
 - [ ] M3：Mihomo 冻结基线缺失协议全部补齐。
 - [ ] M4：DNS 和 Fake-IP 完成。
 - [ ] M5：TUN、权限服务和网络恢复完成。

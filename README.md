@@ -31,6 +31,12 @@
 - Naive 支持 HTTP/2 CONNECT、按配置启用 HTTP/3 CONNECT、HTTP/1.1 兼容路径、Basic
   Auth、官方请求头与前 8 帧双向 padding、连接复用和 IPv6 目标；NaiveProxy 协议仅承载
   TCP 流，不把不存在的 CONNECT-UDP 能力标记为可用。
+- HTTP 代理支持明文 HTTP CONNECT 与 TLS 保护的 HTTPS CONNECT、Basic Auth、SNI、
+  证书校验、IPv4/IPv6 目标和握手后预读数据保留。
+- SOCKS5 支持无认证与用户名密码认证、域名/IPv4/IPv6 TCP CONNECT，以及带有界会话池的
+  UDP ASSOCIATE。
+- SSH 支持固定主机公钥或 SHA-256 指纹、主机密钥算法约束、密码/内联或文件私钥认证、
+  keepalive、direct-tcpip 并发通道复用和断线重连；SSH 协议没有标准 UDP relay。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
 - 订阅与 Provider 下载默认使用直连通道，失败时保留已有本地缓存。
 - 支持自定义域名/IP 规则，并让这些规则优先于订阅规则。

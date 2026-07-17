@@ -12,8 +12,8 @@ use tokio::{
 use crate::routing::Destination;
 
 use super::{
-    target::{encode_socks5_destination, parse_socks5_destination_prefix},
-    transports::connect_tcp,
+    target::{destination_socket_addr, encode_socks5_destination, parse_socks5_destination_prefix},
+    transports::{connect_tcp, run_dial_phase},
     udp::{
         create_bound_udp, resolve_udp_socket_addr, udp_session_key, KeyedRoundRobinSessionPool,
         UDP_SESSION_POOL_SIZE,
@@ -56,6 +56,26 @@ impl Socks5Outbound {
         }
     }
 
+    fn validate_configuration(&self) -> anyhow::Result<()> {
+        if self.server.trim().is_empty() || self.port == 0 {
+            return Err(anyhow!("socks5 server and port are required"));
+        }
+        match (&self.username, &self.password) {
+            (Some(username), Some(password)) => {
+                if username.is_empty() || password.is_empty() {
+                    return Err(anyhow!("socks5 credentials must not be empty"));
+                }
+                if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
+                    return Err(anyhow!("socks5 credentials are too long"));
+                }
+            }
+            (Some(_), None) => return Err(anyhow!("socks5 password is required with username")),
+            (None, Some(_)) => return Err(anyhow!("socks5 username is required with password")),
+            (None, None) => {}
+        }
+        Ok(())
+    }
+
     async fn socks5_udp_session(
         &self,
         key: &str,
@@ -72,22 +92,29 @@ impl Socks5Outbound {
     }
 
     async fn open_socks5_udp_session(&self, timeout_ms: u64) -> anyhow::Result<Socks5UdpSession> {
-        let proxy = format!("{}:{}", self.server, self.port);
+        let proxy = destination_socket_addr(&Destination::new(&self.server, self.port));
         let mut stream = connect_tcp(&proxy, timeout_ms).await?;
-        negotiate_socks5(
-            &mut stream,
-            self.username.as_deref(),
-            self.password.as_deref(),
+        run_dial_phase(
+            timeout_ms,
+            "SOCKS5 UDP authentication",
+            negotiate_socks5(
+                &mut stream,
+                self.username.as_deref(),
+                self.password.as_deref(),
+            ),
         )
-        .await?;
+        .await??;
 
-        let mut request = vec![0x05, 0x03, 0x00];
-        encode_socks5_destination(&Destination::new("0.0.0.0", 0), &mut request)?;
-        stream.write_all(&request).await?;
-        let mut header = [0u8; 4];
-        stream.read_exact(&mut header).await?;
-        validate_socks5_response_header(header, "udp associate")?;
-        let bound = read_socks5_bound_address(&mut stream, header[3]).await?;
+        let bound = run_dial_phase(timeout_ms, "SOCKS5 UDP ASSOCIATE", async {
+            let mut request = vec![0x05, 0x03, 0x00];
+            encode_socks5_destination(&Destination::new("0.0.0.0", 0), &mut request)?;
+            stream.write_all(&request).await?;
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await?;
+            validate_socks5_response_header(header, "udp associate")?;
+            read_socks5_bound_address(&mut stream, header[3]).await
+        })
+        .await??;
         let relay_host = if bound.host == "0.0.0.0" || bound.host == "::" {
             self.server.as_str()
         } else {
@@ -118,6 +145,9 @@ impl Outbound for Socks5Outbound {
     }
 
     fn capability(&self) -> OutboundCapability {
+        if let Err(error) = self.validate_configuration() {
+            return OutboundCapability::unsupported(error.to_string());
+        }
         OutboundCapability::tcp_udp("socks5-udp-associate-session-pool")
     }
 
@@ -130,22 +160,30 @@ impl Outbound for Socks5Outbound {
         destination: &Destination,
         timeout_ms: u64,
     ) -> anyhow::Result<BoxedStream> {
-        let proxy = format!("{}:{}", self.server, self.port);
+        self.validate_configuration()?;
+        let proxy = destination_socket_addr(&Destination::new(&self.server, self.port));
         let mut stream = connect_tcp(&proxy, timeout_ms).await?;
-        negotiate_socks5(
-            &mut stream,
-            self.username.as_deref(),
-            self.password.as_deref(),
+        run_dial_phase(
+            timeout_ms,
+            "SOCKS5 authentication",
+            negotiate_socks5(
+                &mut stream,
+                self.username.as_deref(),
+                self.password.as_deref(),
+            ),
         )
-        .await?;
+        .await??;
 
-        let mut request = vec![0x05, 0x01, 0x00];
-        encode_socks5_destination(destination, &mut request)?;
-        stream.write_all(&request).await?;
-        let mut header = [0u8; 4];
-        stream.read_exact(&mut header).await?;
-        validate_socks5_response_header(header, "connect")?;
-        discard_socks5_bound_address(&mut stream, header[3]).await?;
+        run_dial_phase(timeout_ms, "SOCKS5 CONNECT", async {
+            let mut request = vec![0x05, 0x01, 0x00];
+            encode_socks5_destination(destination, &mut request)?;
+            stream.write_all(&request).await?;
+            let mut header = [0u8; 4];
+            stream.read_exact(&mut header).await?;
+            validate_socks5_response_header(header, "connect")?;
+            discard_socks5_bound_address(&mut stream, header[3]).await
+        })
+        .await??;
         Ok(Box::new(stream))
     }
 
@@ -155,6 +193,10 @@ impl Outbound for Socks5Outbound {
         payload: &[u8],
         timeout_ms: u64,
     ) -> anyhow::Result<Vec<u8>> {
+        self.validate_configuration()?;
+        if payload.len() > 65_245 {
+            return Err(anyhow!("socks5 UDP payload is too large"));
+        }
         let key = udp_session_key(
             self.kind(),
             self.name(),
@@ -179,13 +221,18 @@ impl Outbound for Socks5Outbound {
                 })?;
 
                 let mut buf = vec![0u8; 65_535];
-                let (len, _peer) = timeout(
+                let (len, peer) = timeout(
                     Duration::from_millis(timeout_ms),
                     session.udp.recv_from(&mut buf),
                 )
                 .await
                 .context("socks5 udp receive timed out")?
                 .context("failed to receive socks5 udp response")?;
+                if peer != session.relay {
+                    return Err(anyhow!(
+                        "socks5 UDP response came from unexpected relay {peer}"
+                    ));
+                }
                 let (_response_destination, payload_offset) =
                     parse_socks5_udp_response(&buf[..len])?;
                 Ok(buf[payload_offset..len].to_vec())

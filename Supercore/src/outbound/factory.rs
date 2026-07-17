@@ -142,13 +142,14 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             port,
             username,
             password,
-        } => Arc::new(HttpOutbound::new(
-            name.clone(),
-            server.clone(),
-            *port,
-            username.clone(),
-            password.clone(),
-        )),
+            tls,
+            sni,
+            skip_cert_verify,
+        } => Arc::new(
+            HttpOutbound::new(name.clone(), server.clone(), *port)
+                .with_auth(username.clone(), password.clone())
+                .with_tls(*tls, sni.clone(), *skip_cert_verify),
+        ),
         OutboundConfig::Socks5 {
             name,
             server,
@@ -484,6 +485,11 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             password,
             private_key,
             private_key_passphrase,
+            host_key,
+            host_key_algorithms,
+            skip_host_key_verify,
+            keepalive_interval_ms,
+            keepalive_max,
         } => Arc::new(SshOutbound::new(
             name.clone(),
             server.clone(),
@@ -492,6 +498,11 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             password.clone(),
             private_key.clone(),
             private_key_passphrase.clone(),
+            host_key.clone(),
+            host_key_algorithms.clone(),
+            *skip_host_key_verify,
+            *keepalive_interval_ms,
+            *keepalive_max,
         )),
         OutboundConfig::Mieru { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
             name.clone(),

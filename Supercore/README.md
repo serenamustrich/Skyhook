@@ -13,7 +13,14 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 - Mixed inbound listener with SOCKS5 and HTTP CONNECT.
 - SOCKS5 UDP ASSOCIATE with bounded concurrent routed UDP exchange.
 - HTTP absolute-form proxy requests for plain HTTP.
-- Direct, HTTP proxy, and SOCKS5 proxy outbounds, with Direct UDP and pooled SOCKS5 UDP ASSOCIATE.
+- Direct, HTTP/HTTPS CONNECT, SOCKS5, and SSH outbounds, with Direct UDP and pooled SOCKS5 UDP ASSOCIATE.
+- HTTP and HTTPS proxy outbounds with Basic authentication, SNI and certificate policy, IPv4/IPv6
+  CONNECT authorities, non-2xx errors, and preservation of tunnel bytes prefetched with the response.
+- SOCKS5 outbounds with no-auth or username/password authentication, domain/IPv4/IPv6 TCP CONNECT,
+  UDP ASSOCIATE relay validation, bounded payloads, and reusable UDP session pools.
+- SSH outbounds with pinned OpenSSH host keys or SHA-256 fingerprints, host-key algorithm policy,
+  password or inline/file private-key authentication, keepalive, concurrent direct-tcpip channels on
+  a shared session, and automatic stale-session reconnection. Standard SSH has no UDP relay.
 - Proxy group outbounds for subscription `select`, `url-test`, `fallback`, and similar groups.
 - Shadowsocks legacy stream, stream, AEAD, and extended AEAD TCP with pooled UDP, including AES,
   ChaCha20/ChaCha8, XChaCha, LEA, AEGIS, AEZ, Deoxys-II, Ascon, and Rabbit128 method families.
@@ -116,7 +123,7 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 
 Supercore no longer treats protocol support as a single boolean.
 
-- **full**: parse + TCP/UDP probe + dialing path are complete for common usage
+- **full**: parsing and every protocol-applicable TCP/UDP dialing path are complete for common usage
 - **partial**: parsed and runnable, but with known feature gaps (for example: UDP mode, Reality options, or limited codec/protocol variants)
 - **parse-only**: config is recognized but native dialing is not implemented yet
 - **unsupported**: not currently implemented or intentionally blocked
@@ -125,9 +132,8 @@ Current matrix details are in `docs/protocol-matrix.md`:
 
 - **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **partial**: HTTP and SSH while their documented gaps remain
 - **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria2, TUIC,
-  WireGuard, AnyTLS, ShadowTLS, Naive, and SOCKS5
+  WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, SOCKS5, and SSH
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently
