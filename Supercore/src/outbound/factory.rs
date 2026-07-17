@@ -292,6 +292,9 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             obfs,
             obfs_password,
             alpn,
+            up,
+            down,
+            congestion_control,
         } => Arc::new(Hysteria2Outbound::new(
             name.clone(),
             server.clone(),
@@ -302,6 +305,9 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             obfs.clone(),
             obfs_password.clone(),
             alpn.clone(),
+            up.clone(),
+            down.clone(),
+            congestion_control.clone(),
         )),
         OutboundConfig::Tuic {
             name,
@@ -314,6 +320,9 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             congestion_control,
             udp_relay_mode,
             alpn,
+            max_udp_relay_packet_size,
+            heartbeat_interval_ms,
+            reduce_rtt,
         } => Arc::new(TuicOutbound::new(
             name.clone(),
             server.clone(),
@@ -325,6 +334,9 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             congestion_control.clone(),
             udp_relay_mode.clone(),
             alpn.clone(),
+            *max_udp_relay_packet_size,
+            *heartbeat_interval_ms,
+            *reduce_rtt,
         )),
         OutboundConfig::Naive {
             name,

@@ -43,6 +43,11 @@ impl<T> SharedConnectionPool<T> {
     async fn clear(&self) {
         self.connection.lock().await.take();
     }
+
+    #[cfg(test)]
+    pub(crate) async fn take_for_test(&self) -> Option<Arc<T>> {
+        self.connection.lock().await.take()
+    }
 }
 
 #[cfg(test)]

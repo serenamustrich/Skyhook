@@ -53,12 +53,14 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   standard `vmess://` JSON, custom transport headers, ALPN, multi-destination UDP associations,
   authenticated EOF, and stale-session eviction have independent real-dial coverage. XHTTP is an
   explicit pre-dial unsupported boundary rather than a false timeout.
-- Hysteria2 and TUIC native QUIC TCP outbounds for common subscription nodes.
-- Hysteria2 QUIC datagram UDP exchange with a session pool, UDP fragmentation, and Salamander
-  obfuscation.
-  Hysteria2 and TUIC remain partial until complete local QUIC server end-to-end tests are present.
+- Hysteria2 and TUIC native QUIC TCP outbounds with strict authentication and complete local QUIC
+  server end-to-end coverage.
+- Hysteria2 HTTP/3 auth, TCP, QUIC datagram UDP, session reuse, fragmentation, bandwidth-aware
+  congestion control, and Salamander/Gecko packet obfuscation.
 - TUIC UDP exchange for `native` QUIC datagram mode and `quic` unidirectional-stream mode, with a
-  session pool and UDP fragmentation.
+  session pool, UDP fragmentation, heartbeat, dissociation, persistent TLS resumption, and a safe
+  replay policy that withholds authentication and user traffic until a resumed handshake is
+  accepted.
 - Structured YAML config.
 - Native versioned control API under `/v1/*`.
 - Control-plane modules isolate authentication, structured errors, schemas, SSE events, route
@@ -115,9 +117,8 @@ Current matrix details are in `docs/protocol-matrix.md`:
 
 - **parse-only**: `mieru`, `juicity`, `masque`, `openvpn`, `hysteria`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
-- **partial**: Hysteria2, TUIC, WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, and SSH while
-  their documented gaps remain
-- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, and SOCKS5
+- **partial**: WireGuard, AnyTLS, ShadowTLS, Naive, HTTP, and SSH while their documented gaps remain
+- **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria2, TUIC, and SOCKS5
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently
@@ -465,7 +466,10 @@ Hysteria2 URI subscriptions using `hysteria2://` or `hy2://` are converted into 
 QUIC TCP outbounds. UDP exchange uses a small QUIC datagram session pool per outbound and supports
 datagram fragmentation/reassembly. Salamander obfuscation is implemented at the QUIC packet socket
 layer; Gecko obfuscation wraps Salamander and fragments QUIC long-header handshake datagrams into
-randomly padded frames before sending.
+randomly padded frames before sending. Authentication strictly validates status 233 and the
+required `Hysteria-UDP`/`Hysteria-CC-RX` response headers. Upload/download bandwidth settings feed
+the negotiated receive-rate header and a rate-aware BDP controller. Plain QUIC, Salamander, and
+Gecko all have local HTTP/3 server authentication and bidirectional relay coverage.
 
 Basic TUIC outbound:
 
@@ -485,7 +489,10 @@ outbounds:
 TUIC URI subscriptions using `tuic://` are converted into runnable native QUIC TCP outbounds.
 UDP exchange uses a small associate session pool per outbound for both `native` QUIC datagram mode and
 `quic` unidirectional-stream mode, with packet fragmentation/reassembly. Parallel multi-session UDP
-is handled through the pool.
+is handled by per-association dispatchers so concurrent sessions cannot consume each other's
+packets. Heartbeat and Dissociate commands, packet-size limits, persistent TLS session resumption,
+and accepted resumed handshakes are covered by a local TUIC v5 server. Authentication and user
+traffic are intentionally held until handshake acceptance so replayable early data is never used.
 
 ## Real Subscription Compatibility Tests
 

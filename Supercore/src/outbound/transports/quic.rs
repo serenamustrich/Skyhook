@@ -1,7 +1,11 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context};
-use rustls::{crypto::aws_lc_rs, ClientConfig, RootCertStore};
+use rustls::{
+    client::{ClientSessionStore, Resumption},
+    crypto::aws_lc_rs,
+    ClientConfig, RootCertStore,
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     net::lookup_host,
@@ -13,10 +17,55 @@ use crate::outbound::context::active_dial_context;
 use super::{order_addresses, tls::NoCertificateVerification};
 use crate::outbound::udp::create_bound_std_udp;
 
+#[cfg(test)]
 pub(crate) fn quic_client_config(
     skip_cert_verify: bool,
     alpn: Option<&str>,
     congestion_control: Option<&str>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    quic_client_config_with_resumption(skip_cert_verify, alpn, congestion_control, None, false)
+}
+
+pub(crate) fn quic_client_config_with_controller(
+    skip_cert_verify: bool,
+    alpn: Option<&str>,
+    congestion_control: Option<&str>,
+    controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    quic_client_config_advanced(
+        skip_cert_verify,
+        alpn,
+        congestion_control,
+        None,
+        false,
+        Some(controller),
+    )
+}
+
+pub(crate) fn quic_client_config_with_resumption(
+    skip_cert_verify: bool,
+    alpn: Option<&str>,
+    congestion_control: Option<&str>,
+    session_store: Option<Arc<dyn ClientSessionStore>>,
+    enable_early_data: bool,
+) -> anyhow::Result<quinn::ClientConfig> {
+    quic_client_config_advanced(
+        skip_cert_verify,
+        alpn,
+        congestion_control,
+        session_store,
+        enable_early_data,
+        None,
+    )
+}
+
+fn quic_client_config_advanced(
+    skip_cert_verify: bool,
+    alpn: Option<&str>,
+    congestion_control: Option<&str>,
+    session_store: Option<Arc<dyn ClientSessionStore>>,
+    enable_early_data: bool,
+    controller: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
 ) -> anyhow::Result<quinn::ClientConfig> {
     let provider = aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(provider.into())
@@ -44,29 +93,38 @@ pub(crate) fn quic_client_config(
         .unwrap_or_else(|| vec![b"h3".to_vec()]);
     config.alpn_protocols = protocols;
     let active = active_dial_context();
-    config.enable_early_data = active.as_ref().is_some_and(|context| context.quic_zero_rtt);
+    if let Some(session_store) = session_store {
+        config.resumption = Resumption::store(session_store);
+    }
+    config.enable_early_data =
+        enable_early_data || active.as_ref().is_some_and(|context| context.quic_zero_rtt);
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
         .context("failed to build quic rustls client config")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
     let mut transport_config = quinn::TransportConfig::default();
     transport_config.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    match congestion_control
-        .unwrap_or("cubic")
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "" | "default" | "cubic" => {}
-        "bbr" => {
-            transport_config
-                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    if let Some(controller) = controller {
+        transport_config.congestion_controller_factory(controller);
+    } else {
+        match congestion_control
+            .unwrap_or("cubic")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "default" | "cubic" => {}
+            "bbr" => {
+                transport_config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::BbrConfig::default(),
+                ));
+            }
+            "new-reno" | "new_reno" | "newreno" => {
+                transport_config.congestion_controller_factory(Arc::new(
+                    quinn::congestion::NewRenoConfig::default(),
+                ));
+            }
+            value => return Err(anyhow!("unsupported QUIC congestion controller {value}")),
         }
-        "new-reno" | "new_reno" | "newreno" => {
-            transport_config.congestion_controller_factory(Arc::new(
-                quinn::congestion::NewRenoConfig::default(),
-            ));
-        }
-        value => return Err(anyhow!("unsupported QUIC congestion controller {value}")),
     }
     if let Some(context) = active {
         transport_config.keep_alive_interval(context.keepalive);
@@ -77,6 +135,12 @@ pub(crate) fn quic_client_config(
     }
     client_config.transport_config(Arc::new(transport_config));
     Ok(client_config)
+}
+
+pub(crate) struct ResumableQuicConnection {
+    pub(crate) endpoint: quinn::Endpoint,
+    pub(crate) connection: quinn::Connection,
+    pub(crate) zero_rtt_accepted: Option<quinn::ZeroRttAccepted>,
 }
 
 pub(crate) async fn resolve_quic_remote(
@@ -152,6 +216,58 @@ pub(crate) async fn connect_quic_endpoint(
         }
     };
     Ok((endpoint, connection))
+}
+
+pub(crate) async fn connect_quic_endpoint_resumable(
+    mut endpoint: quinn::Endpoint,
+    remote: SocketAddr,
+    server_name: &str,
+    client_config: quinn::ClientConfig,
+    attempt_zero_rtt: bool,
+    timeout_ms: u64,
+    protocol: &str,
+) -> anyhow::Result<ResumableQuicConnection> {
+    endpoint.set_default_client_config(client_config);
+    let active = active_dial_context();
+    let timeout_budget = active
+        .as_ref()
+        .map(|context| Duration::from_millis(timeout_ms).min(context.remaining_timeout()))
+        .unwrap_or_else(|| Duration::from_millis(timeout_ms));
+    if timeout_budget.is_zero() {
+        return Err(anyhow!("{protocol} quic connect timed out"));
+    }
+    let cancellation = active
+        .as_ref()
+        .map(|context| context.cancellation.clone())
+        .unwrap_or_default();
+    let connecting = endpoint.connect(remote, server_name)?;
+    let connecting = if attempt_zero_rtt {
+        match connecting.into_0rtt() {
+            Ok((connection, zero_rtt_accepted)) => {
+                return Ok(ResumableQuicConnection {
+                    endpoint,
+                    connection,
+                    zero_rtt_accepted: Some(zero_rtt_accepted),
+                });
+            }
+            Err(connecting) => connecting,
+        }
+    } else {
+        connecting
+    };
+    let connection = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("{protocol} quic connect cancelled")),
+        result = timeout(timeout_budget, connecting) => {
+            result
+                .with_context(|| format!("{protocol} quic connect timed out"))?
+                .with_context(|| format!("{protocol} quic connect failed"))?
+        }
+    };
+    Ok(ResumableQuicConnection {
+        endpoint,
+        connection,
+        zero_rtt_accepted: None,
+    })
 }
 
 pub(crate) fn encode_quic_varint(value: u64, output: &mut Vec<u8>) -> anyhow::Result<()> {

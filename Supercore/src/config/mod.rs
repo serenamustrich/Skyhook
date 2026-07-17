@@ -569,6 +569,12 @@ pub enum OutboundConfig {
         obfs_password: Option<String>,
         #[serde(default)]
         alpn: Option<String>,
+        #[serde(default)]
+        up: Option<String>,
+        #[serde(default)]
+        down: Option<String>,
+        #[serde(default)]
+        congestion_control: Option<String>,
     },
     Tuic {
         name: String,
@@ -586,6 +592,12 @@ pub enum OutboundConfig {
         udp_relay_mode: Option<String>,
         #[serde(default)]
         alpn: Option<String>,
+        #[serde(default)]
+        max_udp_relay_packet_size: Option<usize>,
+        #[serde(default)]
+        heartbeat_interval_ms: Option<u64>,
+        #[serde(default)]
+        reduce_rtt: bool,
     },
     Naive {
         name: String,

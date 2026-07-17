@@ -4330,6 +4330,7 @@ dependencies = [
  "md-5",
  "poly1305 0.8.0",
  "quinn",
+ "quinn-proto",
  "rc4",
  "rcgen",
  "regex",

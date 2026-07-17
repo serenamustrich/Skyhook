@@ -167,7 +167,10 @@ impl SubscriptionNode {
         options.quic_mtu = first_param(&self.params, &["quic-mtu", "mtu"])
             .map(|value| parse_u16_text(&value, "quic-mtu"))
             .transpose()?;
-        options.quic_zero_rtt = bool_param_any(&self.params, &["quic-zero-rtt", "zero-rtt"]);
+        options.quic_zero_rtt = bool_param_any(
+            &self.params,
+            &["quic-zero-rtt", "zero-rtt", "reduce-rtt", "reduce_rtt"],
+        );
         options.websocket_early_data_header = first_param(
             &self.params,
             &["early-data-header-name", "ws-early-data-header"],
@@ -379,6 +382,16 @@ impl SubscriptionNode {
                         .or_else(|| self.params.get("obfs_password"))
                         .cloned(),
                     alpn: self.params.get("alpn").cloned(),
+                    up: first_param(&self.params, &["up", "upmbps", "up-mbps"]),
+                    down: first_param(&self.params, &["down", "downmbps", "down-mbps"]),
+                    congestion_control: first_param(
+                        &self.params,
+                        &[
+                            "congestion-control",
+                            "congestion-controller",
+                            "congestion_control",
+                        ],
+                    ),
                 })
             }
             NodeProtocol::Hysteria => Ok(OutboundConfig::Hysteria {
@@ -427,6 +440,7 @@ impl SubscriptionNode {
                     congestion_control: self
                         .params
                         .get("congestion-control")
+                        .or_else(|| self.params.get("congestion-controller"))
                         .or_else(|| self.params.get("congestion_control"))
                         .cloned(),
                     udp_relay_mode: self
@@ -435,6 +449,27 @@ impl SubscriptionNode {
                         .or_else(|| self.params.get("udp_relay_mode"))
                         .cloned(),
                     alpn: self.params.get("alpn").cloned(),
+                    max_udp_relay_packet_size: first_param(
+                        &self.params,
+                        &["max-udp-relay-packet-size", "max_udp_relay_packet_size"],
+                    )
+                    .map(|value| parse_u64_text(&value, "tuic max udp relay packet size"))
+                    .transpose()?
+                    .map(|value| {
+                        usize::try_from(value)
+                            .context("tuic max udp relay packet size exceeds platform limits")
+                    })
+                    .transpose()?,
+                    heartbeat_interval_ms: first_param(
+                        &self.params,
+                        &["heartbeat-interval", "heartbeat_interval"],
+                    )
+                    .map(|value| parse_u64_text(&value, "tuic heartbeat interval"))
+                    .transpose()?,
+                    reduce_rtt: bool_param_any(
+                        &self.params,
+                        &["reduce-rtt", "reduce_rtt", "quic-zero-rtt", "zero-rtt"],
+                    ),
                 })
             }
             NodeProtocol::WireGuard => Ok(OutboundConfig::WireGuard {

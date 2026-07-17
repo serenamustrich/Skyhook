@@ -593,6 +593,9 @@ fn hysteria2_config_with_obfs_and_alpn_builds_outbound() {
         obfs: Some("salamander".to_string()),
         obfs_password: Some("obfs-secret".to_string()),
         alpn: Some("h3".to_string()),
+        up: None,
+        down: None,
+        congestion_control: None,
     }];
 
     let map = build_outbounds(&configs, None).expect("build hy2");
@@ -654,6 +657,9 @@ async fn hysteria2_empty_password_rejected_at_connect() {
         obfs: None,
         obfs_password: None,
         alpn: None,
+        up: None,
+        down: None,
+        congestion_control: None,
     }];
 
     let map = build_outbounds(&configs, None).expect("build hy2 empty pw");
@@ -750,6 +756,9 @@ fn tuic_config_with_congestion_and_udp_mode_builds_outbound() {
         congestion_control: Some("cubic".to_string()),
         udp_relay_mode: Some("native".to_string()),
         alpn: Some("h3".to_string()),
+        max_udp_relay_packet_size: None,
+        heartbeat_interval_ms: None,
+        reduce_rtt: false,
     }];
 
     let map = build_outbounds(&configs, None).expect("build tuic");
@@ -811,6 +820,9 @@ async fn tuic_empty_password_rejected_at_connect() {
         congestion_control: None,
         udp_relay_mode: None,
         alpn: None,
+        max_udp_relay_packet_size: None,
+        heartbeat_interval_ms: None,
+        reduce_rtt: false,
     }];
 
     let map = build_outbounds(&configs, None).expect("build tuic empty pw");
@@ -840,6 +852,9 @@ async fn tuic_udp_unsupported_mode_rejected() {
         congestion_control: None,
         udp_relay_mode: Some("nonsense".to_string()),
         alpn: None,
+        max_udp_relay_packet_size: None,
+        heartbeat_interval_ms: None,
+        reduce_rtt: false,
     }];
     let map = build_outbounds(&configs, None).expect("build tuic bad mode");
     let outbound = map.get("tuic-bad-mode").expect("tuic-bad-mode lookup");

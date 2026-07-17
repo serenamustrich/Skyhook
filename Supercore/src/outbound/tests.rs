@@ -2,6 +2,7 @@ use super::*;
 use std::{
     collections::BTreeMap,
     io::{Cursor, Error, ErrorKind},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context as TaskContext, Poll},
@@ -32,7 +33,7 @@ use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Sha224, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -45,7 +46,7 @@ use super::{
     group::GroupOutbound,
     hysteria2::{
         build_hysteria2_tcp_request, build_hysteria2_udp_messages, parse_hysteria2_udp_message,
-        Hysteria2UdpReassembly,
+        wrap_hysteria2_obfs_socket_for_test, Hysteria2Outbound, Hysteria2UdpReassembly,
     },
     shadowsocks::{
         encode_ss_chunk, evp_bytes_to_key, find_header_end, read_simple_obfs_tls_record,
@@ -54,13 +55,13 @@ use super::{
         SIMPLE_OBFS_TLS_SESSION_TICKET_HEADER_LEN, SS_NONCE_LEN,
     },
     transports::{
-        read_websocket_frame, render_transport_headers, websocket_accept_key,
+        read_quic_varint, read_websocket_frame, render_transport_headers, websocket_accept_key,
         write_websocket_binary_frame, write_websocket_frame,
     },
     trojan::{build_trojan_request, trojan_alpn_protocols, TrojanOutbound},
     tuic::{
         build_tuic_connect_request, build_tuic_packet_messages, parse_tuic_packet_message,
-        TuicUdpReassembly,
+        TuicOutbound, TuicUdpReassembly,
     },
     util::hex_lower,
     vless::{
@@ -3212,7 +3213,9 @@ fn hysteria2_tcp_request_encodes_command_address_and_padding() {
     assert_eq!(&request[0..2], &[0x44, 0x01]);
     assert_eq!(request[2], b"example.com:443".len() as u8);
     assert_eq!(&request[3..18], b"example.com:443");
-    assert_eq!(request[18], 0x00);
+    let padding_len = request[18] as usize;
+    assert!(padding_len <= 64);
+    assert_eq!(request.len(), 19 + padding_len);
 }
 
 #[test]
@@ -3294,6 +3297,611 @@ fn tuic_packet_request_round_trips_payload() {
         parse_tuic_packet_message(&request, 0x9999, &mut TuicUdpReassembly::default())
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn tuic_fragmentation_uses_none_address_after_first_fragment() {
+    let messages = build_tuic_packet_messages(
+        0x0102,
+        0x0304,
+        &Destination::new("example.com", 53),
+        &[7u8; 120],
+        Some(48),
+    )
+    .unwrap();
+
+    assert!(messages.len() > 1);
+    assert_eq!(messages[0][10], 0x00);
+    assert!(messages.iter().skip(1).all(|message| message[10] == 0xff));
+    let mut reassembly = TuicUdpReassembly::default();
+    let mut payload = None;
+    for message in messages {
+        payload = parse_tuic_packet_message(&message, 0x0102, &mut reassembly).unwrap();
+    }
+    assert_eq!(payload, Some(vec![7u8; 120]));
+}
+
+fn local_quic_test_server(alpn: &[u8]) -> (quinn::Endpoint, SocketAddr) {
+    local_quic_test_server_with_socket(alpn, None)
+}
+
+fn local_quic_test_server_with_socket(
+    alpn: &[u8],
+    obfs: Option<(&str, &str)>,
+) -> (quinn::Endpoint, SocketAddr) {
+    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let certificate_der = CertificateDer::from(certificate.cert.der().to_vec());
+    let private_key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+    let provider = aws_lc_rs::default_provider();
+    let mut server_crypto = ServerConfig::builder_with_provider(provider.into())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate_der], private_key.into())
+        .unwrap();
+    server_crypto.alpn_protocols = vec![alpn.to_vec()];
+    server_crypto.max_early_data_size = u32::MAX;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(1024 * 1024));
+    transport.datagram_send_buffer_size(1024 * 1024);
+    server_config.transport_config(Arc::new(transport));
+    let endpoint = if let Some((mode, password)) = obfs {
+        let socket =
+            std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+        let inner = runtime.wrap_udp_socket(socket).unwrap();
+        let socket = wrap_hysteria2_obfs_socket_for_test(inner, mode, password).unwrap();
+        quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .unwrap()
+    } else {
+        quinn::Endpoint::server(
+            server_config,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap()
+    };
+    let address = endpoint.local_addr().unwrap();
+    (endpoint, address)
+}
+
+async fn accept_and_verify_tuic_auth(
+    connection: &quinn::Connection,
+    user_id: Uuid,
+    password: &'static str,
+) {
+    let mut stream = connection.accept_uni().await.unwrap();
+    let auth = stream.read_to_end(64).await.unwrap();
+    assert_eq!(auth.len(), 50);
+    assert_eq!(&auth[..2], &[0x05, 0x00]);
+    assert_eq!(&auth[2..18], user_id.as_bytes());
+    let mut expected_token = [0u8; 32];
+    connection
+        .export_keying_material(&mut expected_token, user_id.as_bytes(), password.as_bytes())
+        .unwrap();
+    assert_eq!(&auth[18..], &expected_token);
+}
+
+#[tokio::test]
+async fn tuic_local_quic_server_covers_auth_tcp_and_native_udp() {
+    const PASSWORD: &str = "tuic-local-password";
+    let user_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+    let (server_endpoint, server_address) = local_quic_test_server(b"h3");
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        accept_and_verify_tuic_auth(&connection, user_id, PASSWORD).await;
+
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let mut header = [0u8; 4];
+        recv.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..3], &[0x05, 0x01, 0x00]);
+        let mut address = vec![0u8; usize::from(header[3]) + 2];
+        recv.read_exact(&mut address).await.unwrap();
+        assert_eq!(&address[..address.len() - 2], b"target.example");
+        assert_eq!(
+            u16::from_be_bytes([address[address.len() - 2], address[address.len() - 1]]),
+            443
+        );
+        let mut payload = [0u8; 4];
+        recv.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        send.write_all(b"pong").await.unwrap();
+        send.finish().unwrap();
+
+        let mut associate_id = None;
+        let mut saw_heartbeat = false;
+        while associate_id.is_none() || !saw_heartbeat {
+            let datagram = connection.read_datagram().await.unwrap();
+            if datagram.starts_with(&[0x05, 0x02]) {
+                associate_id = Some(u16::from_be_bytes([datagram[2], datagram[3]]));
+                connection.send_datagram_wait(datagram).await.unwrap();
+            } else if datagram.as_ref() == [0x05, 0x04] {
+                saw_heartbeat = true;
+            }
+        }
+        let mut dissociate = connection.accept_uni().await.unwrap();
+        let dissociate = dissociate.read_to_end(4).await.unwrap();
+        assert_eq!(&dissociate[..2], &[0x05, 0x03]);
+        assert_eq!(
+            u16::from_be_bytes([dissociate[2], dissociate[3]]),
+            associate_id.unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let outbound = TuicOutbound::new(
+        "tuic-local".to_string(),
+        server_address.ip().to_string(),
+        server_address.port(),
+        user_id.to_string(),
+        PASSWORD.to_string(),
+        Some("localhost".to_string()),
+        true,
+        Some("bbr".to_string()),
+        Some("native".to_string()),
+        Some("h3".to_string()),
+        Some(1_500),
+        Some(500),
+        false,
+    );
+    let mut stream = outbound
+        .connect(&Destination::new("target.example", 443), 2_000)
+        .await
+        .unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    assert_eq!(
+        outbound
+            .udp_exchange(&Destination::new("dns.example", 53), b"dns-query", 2_000)
+            .await
+            .unwrap(),
+        b"dns-query"
+    );
+    outbound.clear_udp_sessions_for_test().await;
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tuic_resumes_with_accepted_zero_rtt_on_second_connection() {
+    const PASSWORD: &str = "tuic-zero-rtt-password";
+    let user_id = Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap();
+    let (server_endpoint, server_address) = local_quic_test_server(b"h3");
+    let server = tokio::spawn(async move {
+        for expected_payload in [b"first".as_slice(), b"second".as_slice()] {
+            let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+            accept_and_verify_tuic_auth(&connection, user_id, PASSWORD).await;
+            let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+            let mut header = [0u8; 4];
+            recv.read_exact(&mut header).await.unwrap();
+            assert_eq!(&header[..3], &[0x05, 0x01, 0x00]);
+            let mut address = vec![0u8; usize::from(header[3]) + 2];
+            recv.read_exact(&mut address).await.unwrap();
+            let mut payload = vec![0u8; expected_payload.len()];
+            recv.read_exact(&mut payload).await.unwrap();
+            assert_eq!(payload, expected_payload);
+            send.write_all(expected_payload).await.unwrap();
+            send.finish().unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    });
+
+    let outbound = TuicOutbound::new(
+        "tuic-zero-rtt".to_string(),
+        server_address.ip().to_string(),
+        server_address.port(),
+        user_id.to_string(),
+        PASSWORD.to_string(),
+        Some("localhost".to_string()),
+        true,
+        Some("bbr".to_string()),
+        Some("native".to_string()),
+        Some("h3".to_string()),
+        None,
+        Some(1_000),
+        true,
+    );
+    for (index, payload) in [b"first".as_slice(), b"second".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let mut stream = outbound
+            .connect(&Destination::new("target.example", 443), 2_000)
+            .await
+            .unwrap();
+        stream.write_all(payload).await.unwrap();
+        let mut response = vec![0u8; payload.len()];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, payload);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(stream);
+        assert_eq!(outbound.take_connection_for_test().await, Some(index == 1));
+    }
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tuic_local_quic_server_covers_stream_udp_relay() {
+    const PASSWORD: &str = "tuic-stream-password";
+    let user_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+    let (server_endpoint, server_address) = local_quic_test_server(b"h3");
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        accept_and_verify_tuic_auth(&connection, user_id, PASSWORD).await;
+        let mut packet_stream = connection.accept_uni().await.unwrap();
+        let packet = packet_stream.read_to_end(2_048).await.unwrap();
+        assert!(packet.starts_with(&[0x05, 0x02]));
+        let mut response = connection.open_uni().await.unwrap();
+        response.write_all(&packet).await.unwrap();
+        response.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let outbound = TuicOutbound::new(
+        "tuic-stream-local".to_string(),
+        server_address.ip().to_string(),
+        server_address.port(),
+        user_id.to_string(),
+        PASSWORD.to_string(),
+        Some("localhost".to_string()),
+        true,
+        Some("cubic".to_string()),
+        Some("quic".to_string()),
+        Some("h3".to_string()),
+        Some(1_500),
+        Some(1_000),
+        false,
+    );
+    assert_eq!(
+        outbound
+            .udp_exchange(&Destination::new("dns.example", 53), b"stream-dns", 2_000)
+            .await
+            .unwrap(),
+        b"stream-dns"
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hysteria2_local_h3_server_covers_auth_tcp_and_udp() {
+    const PASSWORD: &str = "hysteria2-local-password";
+    let (server_endpoint, server_address) = local_quic_test_server(b"h3");
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        let mut h3_connection: h3::server::Connection<h3_quinn::Connection, Bytes> =
+            h3::server::builder()
+                .build(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .unwrap();
+        let resolver = h3_connection.accept().await.unwrap().unwrap();
+        let (request, mut request_stream) = resolver.resolve_request().await.unwrap();
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(request.uri().path(), "/auth");
+        assert_eq!(request.headers()["hysteria-auth"], PASSWORD);
+        assert_eq!(request.headers()["hysteria-cc-rx"], "25000000");
+        assert!(request.headers()["hysteria-padding"].as_bytes().len() >= 64);
+        let response = http::Response::builder()
+            .status(233)
+            .header("hysteria-udp", "true")
+            .header("hysteria-cc-rx", "12500000")
+            .header("hysteria-padding", "server-random-padding")
+            .body(())
+            .unwrap();
+        request_stream.send_response(response).await.unwrap();
+        request_stream.finish().await.unwrap();
+
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        assert_eq!(read_quic_varint(&mut recv).await.unwrap(), 0x401);
+        let address_len = read_quic_varint(&mut recv).await.unwrap() as usize;
+        let mut address = vec![0u8; address_len];
+        recv.read_exact(&mut address).await.unwrap();
+        assert_eq!(&address, b"target.example:443");
+        let padding_len = read_quic_varint(&mut recv).await.unwrap() as usize;
+        let mut padding = vec![0u8; padding_len];
+        recv.read_exact(&mut padding).await.unwrap();
+        send.write_all(&[0x00, 0x00, 0x00]).await.unwrap();
+        let mut payload = [0u8; 4];
+        recv.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        send.write_all(b"pong").await.unwrap();
+        send.finish().unwrap();
+
+        let datagram = connection.read_datagram().await.unwrap();
+        connection.send_datagram_wait(datagram).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(h3_connection);
+    });
+
+    let outbound = Hysteria2Outbound::new(
+        "hy2-local".to_string(),
+        server_address.ip().to_string(),
+        server_address.port(),
+        PASSWORD.to_string(),
+        Some("localhost".to_string()),
+        true,
+        None,
+        None,
+        Some("h3".to_string()),
+        Some("100 Mbps".to_string()),
+        Some("200 Mbps".to_string()),
+        Some("brutal".to_string()),
+    );
+    let mut stream = outbound
+        .connect(&Destination::new("target.example", 443), 2_000)
+        .await
+        .unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    assert_eq!(
+        outbound
+            .udp_exchange(&Destination::new("dns.example", 53), b"hy2-dns", 2_000)
+            .await
+            .unwrap(),
+        b"hy2-dns"
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn assert_hysteria2_obfs_round_trip(mode: &'static str) {
+    const AUTH_PASSWORD: &str = "hysteria2-obfs-auth";
+    const OBFS_PASSWORD: &str = "hysteria2-obfs-wire";
+    let (server_endpoint, server_address) =
+        local_quic_test_server_with_socket(b"h3", Some((mode, OBFS_PASSWORD)));
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        let mut h3_connection: h3::server::Connection<h3_quinn::Connection, Bytes> =
+            h3::server::builder()
+                .build(h3_quinn::Connection::new(connection.clone()))
+                .await
+                .unwrap();
+        let resolver = h3_connection.accept().await.unwrap().unwrap();
+        let (request, mut request_stream) = resolver.resolve_request().await.unwrap();
+        assert_eq!(request.headers()["hysteria-auth"], AUTH_PASSWORD);
+        request_stream
+            .send_response(
+                http::Response::builder()
+                    .status(233)
+                    .header("hysteria-udp", "true")
+                    .header("hysteria-cc-rx", "auto")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        request_stream.finish().await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        assert_eq!(read_quic_varint(&mut recv).await.unwrap(), 0x401);
+        let address_len = read_quic_varint(&mut recv).await.unwrap() as usize;
+        let mut address = vec![0u8; address_len];
+        recv.read_exact(&mut address).await.unwrap();
+        assert_eq!(&address, b"obfs.example:443");
+        let padding_len = read_quic_varint(&mut recv).await.unwrap() as usize;
+        let mut padding = vec![0u8; padding_len];
+        recv.read_exact(&mut padding).await.unwrap();
+        send.write_all(&[0x00, 0x00, 0x00]).await.unwrap();
+        let mut payload = [0u8; 4];
+        recv.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        send.write_all(b"pong").await.unwrap();
+        send.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(h3_connection);
+    });
+
+    let outbound = Hysteria2Outbound::new(
+        format!("hy2-{mode}"),
+        server_address.ip().to_string(),
+        server_address.port(),
+        AUTH_PASSWORD.to_string(),
+        Some("localhost".to_string()),
+        true,
+        Some(mode.to_string()),
+        Some(OBFS_PASSWORD.to_string()),
+        Some("h3".to_string()),
+        None,
+        None,
+        None,
+    );
+    let mut stream = outbound
+        .connect(&Destination::new("obfs.example", 443), 2_000)
+        .await
+        .unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"pong");
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hysteria2_salamander_and_gecko_complete_real_quic_round_trips() {
+    assert_hysteria2_obfs_round_trip("salamander").await;
+    assert_hysteria2_obfs_round_trip("gecko").await;
+}
+
+#[tokio::test]
+async fn hysteria2_obfs_rejects_a_mismatched_password() {
+    let (_server_endpoint, server_address) =
+        local_quic_test_server_with_socket(b"h3", Some(("salamander", "server-secret")));
+    let outbound = Hysteria2Outbound::new(
+        "hy2-bad-obfs".to_string(),
+        server_address.ip().to_string(),
+        server_address.port(),
+        "auth-password".to_string(),
+        Some("localhost".to_string()),
+        true,
+        Some("salamander".to_string()),
+        Some("client-secret".to_string()),
+        Some("h3".to_string()),
+        None,
+        None,
+        None,
+    );
+    let error = match outbound
+        .connect(&Destination::new("target.example", 443), 200)
+        .await
+    {
+        Ok(_) => panic!("mismatched hysteria2 obfs password unexpectedly connected"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("timed out"),
+        "unexpected mismatched obfs error: {error}"
+    );
+}
+
+async fn assert_hysteria2_auth_rejected(
+    status: u16,
+    udp_header: Option<&'static str>,
+    cc_header: Option<&'static str>,
+    expected_error: &str,
+) {
+    let (server_endpoint, server_address) = local_quic_test_server(b"h3");
+    let server = tokio::spawn(async move {
+        let connection = server_endpoint.accept().await.unwrap().await.unwrap();
+        let mut h3_connection: h3::server::Connection<h3_quinn::Connection, Bytes> =
+            h3::server::builder()
+                .build(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+        let resolver = h3_connection.accept().await.unwrap().unwrap();
+        let (_, mut request_stream) = resolver.resolve_request().await.unwrap();
+        let mut response = http::Response::builder().status(status);
+        if let Some(value) = udp_header {
+            response = response.header("hysteria-udp", value);
+        }
+        if let Some(value) = cc_header {
+            response = response.header("hysteria-cc-rx", value);
+        }
+        request_stream
+            .send_response(response.body(()).unwrap())
+            .await
+            .unwrap();
+        request_stream.finish().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+    let outbound = Hysteria2Outbound::new(
+        "hy2-rejected".to_string(),
+        server_address.ip().to_string(),
+        server_address.port(),
+        "password".to_string(),
+        Some("localhost".to_string()),
+        true,
+        None,
+        None,
+        Some("h3".to_string()),
+        None,
+        None,
+        None,
+    );
+    let error = match outbound
+        .connect(&Destination::new("target.example", 443), 2_000)
+        .await
+    {
+        Ok(_) => panic!("invalid hysteria2 auth response unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains(expected_error),
+        "unexpected hysteria2 error: {error}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hysteria2_rejects_bad_status_and_missing_required_auth_headers() {
+    assert_hysteria2_auth_rejected(401, None, None, "authentication failed").await;
+    assert_hysteria2_auth_rejected(233, None, Some("auto"), "missing Hysteria-UDP").await;
+    assert_hysteria2_auth_rejected(233, Some("true"), None, "missing Hysteria-CC-RX").await;
+}
+
+#[tokio::test]
+async fn hysteria2_and_tuic_reject_invalid_configuration_before_dial() {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let tuic = TuicOutbound::new(
+        "tuic-invalid".to_string(),
+        address.ip().to_string(),
+        address.port(),
+        "not-a-uuid".to_string(),
+        "password".to_string(),
+        None,
+        true,
+        None,
+        Some("invalid-mode".to_string()),
+        None,
+        Some(128),
+        Some(100),
+        false,
+    );
+    let error = match tuic
+        .connect(&Destination::new("target.example", 443), 500)
+        .await
+    {
+        Ok(_) => panic!("invalid TUIC configuration unexpectedly dialed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid tuic uuid"));
+
+    let hysteria2 = Hysteria2Outbound::new(
+        "hy2-invalid".to_string(),
+        address.ip().to_string(),
+        address.port(),
+        "password".to_string(),
+        None,
+        true,
+        Some("unsupported".to_string()),
+        None,
+        None,
+        Some("not-bandwidth".to_string()),
+        None,
+        Some("invalid-controller".to_string()),
+    );
+    let error = match hysteria2
+        .connect(&Destination::new("target.example", 443), 500)
+        .await
+    {
+        Ok(_) => panic!("invalid Hysteria2 configuration unexpectedly dialed"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("unsupported hysteria2 congestion controller"));
+    let mut packet = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), socket.recv(&mut packet))
+            .await
+            .is_err()
     );
 }
 

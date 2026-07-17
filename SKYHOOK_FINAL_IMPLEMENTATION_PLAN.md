@@ -8,10 +8,10 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.21（完成 `NEXT-011C` VLESS/Reality/Vision 收口）
+> 计划版本：v1.22（完成 `NEXT-011D` Hysteria2/TUIC 收口）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 进行中，当前直接执行点为 `NEXT-011D`。
+> M2 进行中，当前直接执行点为 `NEXT-011E`。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -386,8 +386,8 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`
-   已完成；执行 `NEXT-011D` 收口 Hysteria2/TUIC。
+1. `NEXT-010A`、`NEXT-010B`、`NEXT-010C`、`NEXT-011A`、`NEXT-011B`、`NEXT-011C`、
+   `NEXT-011D` 已完成；执行 `NEXT-011E` 收口 WireGuard。
 2. 继续按 M2-M3 完成所有 partial/parse-only 协议的真实 TCP/UDP 拨号、认证、传输组合、
    错误映射和互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
 3. 按 M4-M5 完成 DNS/Fake-IP、macOS TUN 虚拟网卡、权限服务、系统网络事务、回滚、
@@ -1195,7 +1195,20 @@ VLESS/Reality、Hysteria2 和 TUIC 的生产实现均已迁出根模块并提交
        custom headers、ALPN、96KB 双向半关闭、错误配置/响应、TLS 证书/超时、UDP 会话复用、
        多目的隔离、超时淘汰恢复和 8192 字节边界；7 项订阅转换、6 项集成回归与
        `cargo check --all-targets` 通过且无 warning。
-   - [ ] `NEXT-011D`：Hysteria2/TUIC 完整能力收口。
+   - [x] `NEXT-011D`：Hysteria2/TUIC 完整能力收口。
+     - Hysteria2 持久保留 H3 请求句柄，严格校验 status 233、`Hysteria-UDP` 和
+       `Hysteria-CC-RX`；随机 auth/TCP padding、TCP、QUIC datagram UDP、fragmentation、
+       association dispatcher、连接/会话复用、上下行带宽协商和速率感知 BDP 控制器均已落地。
+     - Salamander 使用 BLAKE2b key+salt packet mask，Gecko 在其上执行带随机 padding 的
+       QUIC long-header 分片/重组；普通 QUIC、Salamander 和 Gecko 均通过本地真实
+       QUIC/H3 服务端认证和双向 TCP/UDP 往返，错误状态、缺失认证头和错误混淆密码会明确拒绝。
+     - TUIC v5 完成 TLS exporter UUID/password 认证、TCP、native datagram/QUIC 单向流
+       UDP、非首片 `0xff` 地址、per-association dispatcher、heartbeat、Dissociate、max packet
+       和有界 session pool；持久复用同一 Rustls/QUIC 配置后第二次连接具有真实会话恢复证据。
+     - TUIC 恢复流程必须先确认握手，再用当前 TLS session exporter 认证并开放业务流量；
+       不把认证或用户数据置于可重放 early data。`cargo check --all-targets`、186 项 lib、
+       19 项 VLESS/Hysteria2/TUIC 集成、8 项 Hysteria2 和 9 项 TUIC 专项均通过。
+       本批新增 Clippy 项已清零；全仓严格 Clippy 的历史风格债务保留到 M11 统一治理。
    - [ ] `NEXT-011E`：WireGuard 完整能力收口。
    - [ ] `NEXT-011F`：AnyTLS/ShadowTLS/Naive 完整能力收口。
    - [ ] `NEXT-011G`：HTTP/SOCKS5/SSH 与 M2 集中验收。
