@@ -8,6 +8,16 @@ use std::{
     time::Duration,
 };
 
+use ::shadowsocks::{
+    config::{ServerConfig as ShadowsocksServerConfig, ServerType as ShadowsocksServerType},
+    context::Context as ShadowsocksContext,
+    crypto::CipherKind as ShadowsocksCipherKind,
+    relay::{
+        socks5::Address as ShadowsocksAddress,
+        tcprelay::proxy_stream::ProxyServerStream as ShadowsocksServerStream,
+    },
+    ServerAddr as ShadowsocksServerAddr,
+};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm,
@@ -37,9 +47,9 @@ use super::{
     },
     shadowsocks::{
         encode_ss_chunk, evp_bytes_to_key, find_header_end, read_simple_obfs_tls_record,
-        read_ss_chunk, write_ss_chunk, ShadowsocksOutbound, Ss2022ReplayWindow, SsCipher,
-        SIMPLE_OBFS_TLS_FIXED_CLIENT_HELLO_LEN, SIMPLE_OBFS_TLS_SESSION_TICKET_HEADER_LEN,
-        SS_NONCE_LEN,
+        read_ss_chunk, spawn_simple_obfs_transport, write_ss_chunk, ShadowsocksOutbound,
+        Ss2022ReplayWindow, SsCipher, SIMPLE_OBFS_TLS_FIXED_CLIENT_HELLO_LEN,
+        SIMPLE_OBFS_TLS_SESSION_TICKET_HEADER_LEN, SS_NONCE_LEN,
     },
     transports::{
         read_websocket_frame, render_transport_headers, websocket_accept_key,
@@ -217,6 +227,8 @@ async fn shadowsocks_outbound_encrypts_tcp_stream() {
         "aes-128-gcm".to_string(),
         password,
         None,
+        false,
+        1,
     );
     let mut stream = outbound.connect(&destination, 1000).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
@@ -316,6 +328,8 @@ async fn shadowsocks_simple_obfs_http_wraps_first_packet() {
             tls: false,
             skip_cert_verify: false,
         }),
+        false,
+        1,
     );
     let mut stream = outbound.connect(&destination, 1000).await.unwrap();
     let mut response = [0u8; 4];
@@ -414,12 +428,229 @@ async fn shadowsocks_simple_obfs_tls_wraps_stream() {
             tls: false,
             skip_cert_verify: false,
         }),
+        false,
+        1,
     );
     let mut stream = outbound.connect(&destination, 1000).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
     let mut response = [0u8; 4];
     stream.read_exact(&mut response).await.unwrap();
 
+    assert_eq!(&response, b"pong");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn shadowsocks_simple_obfs_http_transparent_transport() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 512];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = find_header_end(&request) else {
+                continue;
+            };
+            let header = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap();
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            assert_eq!(&request[header_end..header_end + content_length], b"hello");
+            stream
+                .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\nworld")
+                .await
+                .unwrap();
+            break;
+        }
+    });
+
+    let raw = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+    let mut stream = spawn_simple_obfs_transport(
+        Box::new(raw),
+        ShadowsocksPluginConfig {
+            mode: "http_simple".to_string(),
+            host: Some("edge.example.com".to_string()),
+            path: None,
+            tls: false,
+            skip_cert_verify: false,
+        },
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+    );
+    stream.write_all(b"hello").await.unwrap();
+    let mut response = [0u8; 5];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"world");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn shadowsocks_simple_obfs_tls_transparent_transport() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (record_type, _, client_hello) = read_simple_obfs_tls_record(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record_type, 0x16);
+        let ticket_offset = SIMPLE_OBFS_TLS_FIXED_CLIENT_HELLO_LEN - 5;
+        let ticket_len = u16::from_be_bytes([
+            client_hello[ticket_offset + 2],
+            client_hello[ticket_offset + 3],
+        ]) as usize;
+        let body_start = ticket_offset + SIMPLE_OBFS_TLS_SESSION_TICKET_HEADER_LEN;
+        assert_eq!(&client_hello[body_start..body_start + ticket_len], b"hello");
+
+        let mut response = vec![
+            0x16, 0x03, 0x01, 0x00, 0x00, 0x14, 0x03, 0x03, 0x00, 0x01, 0x01,
+        ];
+        response.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x05]);
+        response.extend_from_slice(b"world");
+        stream.write_all(&response).await.unwrap();
+    });
+
+    let raw = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+    let mut stream = spawn_simple_obfs_transport(
+        Box::new(raw),
+        ShadowsocksPluginConfig {
+            mode: "tls".to_string(),
+            host: Some("edge.example.com".to_string()),
+            path: None,
+            tls: false,
+            skip_cert_verify: false,
+        },
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+    );
+    stream.write_all(b"hello").await.unwrap();
+    let mut response = [0u8; 5];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"world");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn shadowsocks_extended_cipher_over_simple_obfs_real_dial() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let destination = Destination::new("managed-obfs.example", 443);
+    let expected_destination = destination.clone();
+    let method = "aes-192-ctr".parse::<ShadowsocksCipherKind>().unwrap();
+    let server_config = ShadowsocksServerConfig::new(
+        ShadowsocksServerAddr::SocketAddr(listen_addr),
+        "secret",
+        method,
+    )
+    .unwrap();
+    let server_key = server_config.key().to_vec();
+    let server = tokio::spawn(async move {
+        let (mut raw, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 512];
+        let (header_end, content_length) = loop {
+            let read = raw.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = find_header_end(&request) else {
+                continue;
+            };
+            let header = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap();
+            break (header_end, content_length);
+        };
+        while request.len() - header_end < content_length {
+            let read = raw.read(&mut buffer).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let initial = request[header_end..header_end + content_length].to_vec();
+        let trailing = request[header_end + content_length..].to_vec();
+
+        let (proxy_side, relay_side) = tokio::io::duplex(64 * 1024);
+        let (mut relay_read, mut relay_write) = tokio::io::split(relay_side);
+        relay_write.write_all(&initial).await.unwrap();
+        relay_write.write_all(&trailing).await.unwrap();
+        let (mut raw_read, mut raw_write) = raw.into_split();
+        raw_write
+            .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n")
+            .await
+            .unwrap();
+        let uplink = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut raw_read, &mut relay_write).await;
+        });
+        let downlink = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut relay_read, &mut raw_write).await;
+        });
+
+        let context = ShadowsocksContext::new_shared(ShadowsocksServerType::Server);
+        let mut stream =
+            ShadowsocksServerStream::from_stream(context, proxy_side, method, &server_key);
+        let address = stream.handshake().await.unwrap();
+        match address {
+            ShadowsocksAddress::DomainNameAddress(host, port) => {
+                assert_eq!(host, expected_destination.host);
+                assert_eq!(port, expected_destination.port);
+            }
+            other => panic!("unexpected Shadowsocks target {other}"),
+        }
+        let mut payload = [0u8; 4];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        uplink.abort();
+        let _ = downlink.await;
+    });
+
+    let outbound = ShadowsocksOutbound::new(
+        "ss-managed-obfs".to_string(),
+        "127.0.0.1".to_string(),
+        listen_addr.port(),
+        "aes-192-ctr".to_string(),
+        "secret".to_string(),
+        Some(ShadowsocksPluginConfig {
+            mode: "http_simple".to_string(),
+            host: Some("edge.example.com".to_string()),
+            path: None,
+            tls: false,
+            skip_cert_verify: false,
+        }),
+        false,
+        1,
+    );
+    let mut stream = outbound.connect(&destination, 1000).await.unwrap();
+    stream.write_all(b"ping").await.unwrap();
+    stream.flush().await.unwrap();
+    let mut response = [0u8; 4];
+    stream.read_exact(&mut response).await.unwrap();
     assert_eq!(&response, b"pong");
     server.await.unwrap();
 }
@@ -524,6 +755,8 @@ async fn shadowsocks_v2ray_plugin_websocket_real_dial() {
             tls: false,
             skip_cert_verify: false,
         }),
+        false,
+        1,
     );
     let mut stream = outbound.connect(&destination, 1000).await.unwrap();
     stream.write_all(b"ping").await.unwrap();
@@ -535,9 +768,44 @@ async fn shadowsocks_v2ray_plugin_websocket_real_dial() {
 }
 
 #[test]
-fn shadowsocks_rejects_unsupported_method() {
+fn custom_shadowsocks_codec_rejects_managed_method() {
     let error = SsCipher::from_method("rc4-md5").unwrap_err();
     assert!(error.to_string().contains("unsupported shadowsocks method"));
+}
+
+#[test]
+fn rabbit128_poly1305_matches_independent_reference_vector() {
+    let key = [0xff; 16];
+    let nonce = [0xfa; 8];
+    let plaintext = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ];
+    let expected = [
+        0x83, 0x5b, 0x45, 0x81, 0x2f, 0x48, 0xd7, 0xc0, 0xc3, 0x9f, 0x72, 0x53, 0x9c, 0xfb, 0xde,
+        0x6f, 0xad, 0x22, 0x9a, 0x1a, 0x03, 0x6b, 0xe5, 0xe3, 0x98, 0x41, 0x92, 0xcf, 0x11, 0x80,
+        0xaa, 0x6b,
+    ];
+    let actual =
+        super::shadowsocks::encrypt_rabbit_poly1305_with_aad(&key, &nonce, &plaintext, &[0x01; 4])
+            .unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn shadowsocks_aead_rejects_wrong_password_key() {
+    let cipher = SsCipher::Aes128Gcm;
+    let salt = [0x44; 16];
+    let nonce = [0u8; SS_NONCE_LEN];
+    let correct_master = evp_bytes_to_key(b"correct-password", cipher.key_len());
+    let wrong_master = evp_bytes_to_key(b"wrong-password", cipher.key_len());
+    let correct_key = cipher.derive_subkey(&correct_master, &salt).unwrap();
+    let wrong_key = cipher.derive_subkey(&wrong_master, &salt).unwrap();
+    let ciphertext = cipher
+        .encrypt(&correct_key, &nonce, b"authenticated")
+        .unwrap();
+    let error = cipher.decrypt(&wrong_key, &nonce, &ciphertext).unwrap_err();
+    assert!(error.to_string().contains("decrypt failed"));
 }
 
 #[tokio::test]

@@ -463,6 +463,10 @@ pub enum OutboundConfig {
         password: String,
         #[serde(default)]
         plugin: Option<ShadowsocksPluginConfig>,
+        #[serde(default)]
+        udp_over_tcp: bool,
+        #[serde(default = "default_shadowsocks_udp_over_tcp_version")]
+        udp_over_tcp_version: u8,
     },
     Trojan {
         name: String,
@@ -748,6 +752,10 @@ pub enum OutboundConfig {
         kind: String,
         members: Vec<String>,
     },
+}
+
+fn default_shadowsocks_udp_over_tcp_version() -> u8 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

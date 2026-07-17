@@ -265,6 +265,19 @@ impl SubscriptionNode {
                     method,
                     password,
                     plugin: shadowsocks_plugin_config(&self.params)?,
+                    udp_over_tcp: self
+                        .params
+                        .get("udp-over-tcp")
+                        .map(|value| bool_text(value))
+                        .unwrap_or(false),
+                    udp_over_tcp_version: self
+                        .params
+                        .get("udp-over-tcp-version")
+                        .map(|value| parse_u16_text(value, "shadowsocks udp-over-tcp-version"))
+                        .transpose()?
+                        .unwrap_or(1)
+                        .try_into()
+                        .map_err(|_| anyhow!("shadowsocks udp-over-tcp-version is too large"))?,
                 })
             }
             NodeProtocol::ShadowsocksR => {
@@ -1161,6 +1174,7 @@ fn parse_ss_uri(value: &str) -> anyhow::Result<SubscriptionNode> {
             let value = value.into_owned();
             if key == "plugin" {
                 parse_simple_obfs_plugin(&value, &mut params);
+                continue;
             }
             params.insert(key, value);
         }
@@ -1431,15 +1445,21 @@ fn shadowsocks_plugin_config(
     let Some(plugin) = params.get("plugin") else {
         return Ok(None);
     };
-    let plugin = plugin.to_ascii_lowercase();
-    if plugin != "obfs" && !plugin.starts_with("simple-obfs") {
-        return Err(anyhow!("unsupported shadowsocks plugin {plugin}"));
-    }
-    let mode = params
-        .get("plugin-mode")
-        .or_else(|| params.get("obfs"))
-        .cloned()
-        .unwrap_or_else(|| "http".to_string());
+    let plugin = plugin
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let mode = match plugin.as_str() {
+        "obfs" | "obfs-local" | "simple-obfs" => params
+            .get("plugin-mode")
+            .or_else(|| params.get("obfs"))
+            .cloned()
+            .unwrap_or_else(|| "http".to_string()),
+        "v2ray-plugin" => "v2ray-plugin".to_string(),
+        _ => return Err(anyhow!("unsupported shadowsocks plugin {plugin}")),
+    };
     Ok(Some(ShadowsocksPluginConfig {
         mode,
         host: params
@@ -1453,11 +1473,12 @@ fn shadowsocks_plugin_config(
         tls: params
             .get("plugin-opts-tls")
             .or_else(|| params.get("tls"))
-            .map(|v| v == "true" || v == "1")
+            .map(|value| bool_text(value))
             .unwrap_or(false),
         skip_cert_verify: params
-            .get("skip-cert-verify")
-            .map(|v| v == "true" || v == "1")
+            .get("plugin-opts-skip-cert-verify")
+            .or_else(|| params.get("skip-cert-verify"))
+            .map(|value| bool_text(value))
             .unwrap_or(false),
     }))
 }
@@ -1471,6 +1492,17 @@ fn parse_clash_plugin_opts(value: &Value, params: &mut BTreeMap<String, String>)
     }
     if let Some(host) = yaml_string(mapping, "host") {
         params.insert("plugin-host".to_string(), host);
+    }
+    if let Some(path) = yaml_string(mapping, "path") {
+        params.insert("plugin-opts-path".to_string(), path);
+    }
+    for key in ["tls", "skip-cert-verify"] {
+        if let Some(value) = mapping
+            .get(Value::String(key.to_string()))
+            .and_then(yaml_scalar_to_string)
+        {
+            params.insert(format!("plugin-opts-{key}"), value);
+        }
     }
 }
 
@@ -1596,24 +1628,30 @@ fn parse_clash_http_upgrade_opts(value: &Value, params: &mut BTreeMap<String, St
 
 fn parse_simple_obfs_plugin(value: &str, params: &mut BTreeMap<String, String>) {
     let parts = value.split(';').collect::<Vec<_>>();
-    if parts
-        .first()
-        .map(|item| item.eq_ignore_ascii_case("simple-obfs"))
-        .unwrap_or(false)
-    {
-        for part in parts.into_iter().skip(1) {
-            let Some((key, value)) = part.split_once('=') else {
-                continue;
-            };
-            match key {
-                "obfs" => {
-                    params.insert("plugin-mode".to_string(), value.to_string());
-                }
-                "obfs-host" => {
-                    params.insert("plugin-host".to_string(), value.to_string());
-                }
-                _ => {}
+    let plugin = parts.first().copied().unwrap_or_default();
+    params.insert("plugin".to_string(), plugin.to_string());
+    for part in parts.into_iter().skip(1) {
+        let (key, value) = part.split_once('=').unwrap_or((part, "true"));
+        match key.to_ascii_lowercase().as_str() {
+            "obfs" | "mode" => {
+                params.insert("plugin-mode".to_string(), value.to_string());
             }
+            "obfs-host" | "host" => {
+                params.insert("plugin-host".to_string(), value.to_string());
+            }
+            "path" => {
+                params.insert("plugin-opts-path".to_string(), value.to_string());
+            }
+            "tls" => {
+                params.insert("plugin-opts-tls".to_string(), value.to_string());
+            }
+            "skip-cert-verify" => {
+                params.insert(
+                    "plugin-opts-skip-cert-verify".to_string(),
+                    value.to_string(),
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -1851,6 +1889,7 @@ proxies:
                 method,
                 password,
                 plugin,
+                ..
             } => {
                 assert_eq!(name, "HK-01");
                 assert_eq!(server, "hk.example.com");
@@ -1923,6 +1962,56 @@ proxies:
     }
 
     #[test]
+    fn converts_shadowsocks_udp_over_tcp_options() {
+        let text = r#"
+proxies:
+  - name: HK-UOT
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    udp-over-tcp: true
+    udp-over-tcp-version: 2
+"#;
+
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Shadowsocks {
+                udp_over_tcp,
+                udp_over_tcp_version,
+                ..
+            } => {
+                assert!(udp_over_tcp);
+                assert_eq!(udp_over_tcp_version, 2);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_shadowsocks_udp_over_tcp_version_over_u8() {
+        let text = r#"
+proxies:
+  - name: HK-UOT
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: secret
+    udp-over-tcp: true
+    udp-over-tcp-version: 256
+"#;
+
+        let doc = parse_subscription(text).unwrap();
+        let error = doc.nodes[0].to_outbound_config().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("shadowsocks udp-over-tcp-version is too large"));
+    }
+
+    #[test]
     fn parses_shadowsocks_uri_simple_obfs_plugin_options() {
         let uri = "ss://YWVzLTEyOC1nY206cGFzcw@example.com:8388/?plugin=simple-obfs%3Bobfs%3Dhttp%3Bobfs-host%3Dedge.example.com#HK";
 
@@ -1951,6 +2040,58 @@ proxies:
                 let plugin = plugin.expect("plugin");
                 assert_eq!(plugin.mode, "tls");
                 assert_eq!(plugin.host.as_deref(), Some("edge.example.com"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converts_shadowsocks_v2ray_plugin_yaml_options() {
+        let text = r#"
+proxies:
+  - name: HK-WS
+    type: ss
+    server: hk.example.com
+    port: 443
+    cipher: aes-192-ctr
+    password: secret
+    plugin: v2ray-plugin
+    plugin-opts:
+      mode: websocket
+      host: edge.example.com
+      path: /ss
+      tls: true
+      skip-cert-verify: true
+"#;
+
+        let doc = parse_subscription(text).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Shadowsocks { plugin, .. } => {
+                let plugin = plugin.expect("plugin");
+                assert_eq!(plugin.mode, "v2ray-plugin");
+                assert_eq!(plugin.host.as_deref(), Some("edge.example.com"));
+                assert_eq!(plugin.path.as_deref(), Some("/ss"));
+                assert!(plugin.tls);
+                assert!(plugin.skip_cert_verify);
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_shadowsocks_v2ray_plugin_uri_options() {
+        let uri = "ss://YWVzLTE5Mi1jdHI6cGFzcw@example.com:8388/?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Bhost%3Dedge.example.com%3Bpath%3D%2Fss%3Btls#HK";
+
+        let doc = parse_subscription(uri).unwrap();
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Shadowsocks { plugin, .. } => {
+                let plugin = plugin.expect("plugin");
+                assert_eq!(plugin.mode, "v2ray-plugin");
+                assert_eq!(plugin.host.as_deref(), Some("edge.example.com"));
+                assert_eq!(plugin.path.as_deref(), Some("/ss"));
+                assert!(plugin.tls);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

@@ -814,6 +814,8 @@ mod doctor_summary_tests {
                 method: "aes-128-gcm".to_string(),
                 password: "password".to_string(),
                 plugin: None,
+                udp_over_tcp: false,
+                udp_over_tcp_version: 1,
             },
             OutboundConfig::Ssr {
                 name: "ssr-node".to_string(),

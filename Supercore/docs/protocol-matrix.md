@@ -13,7 +13,7 @@
 
 | 协议 | YAML 解析 | URI 解析 | TCP 拨号 | UDP 支持 | 传输层 | 状态 | 备注 |
 |------|-----------|----------|----------|----------|--------|------|------|
-| Shadowsocks | full | full | full | full | tcp/simple-obfs/v2ray-ws | partial | 旧 AEAD 与 2022-blake3 三种方法均有 TCP/UDP 双向真实拨号；下载方向使用独立 response salt，2022 UDP 含 session/replay protection；SIP023 TCP/UDP 多用户 EIH、simple-obfs HTTP/TLS 与 v2ray-plugin WS 已实拨；plugin UDP 仍明确不支持 |
+| Shadowsocks | full | full | full | full | tcp/simple-obfs/v2ray-ws/UoT | full | 覆盖 legacy stream、stream、AEAD、扩展 AEAD 与 Shadowsocks 2022 方法；TCP/UDP、SIP022、SIP023 多用户 EIH、response salt、session/replay protection、simple-obfs HTTP/TLS、v2ray-plugin WebSocket/TLS 和 UoT v1/v2 均有真实拨号；SIP003 TCP plugin 的 UDP 通过 UoT 承载 |
 | ShadowsocksR | full | full | full | partial | tcp/http_simple/http_post/tls1.2_ticket_auth | partial | origin、verify_simple、auth_simple、auth_sha1、auth_sha1_v2、auth_sha1_v4、auth_aes128_md5/sha1 与 auth_chain_a-f 均有真实拨号测试；支持 6 种 stream cipher、TCP/UDP、多用户 `uid:key`、HTTP simple/post 和 TLS ticket 混淆；auth_sha1_v4 按协议边界仅支持 TCP |
 | Trojan | full | full | full | full | tcp/ws/grpc/h2/httpupgrade | partial | TLS+TCP、UDP、WS、gRPC、H2、HTTPUpgrade 均有 `build_outbounds` 真实 mock 拨号；支持自定义 transport headers、显式 ALPN、UDP over WS/gRPC 和明确失败分类，其他边界组合仍持续验证 |
 | VMess | full | full | full | full | tcp/ws/grpc/h2 | partial | alterId=0 AEAD 的 TCP、WS、gRPC、H2、per-destination UDP 均有 `build_outbounds` 真实集成测试；legacy alterId 和更广泛兼容组合未覆盖 |
@@ -50,8 +50,9 @@
 
 ## 实现边界
 
-- Shadowsocks 的 AEAD/2022、UDP session、plugin、obfs、framing 和 relay 位于
-  `src/outbound/shadowsocks.rs`。
+- Shadowsocks 的 legacy stream、AEAD/2022、UDP session、UoT、plugin、obfs、framing 和
+  relay 位于 `src/outbound/shadowsocks.rs`，Rabbit128 兼容流位于
+  `src/outbound/rabbit_compat.rs`。
 - ShadowsocksR 的 cipher、protocol、obfs、UDP 和 relay 位于
   `src/outbound/ssr.rs`。
 - Snell v1-v5、connection reuse、UDP-over-TCP 和 obfs 位于

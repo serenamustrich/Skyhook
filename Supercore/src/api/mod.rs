@@ -795,6 +795,8 @@ proxies:
                 method: "chacha20-ietf-poly1305".to_string(),
                 password: "password".to_string(),
                 plugin: None,
+                udp_over_tcp: false,
+                udp_over_tcp_version: 1,
             },
             OutboundConfig::Group {
                 name: "child-group".to_string(),
@@ -858,6 +860,8 @@ proxies:
                 method: "chacha20-ietf-poly1305".to_string(),
                 password: "password".to_string(),
                 plugin: None,
+                udp_over_tcp: false,
+                udp_over_tcp_version: 1,
             },
         ];
 
@@ -881,6 +885,8 @@ proxies:
                 method: "chacha20-ietf-poly1305".to_string(),
                 password: "password".to_string(),
                 plugin: None,
+                udp_over_tcp: false,
+                udp_over_tcp_version: 1,
             },
         ];
 
@@ -904,6 +910,8 @@ proxies:
                 method: "chacha20-ietf-poly1305".to_string(),
                 password: "password".to_string(),
                 plugin: None,
+                udp_over_tcp: false,
+                udp_over_tcp_version: 1,
             },
         ];
 

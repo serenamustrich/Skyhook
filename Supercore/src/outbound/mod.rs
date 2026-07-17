@@ -11,6 +11,7 @@ mod io;
 mod mux;
 mod naive;
 mod pool;
+mod rabbit_compat;
 mod registry;
 mod reject;
 mod shadowsocks;

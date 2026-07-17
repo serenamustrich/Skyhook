@@ -15,15 +15,16 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
 - HTTP absolute-form proxy requests for plain HTTP.
 - Direct, HTTP proxy, and SOCKS5 proxy outbounds, with Direct UDP and pooled SOCKS5 UDP ASSOCIATE.
 - Proxy group outbounds for subscription `select`, `url-test`, `fallback`, and similar groups.
-- Shadowsocks AEAD TCP and pooled UDP outbound for `aes-128-gcm`, `aes-256-gcm`, and
-  `chacha20-ietf-poly1305`.
-- Shadowsocks 2022 TCP and UDP for `2022-blake3-aes-128-gcm`,
-  `2022-blake3-aes-256-gcm`, and `2022-blake3-chacha20-poly1305`, including SIP022 request and
-  response headers, SIP023 extensible identity headers, UDP sessions, and replay windows.
+- Shadowsocks legacy stream, stream, AEAD, and extended AEAD TCP with pooled UDP, including AES,
+  ChaCha20/ChaCha8, XChaCha, LEA, AEGIS, AEZ, Deoxys-II, Ascon, and Rabbit128 method families.
+- Shadowsocks 2022 TCP and UDP for the BLAKE3 AES-128, AES-256, ChaCha20, and ChaCha8 methods,
+  including SIP022 request and response headers, SIP023 extensible identity headers, UDP sessions,
+  and replay windows.
 - Shadowsocks `simple-obfs` HTTP/TLS modes for subscriptions that use `obfs=http` or `obfs=tls`.
   Simple-obfs UDP is still restricted by matrix limitations (see `docs/protocol-matrix.md` `Shadowsocks` row).
 - Shadowsocks `v2ray-plugin` WebSocket transport with optional TLS, real WebSocket framing, and
   independent response salts.
+- Shadowsocks UDP-over-TCP v1/v2 for native and plugin transports, with bounded reusable sessions.
 - ShadowsocksR origin TCP/UDP for AES-CFB, RC4-MD5, ChaCha20, and ChaCha20-IETF; authenticated
   `verify_simple`, `auth_simple`, `auth_sha1`, `auth_sha1_v2`, `auth_sha1_v4`,
   `auth_aes128_md5`/`auth_aes128_sha1`, and `auth_chain_a` through `auth_chain_f`.

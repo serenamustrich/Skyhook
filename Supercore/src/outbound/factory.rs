@@ -169,6 +169,8 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             method,
             password,
             plugin,
+            udp_over_tcp,
+            udp_over_tcp_version,
         } => Arc::new(ShadowsocksOutbound::new(
             name.clone(),
             server.clone(),
@@ -176,6 +178,8 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             method.clone(),
             password.clone(),
             plugin.clone(),
+            *udp_over_tcp,
+            *udp_over_tcp_version,
         )),
         OutboundConfig::Trojan {
             name,

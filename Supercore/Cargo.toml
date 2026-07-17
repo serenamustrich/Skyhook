@@ -16,8 +16,16 @@ blake2 = "0.10"
 blake3 = "1"
 boringtun = "0.7"
 bytes = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = { version = "0.10", features = ["reduced-round"] }
 chacha20 = "0.9"
+ccm = "0.5"
+lea = "0.5.4"
+aegis = { version = "0.9.15", default-features = false, features = ["std", "pure-rust"] }
+deoxys = { version = "0.2.0-rc.3", default-features = false, features = ["alloc"] }
+zears = "0.2.1"
+ascon-aead = "=0.4.2"
+poly1305 = "0.8.0"
+subtle = "2.5"
 cipher = "0.4"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -46,6 +54,7 @@ smux = "0.2"
 sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
+shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "aead-cipher-2022-extra", "stream-cipher"] }
 socket2 = { version = "0.6", features = ["all"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
