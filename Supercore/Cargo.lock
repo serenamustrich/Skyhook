@@ -3824,6 +3824,7 @@ dependencies = [
  "blake3",
  "boringtun",
  "bytes",
+ "cc",
  "cfb-mode",
  "chacha20 0.9.1",
  "chacha20poly1305",

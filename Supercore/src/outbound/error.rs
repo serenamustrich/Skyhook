@@ -167,15 +167,15 @@ pub fn contextualize_error(
         return anyhow::Error::new(contextualized);
     }
 
-    let message = error.to_string();
-    anyhow::Error::new(
-        OutboundError::new(classify_message(&message), operation, message.clone())
-            .for_protocol(protocol)
-            .for_node(node)
-            .for_destination(destination)
-            .with_trace_id(trace_id)
-            .with_source(message),
-    )
+    let source_chain = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+    let message = source_chain.join(": ");
+    let mut contextualized = OutboundError::new(classify_message(&message), operation, message)
+        .for_protocol(protocol)
+        .for_node(node)
+        .for_destination(destination)
+        .with_trace_id(trace_id);
+    contextualized.source_chain = source_chain;
+    anyhow::Error::new(contextualized)
 }
 
 pub fn classify_message(message: &str) -> OutboundErrorKind {

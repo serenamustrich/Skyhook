@@ -6,6 +6,12 @@ use supercore::{
     routing::Destination,
     subscription::parse_subscription,
 };
+#[cfg(target_os = "macos")]
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    time::{timeout, Duration},
+};
 
 #[test]
 fn clash_common_outbound_options_are_preserved() {
@@ -20,8 +26,7 @@ proxies:
     interface-name: en7
     routing-mark: "0x2a"
     tfo: true
-    mptcp: true
-    dialer-proxy: relay
+    mptcp: false
     udp: false
     certificate-fingerprint: "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff"
     keepalive: 15
@@ -37,6 +42,11 @@ proxies:
       max-streams: 16
       padding: true
       only-tcp: false
+  - name: mptcp-only
+    type: http
+    server: mptcp.example
+    port: 8080
+    mptcp: true
 "#,
     )
     .expect("subscription should parse");
@@ -49,8 +59,8 @@ proxies:
     assert_eq!(options.interface_name.as_deref(), Some("en7"));
     assert_eq!(options.routing_mark, Some(42));
     assert!(options.tfo);
-    assert!(options.mptcp);
-    assert_eq!(options.dialer_proxy.as_deref(), Some("relay"));
+    assert!(!options.mptcp);
+    assert_eq!(options.dialer_proxy, None);
     assert!(!options.udp);
     assert_eq!(options.keepalive_secs, Some(15));
     assert_eq!(options.quic_mtu, Some(1300));
@@ -66,6 +76,13 @@ proxies:
     assert_eq!(smux.max_streams, 16);
     assert!(smux.padding);
     assert!(!smux.only_tcp);
+    assert!(
+        document.nodes[1]
+            .common_options()
+            .expect("MPTCP options")
+            .expect("non-default MPTCP options")
+            .mptcp
+    );
 }
 
 #[test]
@@ -173,6 +190,39 @@ fn invalid_common_option_values_fail_runtime_construction() {
 }
 
 #[test]
+fn mptcp_rejects_options_that_defeat_multipath_selection() {
+    let configs = vec![OutboundConfig::Direct {
+        name: "direct".to_string(),
+    }];
+    for options in [
+        OutboundCommonConfig {
+            mptcp: true,
+            interface_name: Some("en0".to_string()),
+            ..OutboundCommonConfig::default()
+        },
+        OutboundCommonConfig {
+            mptcp: true,
+            dialer_proxy: Some("direct".to_string()),
+            ..OutboundCommonConfig::default()
+        },
+        OutboundCommonConfig {
+            mptcp: true,
+            tfo: true,
+            ..OutboundCommonConfig::default()
+        },
+    ] {
+        let error = build_outbounds_with_options(
+            &configs,
+            &BTreeMap::from([("direct".to_string(), options)]),
+            None,
+        )
+        .err()
+        .expect("conflicting MPTCP options should fail configuration");
+        assert!(error.to_string().contains("mptcp cannot be combined"));
+    }
+}
+
+#[test]
 fn missing_dialer_proxy_is_rejected_during_runtime_construction() {
     let configs = vec![OutboundConfig::Direct {
         name: "direct".to_string(),
@@ -265,4 +315,97 @@ fn dialer_proxy_cycles_are_detected_during_runtime_construction() {
         .expect("dialer cycle should fail configuration");
 
     assert!(error.to_string().contains("dialer-proxy cycle detected"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn unsigned_mptcp_runtime_reports_the_required_entitlement_immediately() {
+    let configs = vec![OutboundConfig::Direct {
+        name: "direct".to_string(),
+    }];
+    let options = BTreeMap::from([(
+        "direct".to_string(),
+        OutboundCommonConfig {
+            mptcp: true,
+            ..OutboundCommonConfig::default()
+        },
+    )]);
+    let outbounds = build_outbounds_with_options(&configs, &options, None).expect("outbounds");
+    let requires_entitlement = outbounds["direct"]
+        .capability()
+        .limitations
+        .iter()
+        .any(|limitation| limitation.contains("multipath entitlement"));
+    if !requires_entitlement {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let error = match outbounds["direct"]
+        .connect(&Destination::new("127.0.0.1", 9), 1_000)
+        .await
+    {
+        Ok(_) => panic!("unsigned MPTCP runtime must not dial without entitlement"),
+        Err(error) => error,
+    };
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(error
+        .to_string()
+        .contains("com.apple.developer.networking.multipath entitlement"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires a signed test executable with the macOS multipath entitlement"]
+async fn mptcp_network_framework_stream_relays_bidirectional_data() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = [0u8; 4];
+        stream.read_exact(&mut request).await.expect("server read");
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await.expect("server write");
+        stream.shutdown().await.expect("server shutdown");
+    });
+    let configs = vec![OutboundConfig::Direct {
+        name: "direct".to_string(),
+    }];
+    let options = BTreeMap::from([(
+        "direct".to_string(),
+        OutboundCommonConfig {
+            mptcp: true,
+            keepalive_secs: Some(5),
+            ..OutboundCommonConfig::default()
+        },
+    )]);
+    let outbounds = build_outbounds_with_options(&configs, &options, None).expect("outbounds");
+    assert!(!outbounds["direct"]
+        .capability()
+        .limitations
+        .iter()
+        .any(|limitation| limitation.contains("native macOS dial backend")));
+
+    let mut stream = match timeout(
+        Duration::from_secs(5),
+        outbounds["direct"].connect(
+            &Destination::new(address.ip().to_string(), address.port()),
+            4_000,
+        ),
+    )
+    .await
+    .expect("MPTCP connect deadline")
+    {
+        Ok(stream) => stream,
+        Err(error) => panic!("MPTCP stream: {error:#}"),
+    };
+    stream.write_all(b"ping").await.expect("client write");
+    let mut response = [0u8; 4];
+    timeout(Duration::from_secs(2), stream.read_exact(&mut response))
+        .await
+        .expect("MPTCP read deadline")
+        .expect("client read");
+    assert_eq!(&response, b"pong");
+    stream.shutdown().await.expect("client shutdown");
+    server.await.expect("server task");
 }

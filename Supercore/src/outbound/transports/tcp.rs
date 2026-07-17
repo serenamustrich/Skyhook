@@ -13,7 +13,10 @@ use crate::{
     routing::Destination,
 };
 
-use super::socket_options::{bind_interface, enable_tcp_fast_open};
+use super::{
+    mptcp::{self, MptcpOptions},
+    socket_options::{bind_interface, enable_tcp_fast_open},
+};
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
 
@@ -78,6 +81,29 @@ pub(crate) async fn connect_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<B
         multipath_tcp: active.as_ref().is_some_and(|context| context.multipath_tcp),
         cancellation: cancellation.clone(),
     };
+
+    if options.multipath_tcp {
+        if let Some(interface_name) = options.interface_name.as_deref() {
+            return Err(anyhow!(
+                "MPTCP cannot be combined with interface-name {interface_name}; multipath requires system path selection"
+            ));
+        }
+        let endpoint = parse_endpoint(addr)?;
+        return mptcp::connect(
+            endpoint.host,
+            endpoint.port,
+            timeout_budget,
+            cancellation,
+            MptcpOptions {
+                source: options.source,
+                ip_version: strategy,
+                keepalive: options.keepalive,
+                fast_open: options.tcp_fast_open,
+            },
+        )
+        .await
+        .with_context(|| format!("failed to connect {addr} with Network.framework MPTCP"));
+    }
 
     let resolved = tokio::select! {
         _ = cancellation.cancelled() => return Err(anyhow!("tcp resolve cancelled for {addr}")),
@@ -165,12 +191,6 @@ async fn connect_socket(
     address: SocketAddr,
     options: &TcpDialOptions,
 ) -> anyhow::Result<TcpStream> {
-    if options.multipath_tcp {
-        return Err(anyhow!(
-            "MPTCP requires the macOS Network.framework dial backend"
-        ));
-    }
-
     let socket = Socket::new(
         Domain::for_address(address),
         Type::STREAM,

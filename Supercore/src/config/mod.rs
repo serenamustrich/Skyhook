@@ -113,6 +113,15 @@ impl OutboundCommonConfig {
         {
             bail!("dialer-proxy must not be empty");
         }
+        if self.mptcp && self.interface_name.is_some() {
+            bail!("mptcp cannot be combined with interface-name because multipath requires system path selection");
+        }
+        if self.mptcp && self.dialer_proxy.is_some() {
+            bail!("mptcp cannot be combined with dialer-proxy; configure MPTCP on the terminal dialer instead");
+        }
+        if self.mptcp && self.tfo {
+            bail!("mptcp cannot be combined with tfo because Network.framework requires replay-safe early data before the stream is ready");
+        }
         if self.keepalive_secs == Some(0) {
             bail!("keepalive must be greater than zero seconds");
         }

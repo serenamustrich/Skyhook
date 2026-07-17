@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use crate::{config::OutboundCommonConfig, routing::Destination};
 
 use super::{
-    context::DialContext, transports::scope_tcp_dialer, BoxedStream, Outbound, OutboundCapability,
+    context::DialContext,
+    transports::{mptcp_runtime_available, scope_tcp_dialer},
+    BoxedStream, Outbound, OutboundCapability,
 };
 
 pub(super) type OutboundRegistry = Arc<RwLock<HashMap<String, Weak<dyn Outbound>>>>;
@@ -122,10 +124,18 @@ impl Outbound for ConfiguredOutbound {
                 .limitations
                 .push("routing-mark is unavailable on macOS".to_string());
         }
+        #[cfg(not(target_os = "macos"))]
         if self.options.mptcp {
             capability
                 .limitations
-                .push("MPTCP requires the native macOS dial backend".to_string());
+                .push("MPTCP is only available through the native macOS dial backend".to_string());
+        }
+        #[cfg(target_os = "macos")]
+        if self.options.mptcp && !mptcp_runtime_available() {
+            capability.limitations.push(
+                "MPTCP requires a signed supercore executable with the multipath entitlement"
+                    .to_string(),
+            );
         }
         capability
     }

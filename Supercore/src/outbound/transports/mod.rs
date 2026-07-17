@@ -3,6 +3,7 @@ mod headers;
 mod http2;
 mod http_connect;
 mod http_upgrade;
+mod mptcp;
 mod quic;
 mod socket_options;
 mod tcp;
@@ -13,6 +14,7 @@ pub(crate) use grpc::open_grpc_tunnel;
 pub(crate) use http2::open_h2_tunnel;
 pub(crate) use http_connect::establish_http_connect;
 pub(crate) use http_upgrade::open_http_upgrade_tunnel;
+pub(crate) use mptcp::runtime_available as mptcp_runtime_available;
 pub(crate) use quic::{
     connect_quic_endpoint, create_quic_endpoint, encode_quic_varint, quic_client_config,
     random_u16, random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
