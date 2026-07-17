@@ -11,7 +11,7 @@ mod tls;
 mod websocket;
 
 pub(crate) use grpc::open_grpc_tunnel;
-pub(crate) use http2::open_h2_tunnel;
+pub(crate) use http2::{open_h2_tunnel, Http2TunnelStream};
 pub(crate) use http_connect::establish_http_connect;
 pub(crate) use http_upgrade::open_http_upgrade_tunnel;
 pub(crate) use mptcp::runtime_available as mptcp_runtime_available;

@@ -59,6 +59,10 @@ pub trait Outbound: Send + Sync {
     fn kind(&self) -> &'static str;
     fn capability(&self) -> OutboundCapability;
 
+    fn runtime_stats(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     async fn connect(
         &self,
         destination: &Destination,

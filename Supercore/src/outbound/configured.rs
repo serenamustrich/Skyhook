@@ -11,6 +11,7 @@ use crate::{config::OutboundCommonConfig, routing::Destination};
 
 use super::{
     context::DialContext,
+    mux::MuxPool,
     transports::{mptcp_runtime_available, scope_tcp_dialer},
     BoxedStream, Outbound, OutboundCapability,
 };
@@ -25,6 +26,7 @@ pub(super) struct ConfiguredOutbound {
     inner: Arc<dyn Outbound>,
     options: OutboundCommonConfig,
     registry: OutboundRegistry,
+    mux: Option<Arc<MuxPool>>,
 }
 
 impl ConfiguredOutbound {
@@ -33,10 +35,17 @@ impl ConfiguredOutbound {
         options: OutboundCommonConfig,
         registry: OutboundRegistry,
     ) -> Self {
+        let mux = options
+            .smux
+            .as_ref()
+            .filter(|config| config.enabled)
+            .cloned()
+            .map(|config| Arc::new(MuxPool::new(Arc::clone(&inner), config)));
         Self {
             inner,
             options,
             registry,
+            mux,
         }
     }
 
@@ -44,12 +53,6 @@ impl ConfiguredOutbound {
         if self.options.routing_mark.is_some() {
             return Err(anyhow!(
                 "routing-mark is not supported by the macOS Skyhook runtime"
-            ));
-        }
-        if self.options.smux.as_ref().is_some_and(|smux| smux.enabled) {
-            return Err(anyhow!(
-                "smux is configured for {} but its selected mux backend is not active",
-                self.name()
             ));
         }
         if context.dialer_chain.iter().any(|name| name == self.name()) {
@@ -137,7 +140,26 @@ impl Outbound for ConfiguredOutbound {
                     .to_string(),
             );
         }
+        if let Some(smux) = self.options.smux.as_ref().filter(|smux| smux.enabled) {
+            if !smux.only_tcp && self.options.udp {
+                capability.udp_supported = true;
+                capability.udp_mode = Some("sing-mux fixed-destination stream".to_string());
+            }
+        }
         capability
+    }
+
+    fn runtime_stats(&self) -> Option<serde_json::Value> {
+        match (&self.mux, self.inner.runtime_stats()) {
+            (Some(mux), Some(inner)) => Some(serde_json::json!({
+                "mux": mux.snapshot(),
+                "inner": inner,
+            })),
+            (Some(mux), None) => Some(serde_json::json!({
+                "mux": mux.snapshot(),
+            })),
+            (None, inner) => inner,
+        }
     }
 
     async fn connect(
@@ -152,7 +174,11 @@ impl Outbound for ConfiguredOutbound {
     async fn connect_context(&self, context: &DialContext) -> anyhow::Result<BoxedStream> {
         let context = self.configured_context(context)?;
         let dialer = self.dialer()?;
-        scope_tcp_dialer(dialer, self.inner.connect_context(&context)).await
+        if let Some(mux) = &self.mux {
+            mux.connect(&context, dialer).await
+        } else {
+            scope_tcp_dialer(dialer, self.inner.connect_context(&context)).await
+        }
     }
 
     async fn udp_exchange(
@@ -175,6 +201,103 @@ impl Outbound for ConfiguredOutbound {
         }
         let context = self.configured_context(context)?;
         let dialer = self.dialer()?;
+        if let Some(mux) = &self.mux {
+            if !self.options.smux.as_ref().is_some_and(|smux| smux.only_tcp) {
+                return mux.udp_exchange(&context, payload, dialer).await;
+            }
+        }
         scope_tcp_dialer(dialer, self.inner.udp_exchange_context(&context, payload)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use async_trait::async_trait;
+
+    use crate::{
+        config::{OutboundCommonConfig, SmuxConfig, SmuxProtocol},
+        outbound::{BoxedStream, Outbound, OutboundCapability},
+        routing::Destination,
+    };
+
+    use super::{outbound_registry, ConfiguredOutbound};
+
+    struct NativeUdpOutbound {
+        tcp_calls: Arc<AtomicUsize>,
+        udp_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Outbound for NativeUdpOutbound {
+        fn name(&self) -> &str {
+            "native-udp"
+        }
+
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+
+        fn capability(&self) -> OutboundCapability {
+            OutboundCapability::tcp_udp("native test UDP")
+        }
+
+        async fn connect(
+            &self,
+            _destination: &Destination,
+            _timeout_ms: u64,
+        ) -> anyhow::Result<BoxedStream> {
+            self.tcp_calls.fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::anyhow!("TCP must not be used by only-tcp UDP"))
+        }
+
+        async fn udp_exchange(
+            &self,
+            _destination: &Destination,
+            payload: &[u8],
+            _timeout_ms: u64,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.udp_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(payload.to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn smux_only_tcp_bypasses_mux_for_udp() {
+        let tcp_calls = Arc::new(AtomicUsize::new(0));
+        let udp_calls = Arc::new(AtomicUsize::new(0));
+        let inner: Arc<dyn Outbound> = Arc::new(NativeUdpOutbound {
+            tcp_calls: Arc::clone(&tcp_calls),
+            udp_calls: Arc::clone(&udp_calls),
+        });
+        let configured = ConfiguredOutbound::new(
+            inner,
+            OutboundCommonConfig {
+                smux: Some(SmuxConfig {
+                    enabled: true,
+                    protocol: SmuxProtocol::H2Mux,
+                    only_tcp: true,
+                    statistic: true,
+                    ..SmuxConfig::default()
+                }),
+                ..OutboundCommonConfig::default()
+            },
+            outbound_registry(),
+        );
+
+        let response = configured
+            .udp_exchange(&Destination::new("dns.example", 53), b"native", 500)
+            .await
+            .unwrap();
+        assert_eq!(response, b"native");
+        assert_eq!(udp_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(tcp_calls.load(Ordering::Relaxed), 0);
+        let stats = configured.runtime_stats().unwrap();
+        assert_eq!(stats["mux"]["underlay_visible"], true);
+        assert_eq!(stats["mux"]["physical_active"], 0);
     }
 }

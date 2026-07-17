@@ -137,11 +137,28 @@ impl OutboundCommonConfig {
             }
         }
         if let Some(smux) = &self.smux {
-            if smux.enabled && smux.max_connections == 0 {
-                bail!("smux max-connections must be greater than zero");
+            if smux.enabled
+                && smux.max_streams > 0
+                && (smux.max_connections > 0 || smux.min_streams > 0)
+            {
+                bail!("smux max-streams conflicts with max-connections and min-streams");
             }
-            if smux.enabled && smux.max_streams == 0 {
-                bail!("smux max-streams must be greater than zero");
+            if smux.enabled && smux.max_connections > 0 && smux.min_streams == 0 {
+                bail!("smux min-streams must be greater than zero with max-connections");
+            }
+            if smux.enabled && smux.max_streams > 4096 {
+                bail!("smux max-streams must not exceed 4096 per physical connection");
+            }
+            if smux.enabled && smux.brutal.as_ref().is_some_and(|brutal| brutal.enabled) {
+                #[cfg(not(target_os = "linux"))]
+                bail!("smux TCP Brutal is only supported on Linux");
+                #[cfg(target_os = "linux")]
+                {
+                    let brutal = smux.brutal.as_ref().expect("checked above");
+                    if brutal.up_mbps == 0 || brutal.down_mbps == 0 {
+                        bail!("smux brutal up/down bandwidth must be greater than zero");
+                    }
+                }
             }
         }
         Ok(())
@@ -173,20 +190,46 @@ pub struct SmuxConfig {
     pub enabled: bool,
     pub protocol: SmuxProtocol,
     pub max_connections: usize,
+    pub min_streams: usize,
     pub max_streams: usize,
+    pub statistic: bool,
     pub padding: bool,
     pub only_tcp: bool,
+    pub brutal: Option<SmuxBrutalConfig>,
 }
 
 impl Default for SmuxConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            protocol: SmuxProtocol::Smux,
+            protocol: SmuxProtocol::H2Mux,
             max_connections: 4,
-            max_streams: 8,
+            min_streams: 4,
+            max_streams: 0,
+            statistic: false,
             padding: false,
-            only_tcp: true,
+            only_tcp: false,
+            brutal: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct SmuxBrutalConfig {
+    pub enabled: bool,
+    #[serde(alias = "up")]
+    pub up_mbps: u64,
+    #[serde(alias = "down")]
+    pub down_mbps: u64,
+}
+
+impl Default for SmuxBrutalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            up_mbps: 100,
+            down_mbps: 100,
         }
     }
 }
@@ -194,9 +237,9 @@ impl Default for SmuxConfig {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SmuxProtocol {
-    #[default]
     Smux,
     Yamux,
+    #[default]
     H2Mux,
 }
 

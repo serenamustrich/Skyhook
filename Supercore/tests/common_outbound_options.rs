@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use supercore::{
-    config::{OutboundCommonConfig, OutboundConfig, SmuxProtocol},
+    config::{OutboundCommonConfig, OutboundConfig, SmuxConfig, SmuxProtocol},
     outbound::{build_outbounds_with_options, context::IpVersionStrategy},
     routing::Destination,
     subscription::parse_subscription,
@@ -39,7 +39,9 @@ proxies:
       enabled: true
       protocol: h2mux
       max-connections: 3
-      max-streams: 16
+      min-streams: 6
+      max-streams: 0
+      statistic: true
       padding: true
       only-tcp: false
   - name: mptcp-only
@@ -73,7 +75,9 @@ proxies:
     let smux = options.smux.expect("smux options");
     assert_eq!(smux.protocol, SmuxProtocol::H2Mux);
     assert_eq!(smux.max_connections, 3);
-    assert_eq!(smux.max_streams, 16);
+    assert_eq!(smux.min_streams, 6);
+    assert_eq!(smux.max_streams, 0);
+    assert!(smux.statistic);
     assert!(smux.padding);
     assert!(!smux.only_tcp);
     assert!(
@@ -83,6 +87,68 @@ proxies:
             .expect("non-default MPTCP options")
             .mptcp
     );
+}
+
+#[test]
+fn smux_defaults_use_h2mux_and_a_bounded_connection_pool() {
+    let document = parse_subscription(
+        r#"
+proxies:
+  - name: default-smux
+    type: http
+    server: proxy.example
+    port: 8080
+    smux:
+      enabled: true
+"#,
+    )
+    .unwrap();
+    let smux = document.nodes[0]
+        .common_options()
+        .unwrap()
+        .unwrap()
+        .smux
+        .unwrap();
+    assert_eq!(smux.protocol, SmuxProtocol::H2Mux);
+    assert_eq!(smux.max_connections, 4);
+    assert_eq!(smux.min_streams, 4);
+    assert_eq!(smux.max_streams, 0);
+    assert!(!smux.only_tcp);
+}
+
+#[test]
+fn smux_rejects_conflicting_connection_and_stream_limits() {
+    let options = OutboundCommonConfig {
+        smux: Some(SmuxConfig {
+            enabled: true,
+            max_connections: 2,
+            min_streams: 2,
+            max_streams: 8,
+            ..SmuxConfig::default()
+        }),
+        ..OutboundCommonConfig::default()
+    };
+    let error = options.validate().unwrap_err();
+    assert!(error.to_string().contains("max-streams conflicts"));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn smux_reports_tcp_brutal_as_linux_only() {
+    let options = OutboundCommonConfig {
+        smux: Some(SmuxConfig {
+            enabled: true,
+            brutal: Some(supercore::config::SmuxBrutalConfig {
+                enabled: true,
+                up_mbps: 100,
+                down_mbps: 100,
+            }),
+            ..SmuxConfig::default()
+        }),
+        ..OutboundCommonConfig::default()
+    };
+    let error = options.validate().unwrap_err();
+    assert!(error.to_string().contains("only supported on Linux"));
 }
 
 #[test]

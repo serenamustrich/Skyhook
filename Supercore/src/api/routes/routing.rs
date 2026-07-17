@@ -15,6 +15,7 @@ pub(super) async fn outbounds(State(runtime): State<Arc<Runtime>>) -> Json<serde
         "outbounds": runtime.telemetry().outbound_health().await,
         "groups": runtime.proxy_groups().await,
         "capabilities": runtime.outbound_capabilities(),
+        "runtime": runtime.outbound_runtime_stats(),
     }))
 }
 

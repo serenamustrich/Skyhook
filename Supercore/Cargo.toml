@@ -24,6 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 crc32c = "0.6"
 digest = "0.10"
 getrandom = "0.3"
+futures = "0.3"
 h2 = "0.4"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
@@ -41,6 +42,7 @@ rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+smux = "0.2"
 sha1 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
@@ -48,7 +50,7 @@ socket2 = { version = "0.6", features = ["all"] }
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 tokio-rustls = "0.26"
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
@@ -59,6 +61,7 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 webpki-roots = "1"
 x25519-dalek = { version = "3.0.0-rc.0", features = ["getrandom", "static_secrets"] }
+yamux = "0.14"
 russh = "0.61.2"
 cfb-mode = "0.8.2"
 argon2 = "0.5.3"

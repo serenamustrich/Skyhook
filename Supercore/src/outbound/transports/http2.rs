@@ -80,6 +80,19 @@ impl Drop for Http2TunnelStream {
 }
 
 impl Http2TunnelStream {
+    pub(crate) fn from_parts(
+        send: h2::SendStream<Bytes>,
+        response: h2::client::ResponseFuture,
+    ) -> Self {
+        Self {
+            send,
+            response: Some(response),
+            recv: None,
+            read_buffer: BytesMut::new(),
+            closed: false,
+        }
+    }
+
     fn poll_response(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Error>> {
         if self.recv.is_some() {
             return Poll::Ready(Ok(()));

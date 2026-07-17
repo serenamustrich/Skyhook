@@ -8,6 +8,7 @@ mod group;
 mod http_proxy;
 mod hysteria2;
 mod io;
+mod mux;
 mod naive;
 mod pool;
 mod registry;

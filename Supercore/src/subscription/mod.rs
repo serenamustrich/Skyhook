@@ -8,7 +8,8 @@ use url::Url;
 
 use crate::{
     config::{
-        OutboundCommonConfig, OutboundConfig, ShadowsocksPluginConfig, SmuxConfig, SmuxProtocol,
+        OutboundCommonConfig, OutboundConfig, ShadowsocksPluginConfig, SmuxBrutalConfig,
+        SmuxConfig, SmuxProtocol,
     },
     outbound::context::IpVersionStrategy,
 };
@@ -177,11 +178,26 @@ impl SubscriptionNode {
                 .transpose()?
                 .unwrap_or(0);
         if bool_param(&self.params, "smux-enabled") {
+            let brutal = if self.params.contains_key("smux-brutal-enabled") {
+                Some(SmuxBrutalConfig {
+                    enabled: bool_param(&self.params, "smux-brutal-enabled"),
+                    up_mbps: first_param(&self.params, &["smux-brutal-up"])
+                        .map(|value| parse_bandwidth_mbps(&value, "smux brutal up"))
+                        .transpose()?
+                        .unwrap_or(100),
+                    down_mbps: first_param(&self.params, &["smux-brutal-down"])
+                        .map(|value| parse_bandwidth_mbps(&value, "smux brutal down"))
+                        .transpose()?
+                        .unwrap_or(100),
+                })
+            } else {
+                None
+            };
             options.smux = Some(SmuxConfig {
                 enabled: true,
                 protocol: match first_param(&self.params, &["smux-protocol"])
                     .as_deref()
-                    .unwrap_or("smux")
+                    .unwrap_or("h2mux")
                     .to_ascii_lowercase()
                     .as_str()
                 {
@@ -194,13 +210,18 @@ impl SubscriptionNode {
                     .map(|value| parse_u64_text(&value, "smux-max-connections"))
                     .transpose()?
                     .unwrap_or(4) as usize,
+                min_streams: first_param(&self.params, &["smux-min-streams"])
+                    .map(|value| parse_u64_text(&value, "smux-min-streams"))
+                    .transpose()?
+                    .unwrap_or(4) as usize,
                 max_streams: first_param(&self.params, &["smux-max-streams"])
                     .map(|value| parse_u64_text(&value, "smux-max-streams"))
                     .transpose()?
-                    .unwrap_or(8) as usize,
+                    .unwrap_or(0) as usize,
+                statistic: bool_param(&self.params, "smux-statistic"),
                 padding: bool_param(&self.params, "smux-padding"),
-                only_tcp: !self.params.contains_key("smux-only-tcp")
-                    || bool_param(&self.params, "smux-only-tcp"),
+                only_tcp: bool_param(&self.params, "smux-only-tcp"),
+                brutal,
             });
         }
 
@@ -1303,6 +1324,16 @@ fn parse_u64_text(value: &str, label: &str) -> anyhow::Result<u64> {
         .map_err(|error| anyhow!("invalid {label} value {value}: {error}"))
 }
 
+fn parse_bandwidth_mbps(value: &str, label: &str) -> anyhow::Result<u64> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let number = normalized
+        .strip_suffix("mbps")
+        .or_else(|| normalized.strip_suffix('m'))
+        .unwrap_or(&normalized)
+        .trim();
+    parse_u64_text(number, label)
+}
+
 fn parse_u32_text(value: &str, label: &str) -> anyhow::Result<u32> {
     let value = value.trim();
     let result = value
@@ -1483,7 +1514,9 @@ fn parse_clash_smux_opts(value: &Value, params: &mut BTreeMap<String, String>) {
         "enabled",
         "protocol",
         "max-connections",
+        "min-streams",
         "max-streams",
+        "statistic",
         "padding",
         "only-tcp",
     ] {
@@ -1492,6 +1525,19 @@ fn parse_clash_smux_opts(value: &Value, params: &mut BTreeMap<String, String>) {
             .and_then(yaml_scalar_to_string)
         {
             params.insert(format!("smux-{key}"), value);
+        }
+    }
+    if let Some(brutal) = mapping
+        .get(Value::String("brutal-opts".to_string()))
+        .and_then(Value::as_mapping)
+    {
+        for key in ["enabled", "up", "down"] {
+            if let Some(value) = brutal
+                .get(Value::String(key.to_string()))
+                .and_then(yaml_scalar_to_string)
+            {
+                params.insert(format!("smux-brutal-{key}"), value);
+            }
         }
     }
 }

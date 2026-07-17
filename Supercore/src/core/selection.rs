@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::anyhow;
 use serde::Serialize;
@@ -206,6 +206,20 @@ impl Runtime {
                     udp_mode: capability.udp_mode,
                     limitations: capability.limitations,
                 }
+            })
+            .collect()
+    }
+
+    pub fn outbound_runtime_stats(&self) -> BTreeMap<String, serde_json::Value> {
+        let state = match self.state.read() {
+            Ok(state) => state,
+            Err(_) => return BTreeMap::new(),
+        };
+        state
+            .outbounds
+            .iter()
+            .filter_map(|(name, outbound)| {
+                outbound.runtime_stats().map(|stats| (name.clone(), stats))
             })
             .collect()
     }
