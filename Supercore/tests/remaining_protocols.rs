@@ -984,6 +984,42 @@ fn juicity_routes_through_factory_to_native_tcp_udp_outbound() {
     assert!(snapshot.limitations.is_empty());
 }
 
+#[test]
+fn masque_routes_through_factory_to_native_connect_ip_outbound() {
+    let config = config_with_default(
+        "masque",
+        OutboundConfig::Masque {
+            name: "masque".to_string(),
+            server: "masque.example.com".to_string(),
+            port: 443,
+            private_key: "MHcCAQEEIA1SUanhFrOFhmn22I0kWyaCACpbGxAAnAUiRAGfFC/VoAoGCCqGSM49AwEHoUQDQgAEI8HULAWSoCJNxmkV+MJMzOspO3c9UsL96KOuPZ+3VY47qxa/B7JG4xyFe/t1mW9xGc+UlSXInqYq9d9Tv6V2Ew==".to_string(),
+            public_key: "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEI8HULAWSoCJNxmkV+MJMzOspO3c9UsL96KOuPZ+3VY47qxa/B7JG4xyFe/t1mW9xGc+UlSXInqYq9d9Tv6V2Ew==".to_string(),
+            ip: Some("10.77.0.2/32".to_string()),
+            ipv6: None,
+            uri: None,
+            sni: None,
+            mtu: Some(1_280),
+            udp: true,
+            handshake_timeout_ms: Some(5_000),
+            skip_cert_verify: false,
+            network: Some("quic".to_string()),
+            congestion_control: Some("bbr".to_string()),
+            cwnd: Some(32),
+            bbr_profile: Some("standard".to_string()),
+            remote_dns_resolve: false,
+            dns: Vec::new(),
+        },
+    );
+    let runtime = Runtime::new(config).expect("runtime");
+    let snapshot = find_snapshot(&runtime, "masque");
+
+    assert_eq!(snapshot.kind, "masque");
+    assert!(snapshot.tcp_supported);
+    assert!(snapshot.udp_supported);
+    assert_eq!(snapshot.udp_mode.as_deref(), Some("masque-connect-ip"));
+    assert!(snapshot.limitations.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // 8. Cross-protocol sanity: outbound cap report contains every protocol
 // ---------------------------------------------------------------------------

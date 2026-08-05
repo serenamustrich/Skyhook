@@ -164,6 +164,35 @@ fn quic_client_config_advanced(
     }
     config.enable_early_data =
         enable_early_data || active.as_ref().is_some_and(|context| context.quic_zero_rtt);
+    quic_client_config_from_rustls_advanced(config, congestion_control, controller, tuning, active)
+}
+
+pub(crate) fn quic_client_config_from_rustls(
+    config: ClientConfig,
+    congestion_control: Option<&str>,
+    tuning: QuicTransportTuning,
+    initial_window: Option<u64>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    let controller = match initial_window {
+        Some(window) => congestion_controller(congestion_control, Some(window))?,
+        None => None,
+    };
+    quic_client_config_from_rustls_advanced(
+        config,
+        congestion_control,
+        controller,
+        Some(tuning),
+        active_dial_context(),
+    )
+}
+
+fn quic_client_config_from_rustls_advanced(
+    config: ClientConfig,
+    congestion_control: Option<&str>,
+    controller: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
+    tuning: Option<QuicTransportTuning>,
+    active: Option<crate::outbound::context::DialContext>,
+) -> anyhow::Result<quinn::ClientConfig> {
     let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(config)
         .context("failed to build quic rustls client config")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
@@ -172,24 +201,8 @@ fn quic_client_config_advanced(
     if let Some(controller) = controller {
         transport_config.congestion_controller_factory(controller);
     } else {
-        match congestion_control
-            .unwrap_or("cubic")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "" | "default" | "cubic" => {}
-            "bbr" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::BbrConfig::default(),
-                ));
-            }
-            "new-reno" | "new_reno" | "newreno" => {
-                transport_config.congestion_controller_factory(Arc::new(
-                    quinn::congestion::NewRenoConfig::default(),
-                ));
-            }
-            value => return Err(anyhow!("unsupported QUIC congestion controller {value}")),
+        if let Some(controller) = congestion_controller(congestion_control, None)? {
+            transport_config.congestion_controller_factory(controller);
         }
     }
     if let Some(tuning) = tuning {
@@ -232,6 +245,39 @@ fn quic_client_config_advanced(
     }
     client_config.transport_config(Arc::new(transport_config));
     Ok(client_config)
+}
+
+fn congestion_controller(
+    congestion_control: Option<&str>,
+    initial_window: Option<u64>,
+) -> anyhow::Result<Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>> {
+    let name = congestion_control
+        .unwrap_or("cubic")
+        .trim()
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "" | "default" | "cubic" if initial_window.is_none() => Ok(None),
+        "" | "default" | "cubic" => {
+            let mut config = quinn::congestion::CubicConfig::default();
+            config.initial_window(initial_window.expect("guarded initial window"));
+            Ok(Some(Arc::new(config)))
+        }
+        "bbr" | "bbr_meta_v1" | "bbr-meta-v1" | "bbr_meta_v2" | "bbr-meta-v2" => {
+            let mut config = quinn::congestion::BbrConfig::default();
+            if let Some(window) = initial_window {
+                config.initial_window(window);
+            }
+            Ok(Some(Arc::new(config)))
+        }
+        "new-reno" | "new_reno" | "newreno" => {
+            let mut config = quinn::congestion::NewRenoConfig::default();
+            if let Some(window) = initial_window {
+                config.initial_window(window);
+            }
+            Ok(Some(Arc::new(config)))
+        }
+        value => Err(anyhow!("unsupported QUIC congestion controller {value}")),
+    }
 }
 
 pub(crate) struct ResumableQuicConnection {

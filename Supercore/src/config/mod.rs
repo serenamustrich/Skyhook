@@ -806,14 +806,42 @@ pub enum OutboundConfig {
         name: String,
         server: String,
         port: u16,
+        #[serde(alias = "private-key")]
+        private_key: String,
+        #[serde(alias = "public-key")]
+        public_key: String,
         #[serde(default)]
-        username: Option<String>,
+        ip: Option<String>,
         #[serde(default)]
-        password: Option<String>,
+        ipv6: Option<String>,
+        #[serde(default)]
+        uri: Option<String>,
         #[serde(default)]
         sni: Option<String>,
         #[serde(default)]
+        mtu: Option<u16>,
+        #[serde(default)]
+        udp: bool,
+        #[serde(
+            default,
+            alias = "handshake-timeout-ms",
+            alias = "handshake_timeout_ms"
+        )]
+        handshake_timeout_ms: Option<u64>,
+        #[serde(default)]
         skip_cert_verify: bool,
+        #[serde(default)]
+        network: Option<String>,
+        #[serde(default, alias = "congestion-controller", alias = "congestion_control")]
+        congestion_control: Option<String>,
+        #[serde(default)]
+        cwnd: Option<u64>,
+        #[serde(default, alias = "bbr-profile")]
+        bbr_profile: Option<String>,
+        #[serde(default, alias = "remote-dns-resolve")]
+        remote_dns_resolve: bool,
+        #[serde(default)]
+        dns: Vec<String>,
     },
     OpenVpn {
         name: String,

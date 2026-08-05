@@ -29,6 +29,9 @@
 - Juicity v0 支持 UUID/password TLS exporter 鉴权、原生 QUIC TCP、可靠 UDP stream relay、
   BBR/Cubic/NewReno、keepalive、连接与 UDP 会话复用、断线重建和证书链 SHA-256 pin；
   TCP/UDP 与错误鉴权已通过官方 v0.5.0 服务端互操作。
+- MASQUE 支持 HTTP/3 和 HTTP/2 CONNECT-IP、HTTP/3 L4 CONNECT 与标准 CONNECT-UDP，
+  提供 ECDSA mTLS、服务端 SPKI pin、用户态 IPv4/IPv6 TCP/UDP、远端 DNS、datagram/capsule、
+  URI template、会话复用、BBR/Cubic/NewReno 和显式握手超时。
 - WireGuard 使用原生用户态网络栈，支持 IPv4/IPv6、TCP/UDP、隧道内 DNS、MTU、reserved、
   pre-shared key、persistent keepalive、多 Peer 和 allowed IP 最长前缀路由。
 - AnyTLS v2 支持 TLS 认证、动态 padding、会话复用与空闲回收、SYNACK/心跳、TCP 和

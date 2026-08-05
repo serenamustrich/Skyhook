@@ -31,7 +31,7 @@
 | SSH | full | full | full | not-applicable | direct-tcpip | full | OpenSSH 公钥/SHA-256 指纹固定、主机密钥算法策略、密码/内联或文件私钥认证、keepalive、并发通道共享会话和服务端断线重连均已实现；SSH 无标准 UDP relay |
 | Mieru | full | full | full | full | tcp/udp | full | 原生 Mieru v3：PBKDF2-HMAC-SHA256、XChaCha20-Poly1305、用户名/密码认证、官方 `mierus://` 与完整 protobuf `mieru://` 分享格式、固定端口和 `port-range`、TCP/UDP underlay、标准/no-wait 握手、off/low/middle/high multiplexing、随机 padding、MTU 分片、累计 ACK、重排、RTT/RTO、快速重传、CUBIC、心跳和 SOCKS5 UDP ASSOCIATE；已与官方 `mita` 服务端完成 TCP/UDP、多路复用、UDP ASSOCIATE 及丢包乱序互通 |
 | Juicity | full | full | full | full | quic/tls/h3-alpn | full | 原生 Juicity v0：UUID/password TLS exporter 鉴权、QUIC 双向流 TCP、可靠 UDP-over-stream、endpoint-independent 会话池、BBR/Cubic/NewReno、keepalive、TLS session cache、断线重建及官方证书链 SHA-256 pin；本地真实 QUIC 覆盖 TCP/UDP、错误鉴权、证书 pin 和 session 恢复，并与官方 v0.5.0 服务端完成双 TCP 流复用、UDP relay 与错误密码互操作 |
-| MASQUE | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
+| MASQUE | full | full | full | full | h2/h3/connect-ip/connect-udp | full | 原生 Cloudflare Access H3/H2 CONNECT-IP、H3 L4 CONNECT 与 RFC 9298 CONNECT-UDP；支持 ECDSA mTLS、服务端 SPKI pin、IPv4/IPv6 用户态 TCP/UDP、远端 DNS、TTL/hop 修正、route advertisement、H2 capsule、标准和旧版 H3 datagram setting、flow/context ID、URI template、会话池、BBR/Cubic/NewReno、CWND profile、keepalive 和握手超时；本地真实 H2/H3 服务端覆盖 TCP/UDP 和错误公钥拒绝 |
 | OpenVPN | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
 
 ## 传输层支持
@@ -42,9 +42,9 @@
 | WebSocket | full | path/headers/early-data |
 | gRPC | full | serviceName/multi-mode |
 | HTTP/2 | full | host/path |
-| HTTP/3 CONNECT | full | Naive 显式 H3 传输支持 Basic Auth、padding 和多流复用 |
+| HTTP/3 CONNECT | full | Naive 支持 Basic Auth、padding 和多流复用；MASQUE 支持 L4 CONNECT、CONNECT-IP 与 CONNECT-UDP |
 | HTTPUpgrade | full | Trojan、VMess 与 VLESS 均有真实拨号、自定义 headers 和非 101 状态校验 |
-| QUIC | full | Hysteria v1 具有官方服务端 TCP/UDP 互通及 xplus/wechat-video 包装验证；Hysteria2/TUIC 具有普通、Salamander、Gecko、native datagram、单向流 UDP 和 TLS 恢复的本地真实服务端 E2E；Juicity 具有官方服务端 TCP/可靠 UDP stream relay 互操作、证书链 pin 和断线重建验证 |
+| QUIC | full | Hysteria v1 具有官方服务端 TCP/UDP 互通及 xplus/wechat-video 包装验证；Hysteria2/TUIC 具有普通、Salamander、Gecko、native datagram、单向流 UDP 和 TLS 恢复的本地真实服务端 E2E；Juicity 具有官方服务端 TCP/可靠 UDP stream relay 互操作、证书链 pin 和断线重建验证；MASQUE 覆盖标准/旧版 H3 datagram setting、CONNECT-IP/CONNECT-UDP flow 与 CWND profile |
 | XTLS Vision | full | VLESS 双向 padding、TLS 1.3 ServerHello 判定、方向独立切换和 direct copy 均有真实 mock 拨号 |
 | Reality | full | X25519/HKDF/AES-GCM ClientHello、short ID、时间窗口、临时证书认证、失败拒绝和 fingerprint profile 均有真实 mock 拨号 |
 | 公共 UDP runtime | full | 有界 association/session、两种 NAT keying、队列背压、空闲淘汰、重放/重组保护与每出站统计；具体协议是否支持 UDP 仍以协议行能力为准 |
@@ -72,6 +72,9 @@
   MTU 分片、拥塞控制和 SOCKS5 relay 位于 `src/outbound/mieru.rs`。
 - Juicity v0 的 TLS exporter 鉴权、TCP/UDP stream framing、证书链 pin、连接与 UDP session
   复用及断线重建位于 `src/outbound/juicity.rs`。
+- MASQUE 的 H2/H3 CONNECT-IP、H3 L4 CONNECT、CONNECT-UDP、mTLS/SPKI pin、capsule、
+  datagram、用户态 IP 栈和会话池位于 `src/outbound/masque.rs` 与
+  `src/outbound/ip_stack.rs`；H3 扩展协议和旧版 datagram setting 位于 vendored `h3`。
 - Hysteria2 的 H3 auth、TCP/UDP framing、Salamander/Gecko obfs 和 reassembly 位于
   `src/outbound/hysteria2.rs`。
 - TUIC v5 auth、TCP stream、native/QUIC UDP relay 和 reassembly 位于
@@ -97,7 +100,7 @@
 
 ## 未完成协议边界
 
-1. **MASQUE / OpenVPN**: 当前仍为 `parse-only`
+1. **OpenVPN**: 当前仍为 `parse-only`
 2. **DNS outbound / Rematch / Sudoku / Tailscale / TrustTunnel**: 尚未进入正式出站模型
 3. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
 
@@ -116,6 +119,8 @@
   `mita` 服务端完成 TCP/UDP、多会话、UDP ASSOCIATE 和丢包乱序互通验证
 - Juicity: `src/outbound/juicity.rs` 覆盖真实 QUIC 鉴权、TCP/UDP、错误密码、证书链 pin
   与 session 恢复；另与官方 v0.5.0 服务端完成连续 TCP、UDP stream relay 和错误鉴权互通
+- MASQUE: `src/outbound/masque.rs` 覆盖 H2/H3 CONNECT-IP 的用户态 TCP/UDP、H3 L4 TCP、
+  RFC 9298 CONNECT-UDP、mTLS、SPKI pin 拒绝、URI template、capsule 和 flow/context datagram
 - Hysteria2 / TUIC: `src/outbound/tests.rs`、`tests/vless_hy2_tuic.rs`
 - WireGuard: `src/outbound/wireguard.rs` 的本地双端 E2E，覆盖 IPv4/IPv6、TCP/UDP、
   DNS、96KB 数据、多 Peer、最长前缀、保活、reserved 和重放拒绝

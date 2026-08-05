@@ -726,13 +726,56 @@ impl SubscriptionNode {
                 name: self.name.clone(),
                 server: self.server.clone(),
                 port: self.port,
-                username: first_param(&self.params, &["username"]),
-                password: first_param(&self.params, &["password"]),
+                private_key: required_param(
+                    &self.params,
+                    &["private-key", "private_key"],
+                    "masque private key",
+                )?,
+                public_key: required_param(
+                    &self.params,
+                    &["public-key", "public_key"],
+                    "masque public key",
+                )?,
+                ip: first_param(&self.params, &["ip"]),
+                ipv6: first_param(&self.params, &["ipv6"]),
+                uri: first_param(&self.params, &["uri"]),
                 sni: first_param(&self.params, &["sni", "servername"]),
+                mtu: first_param(&self.params, &["mtu"])
+                    .map(|value| parse_u16_text(&value, "masque mtu"))
+                    .transpose()?,
+                udp: bool_param_any(&self.params, &["udp"]),
+                handshake_timeout_ms: if let Some(value) = first_param(
+                    &self.params,
+                    &["handshake-timeout-ms", "handshake_timeout_ms"],
+                ) {
+                    Some(parse_u64_text(&value, "masque handshake timeout milliseconds")?)
+                } else {
+                    first_param(&self.params, &["handshake-timeout", "handshake_timeout"])
+                        .map(|value| {
+                            parse_u64_text(&value, "masque handshake timeout seconds")?
+                                .checked_mul(1_000)
+                                .ok_or_else(|| anyhow!("masque handshake timeout is too large"))
+                        })
+                        .transpose()?
+                },
                 skip_cert_verify: bool_param_any(
                     &self.params,
                     &["skip-cert-verify", "allowInsecure", "insecure"],
                 ),
+                network: first_param(&self.params, &["network"]),
+                congestion_control: first_param(
+                    &self.params,
+                    &["congestion-controller", "congestion_control"],
+                ),
+                cwnd: first_param(&self.params, &["cwnd"])
+                    .map(|value| parse_u64_text(&value, "masque cwnd"))
+                    .transpose()?,
+                bbr_profile: first_param(&self.params, &["bbr-profile", "bbr_profile"]),
+                remote_dns_resolve: bool_param_any(
+                    &self.params,
+                    &["remote-dns-resolve", "remote_dns_resolve"],
+                ),
+                dns: string_list_param(&self.params, &["dns"]),
             }),
             NodeProtocol::OpenVpn => Ok(OutboundConfig::OpenVpn {
                 name: self.name.clone(),
@@ -3981,6 +4024,67 @@ proxies:
                     pinned_certchain_sha256.as_deref(),
                     Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
                 );
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_masque_cloudflare_access_fields_and_timeout_units() {
+        let text = r#"
+proxies:
+  - name: MASQUE-Access
+    type: masque
+    server: masque.example.com
+    port: 443
+    private-key: client-sec1-der
+    public-key: server-spki-der
+    ip: 10.77.0.2/32
+    ipv6: fd42:77::2/128
+    uri: https://cloudflareaccess.com
+    sni: consumer-masque.cloudflareclient.com
+    mtu: 1280
+    udp: true
+    handshake-timeout: 7
+    network: quic
+    congestion-controller: bbr
+    cwnd: 32
+    bbr-profile: aggressive
+    remote-dns-resolve: true
+    dns: [10.77.0.1, "[fd42:77::1]:53"]
+"#;
+        let document = parse_subscription(text).unwrap();
+        assert!(document.unsupported.is_empty());
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Masque {
+                private_key,
+                public_key,
+                ip,
+                ipv6,
+                mtu,
+                udp,
+                handshake_timeout_ms,
+                network,
+                congestion_control,
+                cwnd,
+                bbr_profile,
+                remote_dns_resolve,
+                dns,
+                ..
+            } => {
+                assert_eq!(private_key, "client-sec1-der");
+                assert_eq!(public_key, "server-spki-der");
+                assert_eq!(ip.as_deref(), Some("10.77.0.2/32"));
+                assert_eq!(ipv6.as_deref(), Some("fd42:77::2/128"));
+                assert_eq!(mtu, Some(1280));
+                assert!(udp);
+                assert_eq!(handshake_timeout_ms, Some(7_000));
+                assert_eq!(network.as_deref(), Some("quic"));
+                assert_eq!(congestion_control.as_deref(), Some("bbr"));
+                assert_eq!(cwnd, Some(32));
+                assert_eq!(bbr_profile.as_deref(), Some("aggressive"));
+                assert!(remote_dns_resolve);
+                assert_eq!(dns, vec!["10.77.0.1", "[fd42:77::1]:53"]);
             }
             other => panic!("unexpected outbound {other:?}"),
         }

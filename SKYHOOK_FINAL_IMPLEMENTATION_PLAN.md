@@ -8,11 +8,11 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.29（完成 M3 Juicity，进入 MASQUE）
+> 计划版本：v1.30（完成 M3 MASQUE，进入 OpenVPN）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 已验证，M3 Hysteria v1、Mieru 和 Juicity 已完成，当前直接执行点为 M3 MASQUE。
-> 按固定范围估算，当前整体实现进度约 65%。
+> M2 已验证，M3 Hysteria v1、Mieru、Juicity 和 MASQUE 已完成，当前直接执行点为 M3 OpenVPN。
+> 按固定范围估算，当前整体实现进度约 67%。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -226,7 +226,7 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 - Outbound 生产模块中的 `use super::*` 已清零；factory、SSH、WireGuard、Snell 和 SSR
   已改为显式依赖，公共十六进制工具和 UDP session pool 容量常量已归入所属模块。
 - API、核心协调和 UI 状态职责仍过度集中。
-- 当前代码中 MASQUE、OpenVPN 仍是 parse-only/unsupported。
+- 当前代码中 OpenVPN 仍是 parse-only/unsupported；MASQUE 已完成原生真实拨号。
 - Mihomo 当前官方协议列表中的 Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch 尚未进入 Skyhook 正式模型。
 - TUN 当前依赖 `tun2proxy 0.8.1`，不具备最终要求的完整事务恢复能力。
 
@@ -387,8 +387,14 @@ M1 Outbound 第一批已实现、验证并提交：
   错误鉴权互操作。`cargo check --all-targets`、234 项 lib、29 项 remaining protocols、
   21 项 config/runtime、14 项 common outbound options（1 项签名 MPTCP 留到 M12）通过；
   严格 Clippy 在既有历史豁免基线上无新增警告，敏感信息扫描通过。
+- M3 MASQUE 已完成 Cloudflare Access H3/H2 CONNECT-IP、H3 L4 CONNECT 和 RFC 9298
+  CONNECT-UDP；支持 ECDSA mTLS、服务端 SPKI pin、用户态 IPv4/IPv6 TCP/UDP、远端 DNS、
+  route advertisement、H2 capsule、标准/旧版 H3 datagram setting、flow/context ID、URI
+  template、会话池、BBR/Cubic/NewReno、CWND profile、keepalive 和握手超时。8 项模块测试
+  覆盖三类隧道的真实 H2/H3 TCP/UDP 回环及错误公钥拒绝；`cargo check --all-targets`、
+  243 项 lib、30 项 remaining protocols、21 项 config/runtime、release arm64 build 通过，
+  严格 Clippy 在既有历史豁免基线上无新增警告，敏感订阅扫描通过。
 - `UnsupportedProtocolOutbound` 仍承载：
-  - MASQUE
   - OpenVPN
 - 当前 TUN backend 会明确拒绝 `strict_route`、`auto_detect_interface`、
   `auto_redirect`、GSO、自定义 route/address 和进程过滤等能力，尚不满足最终目标。
@@ -404,7 +410,7 @@ M1 Outbound 第一批已实现、验证并提交：
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
 1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收，M3 Hysteria v1、Mieru、
-   Juicity 已完成；继续依次完成 MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、
+   Juicity 和 MASQUE 已完成；继续依次完成 OpenVPN、Sudoku、Tailscale、TrustTunnel、
    DNS outbound 和 Rematch。
 2. 按 M3 完成所有 parse-only/缺失协议的真实 TCP/UDP 拨号、认证、传输组合、错误映射和
    互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
@@ -1516,13 +1522,23 @@ Mihomo 冻结基线有、当前 Skyhook 正式模型缺失：
 
 ### 12.5 MASQUE
 
-- HTTP/3。
-- CONNECT-UDP。
-- CONNECT-IP，配置声明时。
-- authentication。
-- datagram capsule。
-- flow id。
-- QUIC migration 和关闭。
+- [x] HTTP/3 与 HTTP/2。
+- [x] RFC 9298 CONNECT-UDP。
+- [x] Cloudflare Access H3/H2 CONNECT-IP 与 H3 L4 CONNECT。
+- [x] ECDSA mTLS authentication 与服务端 SPKI pin。
+- [x] H2 datagram capsule、H3 标准/旧版 datagram setting 和 route advertisement。
+- [x] flow/context ID、URI template、用户态 IPv4/IPv6 TCP/UDP 与远端 DNS。
+- [x] QUIC keepalive、连接关闭检测、会话淘汰和下一次拨号重建；网络接口级迁移统一在
+  M5 macOS 网络恢复事务中验收。
+
+实现与证据：
+
+- `Supercore/src/outbound/masque.rs`
+- `Supercore/src/outbound/ip_stack.rs`
+- `Supercore/vendor/h3-0.0.8/`
+- `Supercore/src/subscription/mod.rs`
+- `Supercore/tests/remaining_protocols.rs`
+- `Supercore/docs/protocol-matrix.md`
 
 ### 12.6 OpenVPN
 
@@ -2552,17 +2568,18 @@ README 只写最终功能、安装、使用、架构、协议状态和可复现�
 6. `Protocols: complete Hysteria2 TUIC WireGuard`
 7. `Protocols: complete AnyTLS ShadowTLS Naive HTTP SOCKS SSH`
 8. `Protocols: add Hysteria Mieru Juicity`
-9. `Protocols: add MASQUE OpenVPN Sudoku`
-10. `Protocols: add Tailscale TrustTunnel DNS Rematch`
-11. `DNS: complete resolver policies cache and Fake-IP`
-12. `TUN: complete privileged helper and network transactions`
-13. `Probe: complete isolated probing and auto selection`
-14. `Profiles: complete subscriptions providers and groups`
-15. `Routing: complete smart rules and application routing`
-16. `Telemetry: complete traffic connections logs and doctor`
-17. `App: complete architecture and final interaction`
-18. `Quality: complete performance security CI and governance`
-19. `Release: ship signed notarized Yueqiu Elevator`
+9. `Protocols: implement native MASQUE`
+10. `Protocols: add OpenVPN Sudoku`
+11. `Protocols: add Tailscale TrustTunnel DNS Rematch`
+12. `DNS: complete resolver policies cache and Fake-IP`
+13. `TUN: complete privileged helper and network transactions`
+14. `Probe: complete isolated probing and auto selection`
+15. `Profiles: complete subscriptions providers and groups`
+16. `Routing: complete smart rules and application routing`
+17. `Telemetry: complete traffic connections logs and doctor`
+18. `App: complete architecture and final interaction`
+19. `Quality: complete performance security CI and governance`
+20. `Release: ship signed notarized Yueqiu Elevator`
 
 每个提交必须：
 

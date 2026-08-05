@@ -50,6 +50,15 @@ impl OutboundCapability {
         }
     }
 
+    pub fn udp_only(mode: impl Into<String>, limitation: impl Into<String>) -> Self {
+        Self {
+            tcp_supported: false,
+            udp_supported: true,
+            udp_mode: Some(mode.into()),
+            limitations: vec![limitation.into()],
+        }
+    }
+
     pub fn unsupported(limitation: impl Into<String>) -> Self {
         Self {
             tcp_supported: false,
