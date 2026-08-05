@@ -748,11 +748,11 @@ fn classify_outbound_without_runtime(
     use supercore::config::OutboundConfig;
     match outbound {
         OutboundConfig::Group { .. } => OutboundSupportState::Full,
+        OutboundConfig::Hysteria { .. }
+        | OutboundConfig::Mieru { .. }
+        | OutboundConfig::Juicity { .. } => OutboundSupportState::Full,
         OutboundConfig::Reject { .. } => OutboundSupportState::Unsupported,
         OutboundConfig::Unknown { .. }
-        | OutboundConfig::Hysteria { .. }
-        | OutboundConfig::Mieru { .. }
-        | OutboundConfig::Juicity { .. }
         | OutboundConfig::Masque { .. }
         | OutboundConfig::OpenVpn { .. } => OutboundSupportState::ParseOnly,
         _ => OutboundSupportState::Partial,

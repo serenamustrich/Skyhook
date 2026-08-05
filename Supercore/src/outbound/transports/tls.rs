@@ -67,6 +67,83 @@ struct PinnedCertificateVerifier {
     sha256: [u8; 32],
 }
 
+#[derive(Debug)]
+struct PinnedCertificateChainVerifier {
+    signature_verifier: Arc<dyn ServerCertVerifier>,
+    sha256: [u8; 32],
+}
+
+impl ServerCertVerifier for PinnedCertificateChainVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if certificate_chain_sha256(end_entity, intermediates) != self.sha256 {
+            return Err(rustls::Error::General(
+                "server certificate chain SHA-256 pin mismatch".to_string(),
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.signature_verifier
+            .verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.signature_verifier
+            .verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.signature_verifier.supported_verify_schemes()
+    }
+}
+
+fn certificate_chain_sha256(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> [u8; 32] {
+    let mut digest: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+    for certificate in intermediates {
+        let certificate_digest: [u8; 32] = Sha256::digest(certificate.as_ref()).into();
+        let mut chain = [0u8; 64];
+        chain[..32].copy_from_slice(&digest);
+        chain[32..].copy_from_slice(&certificate_digest);
+        digest = Sha256::digest(chain).into();
+    }
+    digest
+}
+
+pub(crate) fn pinned_certificate_chain_verifier(
+    sha256: [u8; 32],
+) -> anyhow::Result<Arc<dyn ServerCertVerifier>> {
+    let provider = Arc::new(aws_lc_rs::default_provider());
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let signature_verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build()?;
+    Ok(Arc::new(PinnedCertificateChainVerifier {
+        signature_verifier,
+        sha256,
+    }))
+}
+
 impl ServerCertVerifier for PinnedCertificateVerifier {
     fn verify_server_cert(
         &self,

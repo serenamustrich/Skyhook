@@ -1,7 +1,7 @@
 //! 6.4.7-11 protocol coverage tests
 //!
 //! Covers: SSR (obfs/UDP), Snell (obfs), WireGuard (allowed_ips/reserved/mtu),
-//! AnyTLS, ShadowTLS, Naive, and Hysteria v1 capability boundaries.
+//! AnyTLS, ShadowTLS, Naive, Hysteria v1, and Juicity capability boundaries.
 //!
 //! The tests exercise the public builder (`build_outbounds`) + the runtime
 //! capability snapshot (`Runtime::outbound_capabilities`) plus lightweight
@@ -952,6 +952,36 @@ async fn hysteria_v1_routes_through_runtime_to_native_outbound() {
     let snapshot = find_snapshot(&runtime, "hy");
     assert!(snapshot.tcp_supported);
     assert!(snapshot.udp_supported);
+}
+
+#[test]
+fn juicity_routes_through_factory_to_native_tcp_udp_outbound() {
+    let config = config_with_default(
+        "juicity",
+        OutboundConfig::Juicity {
+            name: "juicity".to_string(),
+            server: "juicity.example.com".to_string(),
+            port: 443,
+            uuid: "11111111-2222-3333-4444-555555555555".to_string(),
+            password: "password".to_string(),
+            sni: Some("edge.example.com".to_string()),
+            skip_cert_verify: false,
+            congestion_control: Some("bbr".to_string()),
+            keepalive_interval_ms: Some(5_000),
+            pinned_certchain_sha256: None,
+        },
+    );
+    let runtime = Runtime::new(config).expect("runtime");
+    let snapshot = find_snapshot(&runtime, "juicity");
+
+    assert_eq!(snapshot.kind, "juicity");
+    assert!(snapshot.tcp_supported);
+    assert!(snapshot.udp_supported);
+    assert_eq!(
+        snapshot.udp_mode.as_deref(),
+        Some("juicity-v0-quic-stream-tcp-udp-session-pool")
+    );
+    assert!(snapshot.limitations.is_empty());
 }
 
 // ---------------------------------------------------------------------------

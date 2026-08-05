@@ -75,6 +75,10 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   XChaCha20-Poly1305 encryption, multiplexing, random padding, MTU fragmentation, congestion and
   retransmission control, SOCKS5 TCP/UDP relay, fixed ports and `port-range`. Both official simple
   and protobuf share formats are supported, with TCP/UDP interoperability against `mita`.
+- Juicity v0 over native QUIC with UUID/password TLS-exporter authentication, multiplexed TCP,
+  reliable UDP-over-stream sessions, BBR/Cubic/NewReno, keepalive, TLS session caching, stale-session
+  recovery, and official certificate-chain SHA-256 pinning. TCP/UDP and rejected authentication
+  interoperate with the official v0.5.0 server.
 - Hysteria2 and TUIC native QUIC TCP outbounds with strict authentication and complete local QUIC
   server end-to-end coverage.
 - Hysteria2 HTTP/3 auth, TCP, QUIC datagram UDP, session reuse, fragmentation, bandwidth-aware
@@ -137,10 +141,10 @@ Supercore no longer treats protocol support as a single boolean.
 
 Current matrix details are in `docs/protocol-matrix.md`:
 
-- **parse-only**: `juicity`, `masque`, `openvpn`
+- **parse-only**: `masque`, `openvpn`
 - **unsupported**: parse failures and unknown configs with explicit parse errors
 - **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria v1, Hysteria2, TUIC,
-  WireGuard, AnyTLS, ShadowTLS, Naive, Mieru, HTTP, SOCKS5, and SSH
+  WireGuard, AnyTLS, ShadowTLS, Naive, Mieru, Juicity, HTTP, SOCKS5, and SSH
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently

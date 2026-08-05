@@ -791,6 +791,16 @@ pub enum OutboundConfig {
         sni: Option<String>,
         #[serde(default)]
         skip_cert_verify: bool,
+        #[serde(default, alias = "congestion-controller", alias = "congestion_control")]
+        congestion_control: Option<String>,
+        #[serde(default, alias = "keepalive-interval", alias = "keepalive_interval")]
+        keepalive_interval_ms: Option<u64>,
+        #[serde(
+            default,
+            alias = "pinned-certchain-sha256",
+            alias = "pinned_certchain_sha256"
+        )]
+        pinned_certchain_sha256: Option<String>,
     },
     Masque {
         name: String,

@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Context};
 use rustls::{
-    client::{ClientSessionStore, Resumption},
+    client::{danger::ServerCertVerifier, ClientSessionStore, Resumption},
     crypto::aws_lc_rs,
     ClientConfig, RootCertStore,
 };
@@ -14,7 +14,10 @@ use tokio::{
 
 use crate::outbound::context::active_dial_context;
 
-use super::{order_addresses, tls::NoCertificateVerification};
+use super::{
+    order_addresses,
+    tls::{pinned_certificate_chain_verifier, NoCertificateVerification},
+};
 use crate::outbound::udp::create_bound_std_udp;
 
 #[derive(Debug, Clone, Default)]
@@ -50,6 +53,7 @@ pub(crate) fn quic_client_config_with_controller(
         false,
         Some(controller),
         None,
+        None,
     )
 }
 
@@ -68,6 +72,7 @@ pub(crate) fn quic_client_config_with_controller_and_tuning(
         false,
         Some(controller),
         Some(tuning),
+        None,
     )
 }
 
@@ -86,6 +91,28 @@ pub(crate) fn quic_client_config_with_resumption(
         enable_early_data,
         None,
         None,
+        None,
+    )
+}
+
+pub(crate) fn quic_client_config_with_resumption_tuning_and_chain_pin(
+    skip_cert_verify: bool,
+    alpn: Option<&str>,
+    congestion_control: Option<&str>,
+    session_store: Option<Arc<dyn ClientSessionStore>>,
+    enable_early_data: bool,
+    tuning: QuicTransportTuning,
+    certificate_chain_pin: Option<[u8; 32]>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    quic_client_config_advanced(
+        skip_cert_verify,
+        alpn,
+        congestion_control,
+        session_store,
+        enable_early_data,
+        None,
+        Some(tuning),
+        certificate_chain_pin,
     )
 }
 
@@ -97,14 +124,22 @@ fn quic_client_config_advanced(
     enable_early_data: bool,
     controller: Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync>>,
     tuning: Option<QuicTransportTuning>,
+    certificate_chain_pin: Option<[u8; 32]>,
 ) -> anyhow::Result<quinn::ClientConfig> {
     let provider = aws_lc_rs::default_provider();
     let builder = ClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])?;
-    let mut config = if skip_cert_verify {
+    let verifier: Option<Arc<dyn ServerCertVerifier>> = if let Some(pin) = certificate_chain_pin {
+        Some(pinned_certificate_chain_verifier(pin)?)
+    } else if skip_cert_verify {
+        Some(Arc::new(NoCertificateVerification))
+    } else {
+        None
+    };
+    let mut config = if let Some(verifier) = verifier {
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_custom_certificate_verifier(verifier)
             .with_no_client_auth()
     } else {
         let mut roots = RootCertStore::empty();
@@ -187,7 +222,9 @@ fn quic_client_config_advanced(
         }
     }
     if let Some(context) = active {
-        transport_config.keep_alive_interval(context.keepalive);
+        if let Some(keepalive) = context.keepalive {
+            transport_config.keep_alive_interval(Some(keepalive));
+        }
         if let Some(mtu) = context.quic_mtu {
             let mtu = mtu.clamp(1_200, 65_527);
             transport_config.initial_mtu(mtu).min_mtu(mtu.min(1_200));

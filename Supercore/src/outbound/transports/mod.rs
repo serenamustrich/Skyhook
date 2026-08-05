@@ -24,9 +24,9 @@ pub(crate) use mptcp::runtime_available as mptcp_runtime_available;
 pub(crate) use quic::{
     connect_quic_endpoint, connect_quic_endpoint_resumable, create_quic_endpoint,
     encode_quic_varint, quic_client_config_with_controller,
-    quic_client_config_with_controller_and_tuning, quic_client_config_with_resumption, random_u16,
-    random_u32, read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote,
-    QuicTransportTuning,
+    quic_client_config_with_controller_and_tuning, quic_client_config_with_resumption,
+    quic_client_config_with_resumption_tuning_and_chain_pin, random_u16, random_u32,
+    read_quic_varint, read_quic_varint_from_slice, resolve_quic_remote, QuicTransportTuning,
 };
 pub(crate) use socket_options::bind_interface;
 pub(crate) use tcp::{active_tcp_dialer_is_set, connect_tcp, order_addresses, scope_tcp_dialer};

@@ -314,7 +314,12 @@ mod tests {
 
     #[tokio::test]
     async fn list_routes_share_stable_pagination_and_structured_cursor_errors() {
-        let runtime = Arc::new(Runtime::new(SuperConfig::default()).unwrap());
+        let mut config = SuperConfig::default();
+        config.smart_rules.state_path = std::env::temp_dir().join(format!(
+            "supercore-api-pagination-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime = Arc::new(Runtime::new(config).unwrap());
         runtime.telemetry().log("info", "older log").await;
         tokio::time::sleep(Duration::from_millis(2)).await;
         runtime.telemetry().log("warn", "newer log").await;

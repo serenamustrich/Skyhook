@@ -8,11 +8,11 @@
 >
 > 计划冻结日期：2026-07-17
 >
-> 计划版本：v1.28（完成 M3 Mieru，进入 Juicity）
+> 计划版本：v1.29（完成 M3 Juicity，进入 MASQUE）
 >
 > 当前文档状态：`IN_EXECUTION`。M0 已验证，M1 已实现且等待 M12 的 MPTCP 真机发布验证，
-> M2 已验证，M3 Hysteria v1 和 Mieru 已完成，当前直接执行点为 M3 Juicity。按固定范围估算，
-> 当前整体实现进度约 64%。
+> M2 已验证，M3 Hysteria v1、Mieru 和 Juicity 已完成，当前直接执行点为 M3 MASQUE。
+> 按固定范围估算，当前整体实现进度约 65%。
 >
 > 后续执行方式：由 Codex 按本文档直接开发、验证、提交和发布，不作为交接文档，
 > 不依赖 Mihomo 二进制、双核心或运行时兼容回退。
@@ -226,7 +226,7 @@ Provider、Geo、Doctor 和诊断包导出已经迁移到 task。单订阅更新
 - Outbound 生产模块中的 `use super::*` 已清零；factory、SSH、WireGuard、Snell 和 SSR
   已改为显式依赖，公共十六进制工具和 UDP session pool 容量常量已归入所属模块。
 - API、核心协调和 UI 状态职责仍过度集中。
-- 当前代码中 Juicity、MASQUE、OpenVPN 仍是 parse-only/unsupported。
+- 当前代码中 MASQUE、OpenVPN 仍是 parse-only/unsupported。
 - Mihomo 当前官方协议列表中的 Sudoku、Tailscale、TrustTunnel、DNS outbound 和 Rematch 尚未进入 Skyhook 正式模型。
 - TUN 当前依赖 `tun2proxy 0.8.1`，不具备最终要求的完整事务恢复能力。
 
@@ -380,8 +380,14 @@ M1 Outbound 第一批已实现、验证并提交：
   `mieru://`、固定端口和 `port-range` 均已接入。9 项协议单元/实拨、3 项分享与配置回归、
   49 项既有协议/runtime 回归通过，并与官方 `mita` 服务端完成 TCP/UDP、多会话、UDP
   ASSOCIATE 及丢包乱序互通。
+- M3 Juicity 已完成原生 QUIC/TLS、UUID/password TLS exporter 鉴权、TCP、可靠
+  UDP-over-stream、BBR/Cubic/NewReno、keepalive、TLS session cache、连接与 UDP session
+  复用、断线重建和官方证书链 SHA-256 pin。5 项本地真实 QUIC 测试覆盖 TCP/UDP、错误
+  密码、证书 pin 和 session 恢复；并与官方 v0.5.0 服务端完成连续双 TCP、UDP relay 和
+  错误鉴权互操作。`cargo check --all-targets`、234 项 lib、29 项 remaining protocols、
+  21 项 config/runtime、14 项 common outbound options（1 项签名 MPTCP 留到 M12）通过；
+  严格 Clippy 在既有历史豁免基线上无新增警告，敏感信息扫描通过。
 - `UnsupportedProtocolOutbound` 仍承载：
-  - Juicity
   - MASQUE
   - OpenVPN
 - 当前 TUN backend 会明确拒绝 `strict_route`、`auto_detect_interface`、
@@ -397,8 +403,8 @@ M1 Outbound 第一批已实现、验证并提交：
 
 收到继续开发指令后，由 Codex 严格按以下顺序直接开发：
 
-1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收，M3 Hysteria v1、Mieru
-   已完成；继续依次完成 Juicity、MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、
+1. M2 的 `NEXT-010A` 至 `NEXT-011G` 已全部完成并通过集中验收，M3 Hysteria v1、Mieru、
+   Juicity 已完成；继续依次完成 MASQUE、OpenVPN、Sudoku、Tailscale、TrustTunnel、
    DNS outbound 和 Rematch。
 2. 按 M3 完成所有 parse-only/缺失协议的真实 TCP/UDP 拨号、认证、传输组合、错误映射和
    互操作证据；parse-only 或 `UnsupportedProtocolOutbound` 不得留在最终正式能力中。
@@ -1493,11 +1499,20 @@ Mihomo 冻结基线有、当前 Skyhook 正式模型缺失：
 
 ### 12.4 Juicity
 
-- UUID/password。
-- QUIC/TLS。
-- TCP/UDP。
-- congestion、keepalive。
-- 错误认证和 session 恢复。
+- [x] UUID/password 与 TLS exporter authentication。
+- [x] 原生 QUIC/TLS 1.3、H3 ALPN 和 TLS session cache。
+- [x] 双向流 TCP 与可靠 UDP-over-stream、endpoint-independent UDP session pool。
+- [x] BBR/Cubic/NewReno、5 秒默认可配置 keepalive 和接收窗口。
+- [x] 官方证书链 SHA-256 pin、错误认证和关闭 session 自动重建。
+- [x] 本地真实 QUIC E2E 与官方 v0.5.0 TCP/UDP/错误认证互操作。
+
+实现与证据：
+
+- `Supercore/src/outbound/juicity.rs`
+- `Supercore/src/outbound/transports/quic.rs`
+- `Supercore/src/outbound/transports/tls.rs`
+- `Supercore/src/subscription/mod.rs`
+- `Supercore/docs/protocol-matrix.md`
 
 ### 12.5 MASQUE
 

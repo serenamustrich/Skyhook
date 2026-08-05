@@ -695,10 +695,31 @@ impl SubscriptionNode {
                 port: self.port,
                 uuid: required_param(&self.params, &["uuid", "id", "username"], "juicity uuid")?,
                 password: required_param(&self.params, &["password"], "juicity password")?,
-                sni: first_param(&self.params, &["sni", "servername"]),
+                sni: first_param(&self.params, &["sni", "servername", "peer"]),
                 skip_cert_verify: bool_param_any(
                     &self.params,
-                    &["skip-cert-verify", "allowInsecure", "insecure"],
+                    &[
+                        "skip-cert-verify",
+                        "allowInsecure",
+                        "allow_insecure",
+                        "allowinsecure",
+                        "skipVerify",
+                        "insecure",
+                    ],
+                ),
+                congestion_control: first_param(
+                    &self.params,
+                    &["congestion-controller", "congestion_control"],
+                ),
+                keepalive_interval_ms: first_param(
+                    &self.params,
+                    &["keepalive-interval", "keepalive_interval"],
+                )
+                .map(|value| parse_u64_text(&value, "juicity keepalive interval"))
+                .transpose()?,
+                pinned_certchain_sha256: first_param(
+                    &self.params,
+                    &["pinned-certchain-sha256", "pinned_certchain_sha256"],
                 ),
             }),
             NodeProtocol::Masque => Ok(OutboundConfig::Masque {
@@ -3928,6 +3949,38 @@ proxies:
                 assert_eq!(port, 39091);
                 assert_eq!(port_range.as_deref(), Some("39091-39093"));
                 assert_eq!(transport.as_deref(), Some("TCP"));
+            }
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_official_juicity_uri_options() {
+        let uri = "juicity://11111111-2222-3333-4444-555555555555:p%40ss@juicity.example.com:443?congestion_control=bbr&sni=edge.example.com&allow_insecure=1&keepalive_interval=2500&pinned_certchain_sha256=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8%3D#Juicity";
+        let document = parse_subscription(uri).unwrap();
+        assert!(document.unsupported.is_empty());
+        assert_eq!(document.nodes.len(), 1);
+        match document.nodes[0].to_outbound_config().unwrap() {
+            OutboundConfig::Juicity {
+                uuid,
+                password,
+                sni,
+                skip_cert_verify,
+                congestion_control,
+                keepalive_interval_ms,
+                pinned_certchain_sha256,
+                ..
+            } => {
+                assert_eq!(uuid, "11111111-2222-3333-4444-555555555555");
+                assert_eq!(password, "p@ss");
+                assert_eq!(sni.as_deref(), Some("edge.example.com"));
+                assert!(skip_cert_verify);
+                assert_eq!(congestion_control.as_deref(), Some("bbr"));
+                assert_eq!(keepalive_interval_ms, Some(2_500));
+                assert_eq!(
+                    pinned_certchain_sha256.as_deref(),
+                    Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+                );
             }
             other => panic!("unexpected outbound {other:?}"),
         }
