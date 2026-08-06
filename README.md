@@ -59,7 +59,7 @@
   TCP relay 与 `_udp2` UDP 帧，并有本地 H2/H3 TCP 及 H3 `_udp2` 双向拨号回环；Tailscale 使用独立 userspace，
   不调用系统 Tailscale 进程。
 - DNS outbound 支持 UDP/TCP/DoT/DoH raw DNS 查询，Rematch 支持规则重新匹配、命名上下文、
-  循环检测与最大深度保护。
+  循环检测与最大深度保护；外部 DoT 验证脚本使用可隔离的本地监听端口，不依赖默认混合端口。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
 - 订阅与 Provider 下载默认使用直连通道，失败时保留已有本地缓存。
 - 支持自定义域名/IP 规则，并让这些规则优先于订阅规则。

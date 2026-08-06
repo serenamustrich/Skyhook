@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE="${SUPERCORE_BINARY:-${ROOT}/Supercore/target/release/supercore}"
 DOT_HOST="${1:-8.8.8.8}"
 DOT_SNI="${2:-dns.google}"
+DOT_MIXED_PORT="${SUPERCORE_DOT_MIXED_PORT:-17897}"
 CONTROL_PORT="${SUPERCORE_DOT_CONTROL_PORT:-9297}"
 DNS_PORT="${SUPERCORE_DOT_DNS_PORT:-15353}"
 
@@ -35,12 +36,16 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cp "${ROOT}/Supercore/supercore.example.yaml" "${CONFIG}"
-python3 - "${CONFIG}" "${DOT_HOST}" "${DOT_SNI}" "${CONTROL_PORT}" "${DNS_PORT}" <<'PY'
+python3 - "${CONFIG}" "${DOT_HOST}" "${DOT_SNI}" "${DOT_MIXED_PORT}" "${CONTROL_PORT}" "${DNS_PORT}" <<'PY'
 from pathlib import Path
 import sys
 
-path, host, sni, control_port, dns_port = sys.argv[1:]
+path, host, sni, mixed_port, control_port, dns_port = sys.argv[1:]
 config = Path(path).read_text()
+config = config.replace(
+    "  mixed_listen: 127.0.0.1:7897\n",
+    f"  mixed_listen: 127.0.0.1:{mixed_port}\n",
+)
 config = config.replace(
     "  control_listen: 127.0.0.1:9197\n",
     f"  control_listen: 127.0.0.1:{control_port}\n",
