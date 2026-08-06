@@ -12,6 +12,7 @@ WITH_TUN=0
 ROOT_MODE=0
 ALLOW_ROUTE_CHANGES=0
 KEEP_ARTIFACTS=0
+CLEANUP_DONE=0
 
 usage() {
   cat <<'USAGE'
@@ -96,21 +97,37 @@ ENABLED_CONFIG="${WORK_DIR}/enabled.yaml"
 PID=""
 
 cleanup() {
+  if (( CLEANUP_DONE == 1 )); then
+    return
+  fi
+  CLEANUP_DONE=1
+  trap - EXIT INT TERM
   if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-    kill -TERM "$PID" 2>/dev/null || true
+    terminate_process_tree "$PID" TERM
     for _ in {1..40}; do
       kill -0 "$PID" 2>/dev/null || break
       sleep 0.1
     done
-    kill -KILL "$PID" 2>/dev/null || true
+    if kill -0 "$PID" 2>/dev/null; then
+      terminate_process_tree "$PID" KILL
+    fi
+    wait "$PID" 2>/dev/null || true
   fi
+  PID=""
   if (( KEEP_ARTIFACTS == 0 )); then
     rm -rf "$WORK_DIR"
   else
     echo "matrix artifacts: $WORK_DIR"
   fi
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+  local status="$1"
+  cleanup
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 toggle_tun() {
   local source="$1" target="$2" value="$3"
@@ -173,6 +190,14 @@ snapshot() {
 
 interfaces() { /sbin/ifconfig -l | tr ' ' '\n' | sed '/^$/d' | sort; }
 tun_interfaces() { interfaces | awk '/^(utun|tun)[0-9]+$/' || true; }
+
+terminate_process_tree() {
+  local pid="$1" signal="$2" child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    terminate_process_tree "$child" "$signal"
+  done
+  kill "-${signal}" "$pid" 2>/dev/null || true
+}
 
 api_get() {
   curl --noproxy '*' --fail --silent --show-error --max-time 5 \
@@ -258,7 +283,7 @@ if [[ -n "$(comm -13 <(printf '%s\n' "$BASE_TUN") <(tun_interfaces))" ]]; then
 fi
 echo "dynamic_stop=ok"
 
-kill -TERM "$PID"
+terminate_process_tree "$PID" TERM
 wait "$PID" 2>/dev/null || true
 PID=""
 echo "normal_exit=ok"
@@ -266,7 +291,7 @@ echo "normal_exit=ok"
 start_core "$DISABLED_CONFIG"
 api_reload "$ENABLED_CONFIG"
 wait_state running >/dev/null
-kill -KILL "$PID"
+terminate_process_tree "$PID" KILL
 wait "$PID" 2>/dev/null || true
 PID=""
 sleep 2

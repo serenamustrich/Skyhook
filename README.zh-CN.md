@@ -44,7 +44,7 @@
 - Probe 接口：支持按全部节点、按组进行可配置延迟探测。
 - 智能规则：支持观察数据采集、推荐写回与规则持久化。
 
-TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未实现的高级 TUN 字段会明确返回错误，不会静默假装生效。
+TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未实现的高级 TUN 字段会明确返回错误，不会静默假装生效。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权；应用启动和普通测速不会触发该授权。
 
 ## 协议能力状态（简表）
 
