@@ -103,15 +103,7 @@ cleanup() {
   CLEANUP_DONE=1
   trap - EXIT INT TERM
   if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-    terminate_process_tree "$PID" TERM
-    for _ in {1..40}; do
-      kill -0 "$PID" 2>/dev/null || break
-      sleep 0.1
-    done
-    if kill -0 "$PID" 2>/dev/null; then
-      terminate_process_tree "$PID" KILL
-    fi
-    wait "$PID" 2>/dev/null || true
+    stop_core "$PID" TERM
   fi
   PID=""
   if (( KEEP_ARTIFACTS == 0 )); then
@@ -199,6 +191,23 @@ terminate_process_tree() {
   kill "-${signal}" "$pid" 2>/dev/null || true
 }
 
+stop_core() {
+  local pid="$1" signal="${2:-TERM}"
+  if [[ "$signal" == "KILL" ]]; then
+    terminate_process_tree "$pid" KILL
+  else
+    terminate_process_tree "$pid" TERM
+    for _ in {1..40}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      terminate_process_tree "$pid" KILL
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
 api_get() {
   curl --noproxy '*' --fail --silent --show-error --max-time 5 \
     -H "Authorization: Bearer ${TOKEN}" "${CONTROL_URL%/}$1"
@@ -283,16 +292,14 @@ if [[ -n "$(comm -13 <(printf '%s\n' "$BASE_TUN") <(tun_interfaces))" ]]; then
 fi
 echo "dynamic_stop=ok"
 
-terminate_process_tree "$PID" TERM
-wait "$PID" 2>/dev/null || true
+stop_core "$PID" TERM
 PID=""
 echo "normal_exit=ok"
 
 start_core "$DISABLED_CONFIG"
 api_reload "$ENABLED_CONFIG"
 wait_state running >/dev/null
-terminate_process_tree "$PID" KILL
-wait "$PID" 2>/dev/null || true
+stop_core "$PID" KILL
 PID=""
 sleep 2
 if [[ -n "$(comm -13 <(printf '%s\n' "$BASE_TUN") <(tun_interfaces))" ]]; then
