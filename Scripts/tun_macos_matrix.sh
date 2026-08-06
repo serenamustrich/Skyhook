@@ -212,24 +212,33 @@ wait_for_process_exit() {
 
 stop_core() {
   local pid="$1" signal="${2:-TERM}"
+  local timed_out=0
   kill -0 "$pid" 2>/dev/null || return 0
-  if [[ "$signal" == "KILL" ]]; then
-    terminate_process_tree "$pid" KILL
-    if ! wait_for_process_exit "$pid" 30; then
-      echo "ERROR: core pid ${pid} did not exit after SIGKILL" >&2
-      return 1
-    fi
-  else
-    terminate_process_tree "$pid" TERM
-    if ! wait_for_process_exit "$pid" 40; then
+  {
+    if [[ "$signal" == "KILL" ]]; then
       terminate_process_tree "$pid" KILL
       if ! wait_for_process_exit "$pid" 30; then
-        echo "ERROR: core pid ${pid} did not exit after SIGTERM/SIGKILL" >&2
-        return 1
+        timed_out=1
+      fi
+    else
+      terminate_process_tree "$pid" TERM
+      if ! wait_for_process_exit "$pid" 40; then
+        terminate_process_tree "$pid" KILL
+        if ! wait_for_process_exit "$pid" 30; then
+          timed_out=1
+        fi
       fi
     fi
+    wait "$pid" 2>/dev/null || true
+  } 2>/dev/null
+  if (( timed_out == 1 )); then
+    if [[ "$signal" == "KILL" ]]; then
+      echo "ERROR: core pid ${pid} did not exit after SIGKILL" >&2
+    else
+      echo "ERROR: core pid ${pid} did not exit after SIGTERM/SIGKILL" >&2
+    fi
+    return 1
   fi
-  wait "$pid" 2>/dev/null || true
 }
 
 api_get() {
