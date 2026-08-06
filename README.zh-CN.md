@@ -31,7 +31,8 @@
 - MASQUE 支持 Cloudflare Access HTTP/3/HTTP/2 CONNECT-IP、HTTP/3 L4 CONNECT 和 RFC 9298 CONNECT-UDP；实现 ECDSA mTLS、服务端 SPKI pin、用户态 IPv4/IPv6 TCP/UDP、远端 DNS、标准与旧版 H3 datagram setting、capsule、flow/context ID、URI template、会话池、QUIC keepalive、BBR/Cubic/NewReno、CWND profile 和握手超时。本地真实 H2/H3 服务端覆盖 TCP/UDP、错误公钥拒绝和三种隧道模式。
 - OpenVPN 使用自研 TLS control/data channel，支持 TCP、UDP、服务端 push route/DNS、重连和用户态 L3 relay，不启动外部 OpenVPN 进程。
 - Sudoku 支持 KIP 握手、AEAD、纯 Sudoku/6-bit packed 下行、UoT UDP、ASCII/entropy/custom table、custom_tables 轮换，以及 legacy/stream/poll/auto/WebSocket HTTP 伪装。
-- TrustTunnel 支持 TLS+HTTP/2、HTTP/3 CONNECT、Basic 认证、TCP relay 与 `_udp2` UDP 帧。
+- TrustTunnel 支持 TLS+HTTP/2、QUIC/HTTP3 extended CONNECT、Basic 认证、TCP relay 与
+  `_udp2` UDP 帧，并有本地 H2/H3 TCP 及 H3 `_udp2` 双向拨号回环验证。
 - Tailscale 使用独立 Rust userspace，支持持久化 identity/control state、auth key、hostname、tags、TCP 和 UDP，不调用系统 Tailscale 进程、不修改主机路由。
 - DNS outbound 支持 raw DNS 的 UDP、TCP、DoT 和 DoH；Rematch 支持带命名上下文的规则重新匹配、循环检测和最大深度保护。
 - HTTP 代理支持 HTTP/HTTPS CONNECT、Basic Auth、SNI、证书校验、IPv4/IPv6 目标、非 2xx 错误分类和握手后预读数据保留；HTTP CONNECT 原生仅承载 TCP。

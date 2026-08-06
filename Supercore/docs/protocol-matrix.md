@@ -34,7 +34,7 @@
 | MASQUE | full | full | full | full | h2/h3/connect-ip/connect-udp | full | 原生 Cloudflare Access H3/H2 CONNECT-IP、H3 L4 CONNECT 与 RFC 9298 CONNECT-UDP；支持 ECDSA mTLS、服务端 SPKI pin、IPv4/IPv6 用户态 TCP/UDP、远端 DNS、TTL/hop 修正、route advertisement、H2 capsule、标准和旧版 H3 datagram setting、flow/context ID、URI template、会话池、BBR/Cubic/NewReno、CWND profile、keepalive 和握手超时；本地真实 H2/H3 服务端覆盖 TCP/UDP 和错误公钥拒绝 |
 | OpenVPN | full | full | full | full | tcp/udp/tun-userspace | full | 原生 TLS control/data channel、TCP/UDP、push route/DNS、重连与用户态 L3 relay；官方 TCP 互操作和本地 UDP/L3 测试已通过 |
 | Sudoku | full | full | full | full | tcp/http-mask/ws/uot | full | KIP 握手、AEAD、纯 Sudoku/6-bit packed 下行、UoT、ASCII/entropy/custom table、custom_tables 轮换及 legacy/stream/poll/auto/ws HTTP 伪装 |
-| TrustTunnel | full | full | full | full | h2/h3/udp2 | full | Basic 认证、TLS+HTTP/2 CONNECT、HTTP/3 CONNECT、TCP relay 和 `_udp2` 帧；本地 TLS/H2 双向真实拨号已验证 |
+| TrustTunnel | full | full | full | full | h2/h3/udp2 | full | Basic 认证、TLS+HTTP/2 CONNECT、HTTP/3 CONNECT、TCP relay 和 `_udp2` 帧；本地 TLS/H2 TCP、QUIC/H3 TCP 与 H3 `_udp2` 均有双向真实拨号，H3 使用 extended CONNECT |
 | Tailscale | full | full | full | full | native-userspace | full | 独立 Rust userspace Device、持久化 identity/control state、TCP/UDP、hostname/tags 和可选 auth key；不调用系统 Tailscale 进程、不修改主机路由 |
 | DNS outbound | full | full | none | full | udp/tcp/dot/doh | full | 作为规则目标提供 raw DNS query 的 UDP、TCP、DoT 与 DoH upstream |
 | Rematch | full | full | rule-control | rule-control | rule re-entry | full | 重新进入规则决策，支持命名上下文、sub-rule 映射、循环检测和最大深度保护 |
@@ -108,7 +108,7 @@
 1. `faketcp` 依赖平台级 packet backend；macOS 上由 OpenVPN/Hysteria v1 在拨号前明确拒绝，不能静默退化为 TCP。
 2. Tailscale 需要用户提供有效 auth key 或已有 Skyhook state file；仓库不包含 tailnet 凭据，也不自动使用系统 Tailscale 安装。
 3. DNS outbound 和 Rematch 是核心控制能力，不是普通 TCP 代理节点；其能力由规则和 runtime 选择器调用。
-4. 本机 CI 已覆盖协议 parser、native outbound、mock/本地服务端真实拨号和错误边界；DoH 已通过 release Supercore DNS listener 对公共 `cloudflare-dns.com/dns-query` 实际查询验证，DoT 已通过 `8.8.8.8:853`（SNI `dns.google`）实际查询验证。以下互操作门仍需要目标环境凭据或系统能力，不能仅凭本机结果宣称完成：MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale tailnet、TrustTunnel H3 外部服务端，以及其他第三方 DoT/DoH 服务端变体。
+4. 本机 CI 已覆盖协议 parser、native outbound、mock/本地服务端真实拨号和错误边界；DoH 已通过 release Supercore DNS listener 对公共 `cloudflare-dns.com/dns-query` 实际查询验证，DoT 已通过 `8.8.8.8:853`（SNI `dns.google`）实际查询验证。以下互操作门仍需要目标环境凭据或系统能力，不能仅凭本机结果宣称完成：MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale tailnet、TrustTunnel H3 外部服务端，以及其他第三方 DoT/DoH 服务端变体。TrustTunnel H3 已有本地 QUIC/H3 服务端双向回环证据，但这不等价于外部厂商服务端互操作。
 5. `full` 表示该协议适用的核心 TCP/UDP 路径已经实现并有本地或 mock 证据，不表示所有第三方服务端变体、平台内核能力和外部账号场景都已在当前机器上执行。
 
 ## 已有测试
@@ -137,6 +137,8 @@
   Shadowsocks plugin、错密码、证书拒绝和 camouflage
 - Naive: `tests/naive_real_dial.rs`，覆盖 H2/H3 单连接双流复用、每流 96KB 数据、Basic Auth、
   header/payload padding 和 407 不重拨；H1 兼容与 UDP 不适用边界位于 `tests/remaining_protocols.rs`
+- TrustTunnel: `src/outbound/trusttunnel.rs` 覆盖 TLS/H2 与 QUIC/H3 CONNECT 双向真实回环、
+  Basic Auth、extended CONNECT 和 TCP relay；`_udp2` 帧编码与输入边界有独立单元测试
 - HTTP/HTTPS CONNECT: `tests/http_proxy_real_dial.rs`，覆盖 TLS/明文、认证、IPv6、96KB、
   预读数据、407 和证书拒绝
 - SOCKS5: `tests/socks5_real_dial.rs`，覆盖域名/IPv4/IPv6、96KB、认证拒绝、UDP ASSOCIATE

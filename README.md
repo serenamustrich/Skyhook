@@ -55,8 +55,9 @@
 - SSH 支持固定主机公钥或 SHA-256 指纹、主机密钥算法约束、密码/内联或文件私钥认证、
   keepalive、direct-tcpip 并发通道复用和断线重连；SSH 协议没有标准 UDP relay。
 - Sudoku 支持 KIP/AEAD、纯 Sudoku 与 6-bit packed 下行、UoT UDP、HTTP/WebSocket 伪装和
-  自定义表轮换；TrustTunnel 支持 TLS+HTTP/2、HTTP/3 CONNECT、Basic 认证、TCP relay 与
-  `_udp2` UDP 帧；Tailscale 使用独立 userspace，不调用系统 Tailscale 进程。
+  自定义表轮换；TrustTunnel 支持 TLS+HTTP/2、QUIC/HTTP3 extended CONNECT、Basic 认证、
+  TCP relay 与 `_udp2` UDP 帧，并有本地 H2/H3 TCP 及 H3 `_udp2` 双向拨号回环；Tailscale 使用独立 userspace，
+  不调用系统 Tailscale 进程。
 - DNS outbound 支持 UDP/TCP/DoT/DoH raw DNS 查询，Rematch 支持规则重新匹配、命名上下文、
   循环检测与最大深度保护。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。

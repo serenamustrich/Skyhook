@@ -20,7 +20,7 @@
 - DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`，并通过 `Scripts/dot_external_e2e.sh` 使用 `8.8.8.8:853` + `dns.google` 完成真实 DoT 查询并返回 `NOERROR`。Cloudflare 的 `853` 端口在本机单独探测超时只属于该 resolver 的环境差异，不再阻塞 DoT 基础能力结论；其他第三方 DoT 变体仍未覆盖。
 - 全量测试默认高并发执行时曾出现一次 Hysteria 本地 QUIC 测试长时间等待；随后带 120 秒 watchdog 的默认 `cargo test --all --no-fail-fast`、`RUST_TEST_THREADS=4` 并发和串行验收均通过，当前未能复现，稳定性脚本保留 watchdog。
 - 最新 release App 已完成 Rust/Swift 构建、签名验证和启动退出冒烟验证，已包含本轮 Swift 订阅空响应保护。
-- 尚未被本机环境完全覆盖的门：真实管理员 macOS TUN/LaunchDaemon 网络矩阵、MPTCP entitlement、官方 OpenVPN UDP、需要外部账号的 Tailscale、TrustTunnel H3，以及其他第三方 DoT/DoH 服务端变体；DoH 公共 resolver 与 DoT `8.8.8.8:853` 已有 Supercore listener 实际验证。
+- 尚未被本机环境完全覆盖的门：真实管理员 macOS TUN/LaunchDaemon 网络矩阵、MPTCP entitlement、官方 OpenVPN UDP、需要外部账号的 Tailscale、TrustTunnel H3 外部服务端，以及其他第三方 DoT/DoH 服务端变体；TrustTunnel H3 已补充本地 QUIC/H3 服务端双向回环，DoH 公共 resolver 与 DoT `8.8.8.8:853` 已有 Supercore listener 实际验证。
 
 ## 历史阶段记录（截至2026-07-17）
 
@@ -1034,8 +1034,9 @@ swift build -c release
    后两项。
 2. 在 Wi-Fi、有线、DHCP 变化、休眠唤醒、第三方 VPN、IPv6-only/双栈环境补齐
    TUN 网络矩阵，并确认 App 的网络恢复状态与系统实际状态一致。
-3. 为 MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale 和 TrustTunnel H3 提供
-   目标环境凭据后，运行对应 ignored/外部互操作测试；DoT 基础外部 resolver 已由
+3. 为 MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale 和 TrustTunnel H3 外部服务端提供
+   目标环境凭据后，运行对应 ignored/外部互操作测试；TrustTunnel H3 的本地回环已完成，
+   DoT 基础外部 resolver 已由
    `Scripts/dot_external_e2e.sh` 验证，但其他第三方 DoT/DoH 变体仍必须保留为环境门。
 4. 运行 `Scripts/stability_24h.sh 86400`，保留完整日志、采样数、退出码和无残留
    进程证据；短时冒烟不能替代 24 小时门。

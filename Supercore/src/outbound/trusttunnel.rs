@@ -187,10 +187,12 @@ impl TrustTunnelH3Session {
             timeout_ms,
             "TrustTunnel HTTP/3",
         ).await?;
+        let mut builder = h3::client::builder();
+        builder.enable_extended_connect(true);
         let (mut driver, sender) = run_dial_phase(
             timeout_ms,
             "TrustTunnel HTTP/3 initialization",
-            h3::client::new(h3_quinn::Connection::new(connection.clone())),
+            builder.build::<_, _, Bytes>(h3_quinn::Connection::new(connection.clone())),
         ).await??;
         let closed = Arc::new(AtomicBool::new(false));
         let driver_closed = Arc::clone(&closed);
@@ -273,7 +275,7 @@ fn encode_ip(ip: IpAddr) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use bytes::Bytes;
     use rcgen::generate_simple_self_signed;
@@ -381,6 +383,199 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .expect("TrustTunnel server timed out")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusttunnel_h3_connect_round_trips_real_stream() {
+        let certificate = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certificate_der = CertificateDer::from(certificate.cert.der().to_vec());
+        let private_key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+        let provider = aws_lc_rs::default_provider();
+        let mut server_crypto = ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate_der], private_key.into())
+            .unwrap();
+        server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        let endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("TrustTunnel H3 server did not receive a connection")
+                .await
+                .unwrap();
+            let mut h3_builder = h3::server::builder();
+            h3_builder.enable_extended_connect(true);
+            let mut h3_connection = h3_builder
+                .build::<_, Bytes>(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            let resolver = h3_connection.accept().await.unwrap().unwrap();
+            let (request, mut stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            assert_eq!(request.version(), http::Version::HTTP_3);
+            assert_eq!(request.uri().authority().map(|value| value.as_str()), Some("target.example:443"));
+            assert_eq!(request.headers().get(http::header::PROXY_AUTHORIZATION).unwrap(), "Basic dXNlcjpwYXNz");
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+
+            let mut payload = Vec::new();
+            while let Some(mut chunk) = timeout(Duration::from_secs(2), stream.recv_data())
+                .await
+                .expect("TrustTunnel H3 server did not receive DATA")
+                .unwrap()
+            {
+                payload.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                if payload.len() >= 4 {
+                    break;
+                }
+            }
+            assert_eq!(&payload, b"ping");
+            stream.send_data(Bytes::from_static(b"pong")).await.unwrap();
+            stream.finish().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let outbound = TrustTunnelOutbound::new(
+            "trust-h3".to_string(),
+            "127.0.0.1".to_string(),
+            port,
+            "user".to_string(),
+            "pass".to_string(),
+            Some("localhost".to_string()),
+            true,
+            Some("h3".to_string()),
+        );
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            outbound.connect(&Destination::new("target.example", 443), 2_000),
+        )
+        .await
+        .expect("TrustTunnel H3 connect timed out")
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), stream.write_all(b"ping"))
+            .await
+            .expect("TrustTunnel H3 write timed out")
+            .unwrap();
+        let mut response = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut response))
+            .await
+            .expect("TrustTunnel H3 read timed out")
+            .unwrap();
+        assert_eq!(&response, b"pong");
+        tokio::time::timeout(Duration::from_secs(2), stream.shutdown())
+            .await
+            .expect("TrustTunnel H3 shutdown timed out")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("TrustTunnel H3 server timed out")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusttunnel_h3_udp2_round_trips_real_datagram() {
+        let certificate = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certificate_der = CertificateDer::from(certificate.cert.der().to_vec());
+        let private_key = PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der());
+        let provider = aws_lc_rs::default_provider();
+        let mut server_crypto = ServerConfig::builder_with_provider(provider.into())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate_der], private_key.into())
+            .unwrap();
+        server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        let endpoint = quinn::Endpoint::server(
+            server_config,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .expect("TrustTunnel H3 UDP server did not receive a connection")
+                .await
+                .unwrap();
+            let mut h3_builder = h3::server::builder();
+            h3_builder.enable_extended_connect(true);
+            let mut h3_connection = h3_builder
+                .build::<_, Bytes>(h3_quinn::Connection::new(connection))
+                .await
+                .unwrap();
+            let resolver = h3_connection.accept().await.unwrap().unwrap();
+            let (request, mut stream) = resolver.resolve_request().await.unwrap();
+            assert_eq!(request.method(), http::Method::CONNECT);
+            assert_eq!(request.uri().authority().map(|value| value.as_str()), Some(UDP_PSEUDO_HOST));
+            assert_eq!(request.headers().get(http::header::PROXY_AUTHORIZATION).unwrap(), "Basic dXNlcjpwYXNz");
+            stream
+                .send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+
+            let mut frame = Vec::new();
+            while let Some(mut chunk) = timeout(Duration::from_secs(2), stream.recv_data())
+                .await
+                .expect("TrustTunnel H3 UDP server did not receive DATA")
+                .unwrap()
+            {
+                frame.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+                if frame.len() >= 4 {
+                    let body_length = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+                    if frame.len() >= body_length + 4 {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize, frame.len() - 4);
+            assert_eq!(&frame[frame.len() - 3..], b"dns");
+            let mut response = Vec::with_capacity(4 + 36 + 3);
+            response.extend_from_slice(&39u32.to_be_bytes());
+            response.extend_from_slice(&frame[4..40]);
+            response.extend_from_slice(b"dns");
+            stream.send_data(Bytes::from(response)).await.unwrap();
+            stream.finish().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let outbound = TrustTunnelOutbound::new(
+            "trust-h3-udp".to_string(),
+            "127.0.0.1".to_string(),
+            port,
+            "user".to_string(),
+            "pass".to_string(),
+            Some("localhost".to_string()),
+            true,
+            Some("h3".to_string()),
+        );
+        let response = outbound
+            .udp_exchange(&Destination::new("127.0.0.1", 53), b"dns", 2_000)
+            .await
+            .unwrap();
+        assert_eq!(response, b"dns");
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("TrustTunnel H3 UDP server timed out")
             .unwrap();
     }
 }
