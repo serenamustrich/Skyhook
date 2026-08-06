@@ -173,12 +173,22 @@ final class AppState: ObservableObject {
         formatter.formatOptions = [.withInternetDateTime]
         return formatter
     }()
+    private static var configuredControlPort: Int {
+        guard let raw = ProcessInfo.processInfo.environment["SKYHOOK_TEST_CONTROL_PORT"],
+              let port = Int(raw),
+              (1...65535).contains(port) else {
+            return 9197
+        }
+        return port
+    }
 
     init(paths: AppPaths, keychain: KeychainStore) {
         self.paths = paths
         self.keychain = keychain
         self.configManager = ConfigManager(paths: paths, keychain: keychain)
-        self.supercoreAPIClient = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        self.supercoreAPIClient = SupercoreAPIClient(
+            baseURL: URL(string: "http://127.0.0.1:\(Self.configuredControlPort)")!
+        )
         self.supercoreManager = SupercoreManager(paths: paths, apiClient: supercoreAPIClient)
         self.subscriptionManager = SubscriptionManager(paths: paths, keychain: keychain, configManager: configManager)
         self.trafficUsageStore = TrafficUsageStore(paths: paths)
@@ -1894,7 +1904,11 @@ final class AppState: ObservableObject {
     }
 
     private func makeRuntimeOptions(tunEnabled: Bool, useLaunchDaemon: Bool) throws -> RuntimeOptions {
-        var options = RuntimeOptions(mixedPort: 7897, controllerPort: 9197, tunEnabled: tunEnabled)
+        var options = RuntimeOptions(
+            mixedPort: 7897,
+            controllerPort: useLaunchDaemon ? 9197 : Self.configuredControlPort,
+            tunEnabled: tunEnabled
+        )
         options.dnsStrategy = runtimeOptions.dnsStrategy
         options.dnsServer = runtimeOptions.dnsServer
         if useLaunchDaemon {
