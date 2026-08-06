@@ -8,7 +8,7 @@
 
 - Rust 全量串行验收 `cargo test --all --no-fail-fast -- --test-threads=1`：当前基线为 `573 passed / 0 failed / 4 ignored`；`RUST_TEST_THREADS=4 cargo test --lib` 并发 lib 回归也通过。ignored 项是需要外部服务、账号或系统 entitlement 的互操作测试（例如 MPTCP、官方 OpenVPN UDP、外部订阅兼容测试），不是失败。
 - Rust 严格检查 `cargo clippy --all-targets --all-features -- -D warnings`：通过。
-- Swift 全量测试：103 passed、0 failed；包含普通代理启动不加载未运行 TUN daemon 的授权边界回归。
+- Swift 全量测试：104 passed、0 failed；包含普通代理启动不加载未运行 TUN daemon、TUN 未就绪时不自动请求管理员授权的边界回归。
 - 真实订阅兼容性：已验证 provider-only Clash YAML，异步导入会解析 `proxy-providers` 并保存节点；用户此前提供的一个真实地址已通过直连下载、解析和临时 store 导入，且不保存到仓库。空响应会被拒绝，且不会覆盖已有缓存；另一个地址复核为 HTTP 200 但空 body，已明确归类为上游响应异常，不再误报为解析成功。
 - 新增性能基准：路由 1000 条规则/10000 次决策约 1.54s，10000 条 Fake-IP 映射约 7.24ms，1000 节点订阅解析约 6.26ms，1000 节点测速任务调度约 93.8us，10000 次 SOCKS5 framing 约 319.6us。基线记录在 `Supercore/docs/performance-baseline.md`。
 - 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，最近一次 300 秒真实进程稳定性测试已完成（10 次采样，基线 12800KB、峰值 13024KB、增长 224KB），默认使用隔离 mixed/control 端口且运行态强制核验 TUN disabled；正式 86400 秒门尚未执行。
@@ -18,7 +18,7 @@
 - 新增 `Scripts/cleanup_macos_test_residue.sh`，只匹配 `/tmp/skyhook-tun-matrix-trace.sh` 和 `/tmp/skyhook-supercore-matrix` 测试进程；清理使用 `sudo -n`，无缓存授权时返回 `77/SKIP`，不会弹出密码框或触碰其他 root 进程。
 - `dist/玥球电梯.dmg` 已重新生成并只读挂载验收：Finder 背景、Applications 链接、arm64 App、内嵌 Supercore、签名和核心 `--help` 均通过；DMG 构建依赖记录在 `Scripts/requirements-dmg.txt`。
 - TUN cleanup 的系统代理检测已修正为只识别启用中的 loopback 代理；当前机器 dry-run 显示无 198.18 路由、系统代理 clean，针对关闭开关但保留 127.0.0.1 配置的回归测试通过。
-- App 启动代理现在只有在启用 TUN 或复用已加载 daemon 时才使用 LaunchDaemon；已安装但未加载的权限服务不会被普通代理启动强行加载，也不会因此重复请求管理员授权。TUN 矩阵和 24 小时稳定性脚本的停止路径改为有界等待，SIGTERM 无效时会进入 SIGKILL，并避免无界 `wait` 挂住；稳定性脚本启动时还会强制核验 TUN runtime 为 `disabled`。DNS Fake-IP 的 TTL、过滤列表和模式在 runtime reload 时同步更新，策略变化会清理旧的正反向映射。
+- App 启动代理现在只复用已加载的 TUN daemon；已安装但未加载、或尚未安装权限服务时，普通代理启动会直接给出设置操作提示，不再自动执行 `ensureLoaded()` 反复请求管理员授权。TUN 矩阵和 24 小时稳定性脚本的停止路径改为有界等待，SIGTERM 无效时会进入 SIGKILL，并避免无界 `wait` 挂住；稳定性脚本启动时还会强制核验 TUN runtime 为 `disabled`。DNS Fake-IP 的 TTL、过滤列表和模式在 runtime reload 时同步更新，策略变化会清理旧的正反向映射。
 - DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`，并通过 `Scripts/dot_external_e2e.sh` 使用 `8.8.8.8:853` + `dns.google`、`9.9.9.9:853` + `dns.quad9.net` 完成两种真实 DoT 查询并返回 `NOERROR`。Cloudflare 的 `853` 端口在本机单独探测超时只属于该 resolver 的环境差异，不再阻塞 DoT 基础能力结论；其他第三方 DoT/DoH 变体仍未覆盖。
 - 全量测试默认高并发执行时曾出现一次 Hysteria 本地 QUIC 测试长时间等待；随后带 120 秒 watchdog 的默认 `cargo test --all --no-fail-fast`、`RUST_TEST_THREADS=4` 并发和串行验收均通过，当前未能复现，稳定性脚本保留 watchdog。
 - 最新 release App 已完成 Rust/Swift 构建、签名验证和启动退出冒烟验证，已包含本轮 Swift 订阅空响应保护。

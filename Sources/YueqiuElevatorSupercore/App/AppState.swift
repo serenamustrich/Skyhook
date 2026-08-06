@@ -186,6 +186,25 @@ final class AppState: ObservableObject {
         daemonInstalled && (tunEnabled || daemonLoaded)
     }
 
+    /// Return a user-facing error instead of silently requesting administrator
+    /// credentials during an ordinary proxy start. Installing or recovering a
+    /// privileged daemon must be an explicit settings action.
+    static func tunStartupRequirement(
+        tunEnabled: Bool,
+        daemonInstalled: Bool,
+        daemonLoaded: Bool,
+        processIsRoot: Bool
+    ) -> String? {
+        guard tunEnabled, !processIsRoot else { return nil }
+        if !daemonInstalled {
+            return "TUN 模式需要先在设置中安装 TUN 权限服务"
+        }
+        if !daemonLoaded {
+            return "TUN 权限服务已安装但未运行，请在设置中重新安装或启动权限服务"
+        }
+        return nil
+    }
+
     init(paths: AppPaths, keychain: KeychainStore) {
         self.paths = paths
         self.keychain = keychain
@@ -420,8 +439,13 @@ final class AppState: ObservableObject {
                     daemonLoaded: daemonStatus.loaded
                 )
                 daemonStartupRequested = shouldUseTunDaemon && tunEnabled
-                if tunEnabled && !daemonStatus.installed && getuid() != 0 {
-                    appendLog("Supercore TUN 需要先安装 LaunchDaemon 权限服务；当前从 App 启动将尝试普通用户模式")
+                if let requirement = Self.tunStartupRequirement(
+                    tunEnabled: tunEnabled,
+                    daemonInstalled: daemonStatus.installed,
+                    daemonLoaded: daemonStatus.loaded,
+                    processIsRoot: getuid() == 0
+                ) {
+                    throw AppError.processFailed(requirement)
                 }
                 let options = try makeRuntimeOptions(tunEnabled: tunEnabled, useLaunchDaemon: shouldUseTunDaemon)
                 runtimeOptions = options

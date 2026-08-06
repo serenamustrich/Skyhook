@@ -374,6 +374,43 @@ final class PlanBehaviorTests: XCTestCase {
         XCTAssertTrue(yaml.contains("enabled: false"), "TUN should be disabled by default")
     }
 
+    func testOrdinaryTunStartupDoesNotRequestAuthorization() {
+        XCTAssertEqual(
+            AppState.tunStartupRequirement(
+                tunEnabled: true,
+                daemonInstalled: false,
+                daemonLoaded: false,
+                processIsRoot: false
+            ),
+            "TUN 模式需要先在设置中安装 TUN 权限服务"
+        )
+        XCTAssertEqual(
+            AppState.tunStartupRequirement(
+                tunEnabled: true,
+                daemonInstalled: true,
+                daemonLoaded: false,
+                processIsRoot: false
+            ),
+            "TUN 权限服务已安装但未运行，请在设置中重新安装或启动权限服务"
+        )
+        XCTAssertNil(
+            AppState.tunStartupRequirement(
+                tunEnabled: true,
+                daemonInstalled: true,
+                daemonLoaded: true,
+                processIsRoot: false
+            )
+        )
+        XCTAssertNil(
+            AppState.tunStartupRequirement(
+                tunEnabled: true,
+                daemonInstalled: false,
+                daemonLoaded: false,
+                processIsRoot: true
+            )
+        )
+    }
+
     func testFakeIPDisabledByDefault() {
         let paths = AppPaths()
         try? paths.prepareDirectories()
