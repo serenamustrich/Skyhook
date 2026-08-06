@@ -257,7 +257,8 @@ start_core() {
   PID=$!
   for _ in {1..60}; do
     kill -0 "$PID" 2>/dev/null || { cat "$CORE_LOG" >&2; return 1; }
-    if curl --noproxy '*' --fail --silent --max-time 2 "${CONTROL_URL%/}/health" >/dev/null; then
+    if curl --noproxy '*' --fail --silent --max-time 2 "${CONTROL_URL%/}/health" >/dev/null &&
+      api_get /v1/tun >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.5
