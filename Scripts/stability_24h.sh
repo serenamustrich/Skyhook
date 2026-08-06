@@ -6,7 +6,9 @@ CORE="${SUPERCORE_BINARY:-${ROOT}/Supercore/target/release/supercore}"
 CONFIG="${SUPERCORE_STABILITY_CONFIG:-${ROOT}/Supercore/supercore.example.yaml}"
 DURATION_SECS="${1:-86400}"
 SAMPLE_SECS="${SUPERCORE_STABILITY_SAMPLE_SECS:-30}"
-CONTROL_URL="${SUPERCORE_STABILITY_CONTROL_URL:-http://127.0.0.1:9197}"
+CONTROL_PORT="${SUPERCORE_STABILITY_CONTROL_PORT:-19198}"
+MIXED_PORT="${SUPERCORE_STABILITY_MIXED_PORT:-17898}"
+CONTROL_URL="${SUPERCORE_STABILITY_CONTROL_URL:-http://127.0.0.1:${CONTROL_PORT}}"
 
 if ! [[ "${DURATION_SECS}" =~ ^[0-9]+$ ]] || (( DURATION_SECS < 1 )); then
   echo "duration must be a positive integer number of seconds" >&2
@@ -23,6 +25,7 @@ fi
 WORK_DIR="$(mktemp -d /tmp/skyhook-stability.XXXXXX)"
 LOG_FILE="${WORK_DIR}/supercore.log"
 METRICS_FILE="${WORK_DIR}/metrics.tsv"
+RUNTIME_CONFIG="${WORK_DIR}/supercore.yaml"
 PID=""
 BASE_RSS_KB=""
 MAX_RSS_KB=0
@@ -92,9 +95,44 @@ trap cleanup EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 
+prepare_isolated_config() {
+  python3 - "${CONFIG}" "${RUNTIME_CONFIG}" "${CONTROL_URL}" "${MIXED_PORT}" <<'PY'
+from pathlib import Path
+import re
+import sys
+from urllib.parse import urlparse
+
+source, target, control_url, mixed_port = sys.argv[1:]
+parsed = urlparse(control_url)
+if parsed.port is None:
+    raise SystemExit(f"control URL must include a port: {control_url}")
+
+lines = Path(source).read_text(encoding="utf-8").splitlines(keepends=True)
+output = []
+mixed_changed = False
+control_changed = False
+for line in lines:
+    if re.match(r"^\s+mixed_listen:\s*", line) and not mixed_changed:
+        indent = line[: len(line) - len(line.lstrip(" \t"))]
+        output.append(f"{indent}mixed_listen: 127.0.0.1:{mixed_port}\n")
+        mixed_changed = True
+    elif re.match(r"^\s+control_listen:\s*", line) and not control_changed:
+        indent = line[: len(line) - len(line.lstrip(" \t"))]
+        output.append(f"{indent}control_listen: 127.0.0.1:{parsed.port}\n")
+        control_changed = True
+    else:
+        output.append(line)
+if not mixed_changed or not control_changed:
+    raise SystemExit("config is missing core.mixed_listen or core.control_listen")
+Path(target).write_text("".join(output), encoding="utf-8")
+PY
+}
+
 cd "${WORK_DIR}"
+prepare_isolated_config
+"${CORE}" check -c "${RUNTIME_CONFIG}" >/dev/null
 printf 'sample\telapsed_s\trss_kb\tstatus_bytes\n' >"${METRICS_FILE}"
-"${CORE}" run -c "${CONFIG}" >"${LOG_FILE}" 2>&1 &
+"${CORE}" run -c "${RUNTIME_CONFIG}" >"${LOG_FILE}" 2>&1 &
 PID=$!
 
 ready=0

@@ -11,7 +11,7 @@
 - Swift 全量测试：103 passed、0 failed；包含普通代理启动不加载未运行 TUN daemon 的授权边界回归。
 - 真实订阅兼容性：已验证 provider-only Clash YAML，异步导入会解析 `proxy-providers` 并保存节点；用户此前提供的一个真实地址已通过直连下载、解析和临时 store 导入，且不保存到仓库。空响应会被拒绝，且不会覆盖已有缓存；另一个地址复核为 HTTP 200 但空 body，已明确归类为上游响应异常，不再误报为解析成功。
 - 新增性能基准：路由 1000 条规则/10000 次决策约 1.54s，10000 条 Fake-IP 映射约 7.24ms，1000 节点订阅解析约 6.26ms，1000 节点测速任务调度约 93.8us，10000 次 SOCKS5 framing 约 319.6us。基线记录在 `Supercore/docs/performance-baseline.md`。
-- 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 300 秒真实进程稳定性测试并记录 RSS（10 次采样，基线 12736KB、峰值 12736KB、增长 0KB），正式 86400 秒门尚未执行。
+- 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 300 秒真实进程稳定性测试并记录 RSS（10 次采样，基线 12736KB、峰值 12736KB、增长 0KB），并修正为默认隔离 mixed/control 端口；正式 86400 秒门尚未执行。
 - TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出；管理员 trace 已取得动态启停证据（新增 `utun6` 后关闭并恢复原接口集合），但正常退出/强杀清理段因旧 trace 进程等待卡住，完整管理员矩阵仍未宣称通过。
 - macOS 用户 LaunchAgent、root LaunchDaemon、手动 TUN 启动/卸载脚本已补齐并通过 `bash -n`、可执行权限和配置检查。
 - 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；矩阵默认改用隔离的 mixed/control 端口，并用本次 Token 认证，避免接入其他核心。普通权限预检按约定返回 `77/SKIP`。管理员 trace 已证明动态启停和 utun 清理，但完整正常退出/强杀矩阵仍待一次干净运行。
