@@ -11,7 +11,7 @@
 - Swift 全量测试：102 passed、0 failed；新增 TUN running/failed/disabled 状态等待回归。
 - 真实订阅兼容性：已验证 provider-only Clash YAML，异步导入会解析 `proxy-providers` 并保存节点；用户此前提供的一个真实地址已通过直连下载、解析和临时 store 导入，且不保存到仓库。空响应会被拒绝，且不会覆盖已有缓存；另一个地址复核为 HTTP 200 但空 body，已明确归类为上游响应异常，不再误报为解析成功。
 - 新增性能基准：路由 1000 条规则/10000 次决策约 1.54s，10000 条 Fake-IP 映射约 7.24ms，1000 节点订阅解析约 6.26ms，1000 节点测速任务调度约 93.8us，10000 次 SOCKS5 framing 约 319.6us。基线记录在 `Supercore/docs/performance-baseline.md`。
-- 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 60 秒真实进程冒烟并记录 RSS（本轮 4 次采样，基线 12832KB、峰值 12944KB、增长 112KB），正式 86400 秒门尚未执行。
+- 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 300 秒真实进程稳定性测试并记录 RSS（10 次采样，基线 12736KB、峰值 12736KB、增长 0KB），正式 86400 秒门尚未执行。
 - TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。当前无免密 sudo，普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出，无残留进程；真实管理员 TUN 矩阵仍未宣称通过。
 - macOS 用户 LaunchAgent、root LaunchDaemon、手动 TUN 启动/卸载脚本已补齐并通过 `bash -n`、可执行权限和配置检查。
 - 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；当前机器无免密 sudo，预检按约定返回 `77/SKIP`，未伪造管理员 TUN 通过。
@@ -109,7 +109,7 @@
 - `cargo clippy --all-targets --all-features -- -D warnings` 已通过。
 - 已有可重复的 Rust 性能基准套件，基线见 `Supercore/docs/performance-baseline.md`。
 - 最新 release App 已完成构建、签名验证和启动退出冒烟验证，构建日期为 2026-08-06。
-- 1000 并发直连流测试通过；稳定性脚本本轮完成 60 秒真实进程冒烟（4 次健康采样并记录 RSS），正式 86400 秒门仍未执行。
+- 1000 并发直连流测试通过；稳定性脚本本轮完成 300 秒真实进程稳定性测试（10 次健康采样并记录 RSS），正式 86400 秒门仍未执行。
 - DMG 只读挂载验收通过，DMG 文件为 `dist/玥球电梯.dmg`。
 - 从 DMG 挂载副本复制到临时安装目录后，签名验证、实际启动和干净退出均通过。
 - `Scripts/build_dmg.sh` 已支持显式 `NOTARIZE=1` 的 Developer ID notarization、staple
