@@ -14,7 +14,7 @@
 - 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 300 秒真实进程稳定性测试并记录 RSS（10 次采样，基线 12736KB、峰值 12736KB、增长 0KB），正式 86400 秒门尚未执行。
 - TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出；管理员 trace 已取得动态启停证据（新增 `utun6` 后关闭并恢复原接口集合），但正常退出/强杀清理段因旧 trace 进程等待卡住，完整管理员矩阵仍未宣称通过。
 - macOS 用户 LaunchAgent、root LaunchDaemon、手动 TUN 启动/卸载脚本已补齐并通过 `bash -n`、可执行权限和配置检查。
-- 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；普通权限预检按约定返回 `77/SKIP`。管理员 trace 已证明动态启停和 utun 清理，但完整正常退出/强杀矩阵仍待一次干净运行。
+- 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；矩阵默认改用隔离的 mixed/control 端口，并用本次 Token 认证，避免接入其他核心。普通权限预检按约定返回 `77/SKIP`。管理员 trace 已证明动态启停和 utun 清理，但完整正常退出/强杀矩阵仍待一次干净运行。
 - `dist/玥球电梯.dmg` 已重新生成并只读挂载验收：Finder 背景、Applications 链接、arm64 App、内嵌 Supercore、签名和核心 `--help` 均通过；DMG 构建依赖记录在 `Scripts/requirements-dmg.txt`。
 - TUN cleanup 的系统代理检测已修正为只识别启用中的 loopback 代理；当前机器 dry-run 显示无 198.18 路由、系统代理 clean，针对关闭开关但保留 127.0.0.1 配置的回归测试通过。
 - DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`，并通过 `Scripts/dot_external_e2e.sh` 使用 `8.8.8.8:853` + `dns.google`、`9.9.9.9:853` + `dns.quad9.net` 完成两种真实 DoT 查询并返回 `NOERROR`。Cloudflare 的 `853` 端口在本机单独探测超时只属于该 resolver 的环境差异，不再阻塞 DoT 基础能力结论；其他第三方 DoT/DoH 变体仍未覆盖。

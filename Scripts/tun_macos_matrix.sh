@@ -6,7 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE="${SUPERCORE_BINARY:-${ROOT}/Supercore/target/release/supercore}"
 CONFIG="${SUPERCORE_TUN_MATRIX_CONFIG:-${ROOT}/Supercore/supercore.example.yaml}"
-CONTROL_URL="${SUPERCORE_TUN_MATRIX_CONTROL_URL:-http://127.0.0.1:9197}"
+CONTROL_PORT="${SUPERCORE_TUN_MATRIX_CONTROL_PORT:-19197}"
+CONTROL_URL="${SUPERCORE_TUN_MATRIX_CONTROL_URL:-http://127.0.0.1:${CONTROL_PORT}}"
+MIXED_PORT="${SUPERCORE_TUN_MATRIX_MIXED_PORT:-17897}"
 TOKEN="${SKYHOOK_CONTROL_TOKEN:-}"
 WITH_TUN=0
 ROOT_MODE=0
@@ -31,7 +33,8 @@ Options:
   --allow-route-changes allow a config whose TUN setup/auto-route is enabled
   --core <path>         release Supercore binary
   --config <path>       config with a disabled TUN section
-  --control-url <url>   control API base URL (default: http://127.0.0.1:9197)
+  --control-url <url>   control API base URL (default: http://127.0.0.1:19197)
+  --mixed-port <port>   isolated local mixed port (default: 17897)
   --token <token>       control token; otherwise a random test token is used
   --keep-artifacts      retain snapshots and core log under /tmp
   -h, --help            show this help
@@ -52,6 +55,7 @@ while [[ $# -gt 0 ]]; do
     --core) CORE="$2"; shift 2 ;;
     --config) CONFIG="$2"; shift 2 ;;
     --control-url) CONTROL_URL="$2"; shift 2 ;;
+    --mixed-port) MIXED_PORT="$2"; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
     --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -269,6 +273,42 @@ start_core() {
 
 toggle_tun "$CONFIG" "$DISABLED_CONFIG" false
 toggle_tun "$CONFIG" "$ENABLED_CONFIG" true
+
+isolate_ports() {
+  local path="$1"
+  python3 - "$path" "$CONTROL_URL" "$MIXED_PORT" <<'PY'
+from pathlib import Path
+import sys
+from urllib.parse import urlparse
+
+path, control_url, mixed_port = sys.argv[1:]
+parsed = urlparse(control_url)
+control_port = parsed.port
+if control_port is None:
+    raise SystemExit(f"control URL must include a port: {control_url}")
+lines = Path(path).read_text(encoding="utf-8").splitlines(keepends=True)
+output = []
+mixed_changed = False
+control_changed = False
+for line in lines:
+    if line.lstrip().startswith("mixed_listen:"):
+        indent = line[: len(line) - len(line.lstrip())]
+        output.append(f"{indent}mixed_listen: 127.0.0.1:{mixed_port}\n")
+        mixed_changed = True
+    elif line.lstrip().startswith("control_listen:"):
+        indent = line[: len(line) - len(line.lstrip())]
+        output.append(f"{indent}control_listen: 127.0.0.1:{control_port}\n")
+        control_changed = True
+    else:
+        output.append(line)
+if not mixed_changed or not control_changed:
+    raise SystemExit("config is missing mixed_listen or control_listen")
+Path(path).write_text("".join(output), encoding="utf-8")
+PY
+}
+
+isolate_ports "$DISABLED_CONFIG"
+isolate_ports "$ENABLED_CONFIG"
 "$CORE" check -c "$DISABLED_CONFIG" >/dev/null
 "$CORE" check -c "$ENABLED_CONFIG" >/dev/null
 
