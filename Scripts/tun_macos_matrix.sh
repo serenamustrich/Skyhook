@@ -195,18 +195,38 @@ terminate_process_tree() {
   kill "-${signal}" "$pid" 2>/dev/null || true
 }
 
+process_state() {
+  ps -o state= -p "$1" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+wait_for_process_exit() {
+  local pid="$1" tenths="$2" state
+  for ((i = 0; i < tenths; i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    state="$(process_state "$pid")"
+    [[ "$state" == Z* ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 stop_core() {
   local pid="$1" signal="${2:-TERM}"
+  kill -0 "$pid" 2>/dev/null || return 0
   if [[ "$signal" == "KILL" ]]; then
     terminate_process_tree "$pid" KILL
+    if ! wait_for_process_exit "$pid" 30; then
+      echo "ERROR: core pid ${pid} did not exit after SIGKILL" >&2
+      return 1
+    fi
   else
     terminate_process_tree "$pid" TERM
-    for _ in {1..40}; do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    if kill -0 "$pid" 2>/dev/null; then
+    if ! wait_for_process_exit "$pid" 40; then
       terminate_process_tree "$pid" KILL
+      if ! wait_for_process_exit "$pid" 30; then
+        echo "ERROR: core pid ${pid} did not exit after SIGTERM/SIGKILL" >&2
+        return 1
+      fi
     fi
   fi
   wait "$pid" 2>/dev/null || true

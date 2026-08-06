@@ -182,6 +182,10 @@ final class AppState: ObservableObject {
         return port
     }
 
+    static func shouldUseTunLaunchDaemon(tunEnabled: Bool, daemonInstalled: Bool, daemonLoaded: Bool) -> Bool {
+        daemonInstalled && (tunEnabled || daemonLoaded)
+    }
+
     init(paths: AppPaths, keychain: KeychainStore) {
         self.paths = paths
         self.keychain = keychain
@@ -410,7 +414,11 @@ final class AppState: ObservableObject {
                 }
                 let daemonStatus = tunLaunchDaemonManager.status()
                 tunLaunchDaemonStatus = daemonStatus
-                let shouldUseTunDaemon = daemonStatus.installed
+                let shouldUseTunDaemon = Self.shouldUseTunLaunchDaemon(
+                    tunEnabled: tunEnabled,
+                    daemonInstalled: daemonStatus.installed,
+                    daemonLoaded: daemonStatus.loaded
+                )
                 daemonStartupRequested = shouldUseTunDaemon && tunEnabled
                 if tunEnabled && !daemonStatus.installed && getuid() != 0 {
                     appendLog("Supercore TUN 需要先安装 LaunchDaemon 权限服务；当前从 App 启动将尝试普通用户模式")

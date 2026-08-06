@@ -12,8 +12,8 @@
 - 保存多个订阅、订阅 URL、套餐流量和到期信息。
 - 按订阅保存原始订阅、Supercore runtime、节点选择、智能规则和累计流量。
 - 从 App 启动、停止 Supercore。
-- App 只接入本地受管理的 Supercore 进程或已加载的 TUN LaunchDaemon，不会因为端口相同而接入无关核心。
-- TUN 生命周期测试会记录虚拟网卡、路由、DNS 和系统代理快照，并用本次测试 Token 确认控制的是自己的核心；矩阵默认使用隔离的 mixed/control 端口，动态启停已验证，完整管理员矩阵仍需显式授权后执行，核心停止会在超时后强制清理。
+- App 只接入本地受管理的 Supercore 进程或已加载的 TUN LaunchDaemon，不会因为端口相同而接入无关核心；已安装但未加载的权限服务不会被普通代理启动强行加载。
+- TUN 生命周期测试会记录虚拟网卡、路由、DNS 和系统代理快照，并用本次测试 Token 确认控制的是自己的核心；矩阵默认使用隔离的 mixed/control 端口，动态启停已验证，完整管理员矩阵仍需显式授权后执行，核心停止会使用有界等待并在超时后强制清理。
 - 通过独立 `/v1/*` 控制接口读取代理组、国家分组、节点延迟、日志、流量和智能规则建议。
 - 节点、代理组、订阅、规则、日志和任务等列表支持统一的筛选、排序与游标分页。
 - 选择具体节点、代理组择优、国家自动择优。
@@ -92,7 +92,7 @@ App 数据位置：
 
 ## TUN
 
-TUN 模式需要 root/LaunchDaemon 才能完整接管 macOS 路由和 DNS。普通 App 启动可用于 mixed 代理、订阅、测速和界面调试；需要长期免输密码运行 TUN 时，使用 `Supercore/scripts/install_macos_launch_daemon.sh` 走 Supercore 的 LaunchDaemon 路径。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权，应用启动和普通测速不会触发该授权。
+TUN 模式需要 root/LaunchDaemon 才能完整接管 macOS 路由和 DNS。普通 App 启动可用于 mixed 代理、订阅、测速和界面调试；需要长期免输密码运行 TUN 时，使用 `Supercore/scripts/install_macos_launch_daemon.sh` 走 Supercore 的 LaunchDaemon 路径。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权，应用启动和普通测速不会触发该授权。只有启用 TUN 或复用已运行的 daemon 时，App 才会接入权限服务。
 
 `Supercore` 是本项目原生核心，不会自动拉取第三方核心更新。
 正式运行默认使用本机 9197 控制端口；隔离测试可通过 `SKYHOOK_TEST_CONTROL_PORT` 指定测试端口，不会改变正式 App 的默认配置。

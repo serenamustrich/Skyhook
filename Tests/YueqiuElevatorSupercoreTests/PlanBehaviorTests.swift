@@ -22,6 +22,25 @@ final class PlanBehaviorTests: XCTestCase {
         XCTAssertEqual(state.runtimeOptions.dnsStrategy, .direct)
     }
 
+    func testOrdinaryProxyStartupDoesNotBootstrapAnUnloadedTunDaemon() {
+        XCTAssertFalse(
+            AppState.shouldUseTunLaunchDaemon(tunEnabled: false, daemonInstalled: true, daemonLoaded: false),
+            "已安装但未加载的 TUN daemon 不应让普通代理启动触发管理员授权"
+        )
+        XCTAssertTrue(
+            AppState.shouldUseTunLaunchDaemon(tunEnabled: true, daemonInstalled: true, daemonLoaded: false),
+            "用户启用 TUN 时应使用已安装的 LaunchDaemon"
+        )
+        XCTAssertTrue(
+            AppState.shouldUseTunLaunchDaemon(tunEnabled: false, daemonInstalled: true, daemonLoaded: true),
+            "已经运行的 daemon 应继续复用，避免启动时重新授权"
+        )
+        XCTAssertFalse(
+            AppState.shouldUseTunLaunchDaemon(tunEnabled: true, daemonInstalled: false, daemonLoaded: false),
+            "没有安装权限服务时不能伪装成 daemon 模式"
+        )
+    }
+
     // MARK: - §1.3 Network Recovery Detection
 
     func testNetworkRecoveryDetection() async {
