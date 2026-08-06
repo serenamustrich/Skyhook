@@ -204,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
             tasks.spawn(inbound::mixed::serve(runtime.clone()));
 
             let outcome = tokio::select! {
-                signal = tokio::signal::ctrl_c() => signal.map_err(anyhow::Error::from),
+                signal = wait_for_shutdown_signal() => signal,
                 result = tasks.join_next() => match result {
                     Some(Ok(result)) => result,
                     Some(Err(error)) => Err(anyhow::Error::from(error)),
@@ -436,6 +436,24 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = interrupt.recv() => Ok(()),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map_err(anyhow::Error::from)
+    }
 }
 
 /// Keep the TUN task aligned with runtime config reloads.

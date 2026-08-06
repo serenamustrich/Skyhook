@@ -62,6 +62,7 @@
 - DNS outbound 支持 UDP/TCP/DoT/DoH raw DNS 查询，Rematch 支持规则重新匹配、命名上下文、
   循环检测与最大深度保护；外部 DoT 验证脚本使用可隔离的本地监听端口，不依赖默认混合端口。
 - Runtime 重载 DNS 配置时会同步应用 Fake-IP 的 TTL、过滤列表和模式，并清理旧的正反向映射，避免旧策略继续生效；普通代理启动不会加载未运行的 TUN 权限服务。
+- Supercore 对 macOS LaunchDaemon 和终端发送的 `SIGTERM`/`SIGINT` 统一进入优雅退出流程，先停止 TUN 子任务和后台任务，再退出主进程。
 - 节点测速、订阅导入/更新、Provider 更新、Geo 更新、Doctor 和诊断导出使用可取消异步任务。
 - 订阅与 Provider 下载默认使用直连通道，失败时保留已有本地缓存。
 - 支持自定义域名/IP 规则，并让这些规则优先于订阅规则。
