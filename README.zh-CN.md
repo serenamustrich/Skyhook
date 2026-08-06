@@ -35,7 +35,7 @@
   `_udp2` UDP 帧，并有本地 H2/H3 TCP 及 H3 `_udp2` 双向拨号回环验证。
 - Tailscale 使用独立 Rust userspace，支持持久化 identity/control state、auth key、hostname、tags、TCP 和 UDP，不调用系统 Tailscale 进程、不修改主机路由。
 - DNS outbound 支持 raw DNS 的 UDP、TCP、DoT 和 DoH；Rematch 支持带命名上下文的规则重新匹配、循环检测和最大深度保护。外部 DoT 验证脚本支持隔离本地监听端口，不依赖默认混合端口。
-- Runtime 重载 DNS 配置会同步应用 Fake-IP 的 TTL、过滤列表和模式，并清理旧的正反向映射，避免旧策略继续生效。
+- Runtime 重载 DNS 配置会同步应用 Fake-IP 的 TTL、过滤列表和模式，并清理旧的正反向映射，避免旧策略继续生效；普通代理启动不会加载未运行的 TUN 权限服务。
 - HTTP 代理支持 HTTP/HTTPS CONNECT、Basic Auth、SNI、证书校验、IPv4/IPv6 目标、非 2xx 错误分类和握手后预读数据保留；HTTP CONNECT 原生仅承载 TCP。
 - SOCKS5 支持无认证与用户名密码认证、域名/IPv4/IPv6 TCP CONNECT、UDP ASSOCIATE、响应来源校验和有界会话池复用。
 - SSH 支持固定主机公钥或 SHA-256 指纹、主机密钥算法约束、密码/内联或文件私钥认证、keepalive、并发 direct-tcpip 通道共享物理会话和断线自动重连；SSH 没有标准 UDP relay。
