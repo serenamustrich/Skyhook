@@ -21,6 +21,7 @@
 - DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`，并通过 `Scripts/dot_external_e2e.sh` 使用 `8.8.8.8:853` + `dns.google`、`9.9.9.9:853` + `dns.quad9.net` 完成两种真实 DoT 查询并返回 `NOERROR`。Cloudflare 的 `853` 端口在本机单独探测超时只属于该 resolver 的环境差异，不再阻塞 DoT 基础能力结论；其他第三方 DoT/DoH 变体仍未覆盖。
 - 全量测试默认高并发执行时曾出现一次 Hysteria 本地 QUIC 测试长时间等待；随后带 120 秒 watchdog 的默认 `cargo test --all --no-fail-fast`、`RUST_TEST_THREADS=4` 并发和串行验收均通过，当前未能复现，稳定性脚本保留 watchdog。
 - 最新 release App 已完成 Rust/Swift 构建、签名验证和启动退出冒烟验证，已包含本轮 Swift 订阅空响应保护。
+- API 模块化当前状态已核验：鉴权、错误、schema、SSE、测速、订阅、Provider、系统、规则和 telemetry handler 均位于 `Supercore/src/api/` 的独立模块，`api/mod.rs` 生产部分只负责状态组装和 router 启动；历史 M1 拆分遗留已清零。
 - 尚未被本机环境完全覆盖的门：真实管理员 macOS TUN/LaunchDaemon 网络矩阵、MPTCP entitlement、官方 OpenVPN UDP、需要外部账号的 Tailscale、TrustTunnel H3 外部服务端，以及其他第三方 DoT/DoH 服务端变体；TrustTunnel H3 已补充本地 QUIC/H3 服务端双向回环，DoH 公共 resolver 与 DoT `8.8.8.8:853` 已有 Supercore listener 实际验证。
 
 ## 历史阶段记录（截至2026-07-17）
@@ -67,9 +68,8 @@
 - 诊断导出默认脱敏，文件权限为 `0600` 且有界保留；控制服务退出会取消所有活跃
   task。M0 最终回归：Rust lib 92 passed、订阅 13 passed、Geo 3 passed、Swift full
   97 passed，全部 0 failed，因此 M0 状态为 `VERIFIED`。
-- M1 API 模块化第一批已完成：鉴权、错误、schema、SSE、路由表和测速 handler 已从
-  `api/mod.rs` 拆到独立模块；Rust lib 92 passed、0 failed。订阅、Provider、系统、
-  规则和 telemetry handler 仍待迁移，因此 M1 保持 `IN_PROGRESS`。
+- 当时 M1 API 模块化第一批已完成，但订阅、Provider、系统、规则和 telemetry handler
+  仍待迁移；该历史遗留已在后续工作中完成，当前状态见本节“当前执行进度”。
 
 ## 0. 开发总原则
 
