@@ -12,9 +12,9 @@
 - 真实订阅兼容性：已验证 provider-only Clash YAML，异步导入会解析 `proxy-providers` 并保存节点；用户此前提供的一个真实地址已通过直连下载、解析和临时 store 导入，且不保存到仓库。空响应会被拒绝，且不会覆盖已有缓存；另一个地址复核为 HTTP 200 但空 body，已明确归类为上游响应异常，不再误报为解析成功。
 - 新增性能基准：路由 1000 条规则/10000 次决策约 1.54s，10000 条 Fake-IP 映射约 7.24ms，1000 节点订阅解析约 6.26ms，1000 节点测速任务调度约 93.8us，10000 次 SOCKS5 framing 约 319.6us。基线记录在 `Supercore/docs/performance-baseline.md`。
 - 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 300 秒真实进程稳定性测试并记录 RSS（10 次采样，基线 12736KB、峰值 12736KB、增长 0KB），正式 86400 秒门尚未执行。
-- TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。当前无免密 sudo，普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出，无残留进程；真实管理员 TUN 矩阵仍未宣称通过。
+- TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出；管理员 trace 已取得动态启停证据（新增 `utun6` 后关闭并恢复原接口集合），但正常退出/强杀清理段因旧 trace 进程等待卡住，完整管理员矩阵仍未宣称通过。
 - macOS 用户 LaunchAgent、root LaunchDaemon、手动 TUN 启动/卸载脚本已补齐并通过 `bash -n`、可执行权限和配置检查。
-- 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；当前机器无免密 sudo，预检按约定返回 `77/SKIP`，未伪造管理员 TUN 通过。
+- 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；普通权限预检按约定返回 `77/SKIP`。管理员 trace 已证明动态启停和 utun 清理，但完整正常退出/强杀矩阵仍待一次干净运行。
 - `dist/玥球电梯.dmg` 已重新生成并只读挂载验收：Finder 背景、Applications 链接、arm64 App、内嵌 Supercore、签名和核心 `--help` 均通过；DMG 构建依赖记录在 `Scripts/requirements-dmg.txt`。
 - TUN cleanup 的系统代理检测已修正为只识别启用中的 loopback 代理；当前机器 dry-run 显示无 198.18 路由、系统代理 clean，针对关闭开关但保留 127.0.0.1 配置的回归测试通过。
 - DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`，并通过 `Scripts/dot_external_e2e.sh` 使用 `8.8.8.8:853` + `dns.google` 完成真实 DoT 查询并返回 `NOERROR`。Cloudflare 的 `853` 端口在本机单独探测超时只属于该 resolver 的环境差异，不再阻塞 DoT 基础能力结论；其他第三方 DoT 变体仍未覆盖。
@@ -1029,8 +1029,9 @@ swift build -c release
 协议、订阅、规则、流量、日志、性能基线、App UI 和 DMG 已进入当前工作区；后续
 不得重新执行已经有证据的历史开发步骤。剩余验收严格按下面顺序收口：
 
-1. 在有管理员授权的 macOS 上执行 `Scripts/tun_macos_matrix.sh --with-tun --root`，
-   保存动态启停、正常退出和强杀清理证据。
+1. 在有管理员授权的 macOS 上重新执行 `Scripts/tun_macos_matrix.sh --with-tun --root`，
+   保存动态启停、正常退出和强杀清理证据；当前已有动态启停/utun 恢复证据，不能替代
+   后两项。
 2. 在 Wi-Fi、有线、DHCP 变化、休眠唤醒、第三方 VPN、IPv6-only/双栈环境补齐
    TUN 网络矩阵，并确认 App 的网络恢复状态与系统实际状态一致。
 3. 为 MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale 和 TrustTunnel H3 提供
