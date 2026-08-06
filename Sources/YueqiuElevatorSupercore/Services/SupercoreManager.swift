@@ -184,8 +184,12 @@ final class SupercoreManager: @unchecked Sendable {
         apiClient.setControlToken(nil)
     }
 
-    func detectRunningVersion() async -> String? {
-        try? await apiClient.getVersion(timeoutInterval: 0.6).version
+    func detectRunningVersion(allowExternalProcess: Bool = false) async -> String? {
+        // Do not attach to an unrelated process that happens to expose the same port.
+        // A loaded LaunchDaemon is the explicit exception because its binary path is
+        // intentionally managed outside the per-user application directory.
+        guard allowExternalProcess || !ownedCoreProcessIDs().isEmpty else { return nil }
+        return try? await apiClient.getVersion(timeoutInterval: 0.6).version
     }
 
     private func ensureCoreExecutable() throws {

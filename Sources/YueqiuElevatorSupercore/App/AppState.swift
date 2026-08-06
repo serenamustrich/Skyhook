@@ -2202,8 +2202,10 @@ final class AppState: ObservableObject {
 
     private func attachExistingCoreIfNeeded() async {
         guard case .notPrepared = coreState else { return }
-        guard let version = await supercoreManager.detectRunningVersion() else { return }
         refreshTunLaunchDaemonStatus()
+        guard let version = await supercoreManager.detectRunningVersion(
+            allowExternalProcess: tunLaunchDaemonStatus.loaded
+        ) else { return }
         usingTunLaunchDaemon = tunLaunchDaemonStatus.loaded
         coreState = .running(version: version)
         runtimePurpose = .attached
