@@ -42,7 +42,7 @@
 - `faketcp` 依赖平台级 packet backend，在 macOS 上由相关协议明确拒绝，不静默退化为 TCP。
 - 订阅能力：支持多订阅导入、切换、更新、缓存、生命周期计量。
 - 规则能力：支持主要规则目标与 RULE-SET 规则源。
-- 启动行为：启动/运行 `Supercore`，支持 TUN 与本地 DNS 策略（含 Virtual/Direct/over-tcp）；App 只复用已经加载的 TUN 权限服务，TUN 已开启但服务未安装或未加载时会提示从设置执行显式安装/启动，不会让普通代理启动反复触发管理员授权。
+- 启动行为：启动/运行 `Supercore`，支持 TUN 与本地 DNS 策略（含 Virtual/Direct/over-tcp）；App 只复用已经加载的 TUN 权限服务，TUN 已开启但服务未安装或未加载时会提示从设置执行显式安装/启动，不会让普通代理启动、节点测速或订阅操作反复触发管理员授权。
 - App 只接入本地受管理的 Supercore 进程或已加载的 TUN LaunchDaemon，不会因为端口相同而接入无关核心。
 - 控制面按鉴权、错误、schema、SSE、测速、订阅、Provider、系统、规则和 telemetry 模块组织，接口只监听 loopback。
 - TUN 生命周期测试会记录虚拟网卡、路由、DNS 和系统代理快照，并用本次测试 Token 确认控制的是自己的核心；矩阵默认使用隔离的 mixed/control 端口，动态启停已验证，完整管理员矩阵仍需显式授权后执行，核心停止会使用有界等待并在超时后强制清理，正常信号退出不会制造误导性的 shell 噪声。

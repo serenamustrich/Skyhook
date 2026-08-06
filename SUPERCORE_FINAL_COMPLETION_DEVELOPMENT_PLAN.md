@@ -6,7 +6,7 @@
 
 ## 当前执行进度（2026-08-06）
 
-- Rust 全量串行验收 `cargo test --all --no-fail-fast -- --test-threads=1`：当前基线为 `573 passed / 0 failed / 4 ignored`；`RUST_TEST_THREADS=4 cargo test --lib` 并发 lib 回归也通过。ignored 项是需要外部服务、账号或系统 entitlement 的互操作测试（例如 MPTCP、官方 OpenVPN UDP、外部订阅兼容测试），不是失败。
+- Rust 全量串行验收 `cargo test --all --no-fail-fast -- --test-threads=1`：当前基线为 `575 passed / 0 failed / 4 ignored`；`RUST_TEST_THREADS=4 cargo test --lib` 并发 lib 回归也通过。ignored 项是需要外部服务、账号或系统 entitlement 的互操作测试（例如 MPTCP、官方 OpenVPN UDP、外部订阅兼容测试），不是失败。
 - Rust 严格检查 `cargo clippy --all-targets --all-features -- -D warnings`：通过。
 - Swift 全量测试：104 passed、0 failed；包含普通代理启动不加载未运行 TUN daemon、TUN 未就绪时不自动请求管理员授权的边界回归。
 - 真实订阅兼容性：已验证 provider-only Clash YAML，异步导入会解析 `proxy-providers` 并保存节点；用户此前提供的一个真实地址已通过直连下载、解析和临时 store 导入，且不保存到仓库。空响应会被拒绝，且不会覆盖已有缓存；另一个地址复核为 HTTP 200 但空 body，已明确归类为上游响应异常，不再误报为解析成功。
@@ -106,8 +106,8 @@
 
 ### 1.2 最近一次验证结果
 
-- Rust 全量串行测试 23 个测试套件合计 `573 passed / 0 failed / 4 ignored`；并发 lib 回归通过。
-- Swift 全量验证 103 个通过。
+- Rust 全量串行测试 23 个测试套件合计 `575 passed / 0 failed / 4 ignored`；并发 lib 回归通过。
+- Swift 全量验证 104 个通过。
 - `cargo clippy --all-targets --all-features -- -D warnings` 已通过。
 - 已有可重复的 Rust 性能基准套件，基线见 `Supercore/docs/performance-baseline.md`。
 - 最新 release App 已完成构建、签名验证和启动退出冒烟验证，构建日期为 2026-08-06。
