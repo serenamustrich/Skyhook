@@ -78,6 +78,8 @@ Supercore 安装位置：
 ~/Library/Application Support/YueqiuElevator/cores/supercore
 ```
 
+稳定性脚本和 TUN 矩阵在正常退出或中断时都会清理自己启动的 Supercore 子进程；它们不会修改用户订阅数据。
+
 App 数据位置：
 
 ```text

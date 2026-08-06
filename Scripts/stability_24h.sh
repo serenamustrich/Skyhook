@@ -26,16 +26,35 @@ METRICS_FILE="${WORK_DIR}/metrics.tsv"
 PID=""
 BASE_RSS_KB=""
 MAX_RSS_KB=0
+CLEANUP_DONE=0
+
+terminate_process_tree() {
+  local pid="$1" signal="$2" child
+  while read -r child; do
+    [[ -n "$child" ]] || continue
+    terminate_process_tree "$child" "$signal"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  kill "-${signal}" "$pid" 2>/dev/null || true
+}
 
 cleanup() {
+  if (( CLEANUP_DONE == 1 )); then
+    return
+  fi
+  CLEANUP_DONE=1
+  trap - EXIT INT TERM
   if [[ -n "${PID}" ]] && kill -0 "${PID}" 2>/dev/null; then
-    kill -TERM "${PID}" 2>/dev/null || true
+    terminate_process_tree "${PID}" TERM
     for _ in {1..20}; do
       kill -0 "${PID}" 2>/dev/null || break
       sleep 0.1
-    done
-    kill -KILL "${PID}" 2>/dev/null || true
+      done
+    if kill -0 "${PID}" 2>/dev/null; then
+      terminate_process_tree "${PID}" KILL
+    fi
+    wait "${PID}" 2>/dev/null || true
   fi
+  PID=""
   if [[ "${KEEP_STABILITY_LOG:-0}" != "1" ]]; then
     find "${WORK_DIR}" -type f -delete 2>/dev/null || true
     rmdir "${WORK_DIR}" 2>/dev/null || true
@@ -43,7 +62,14 @@ cleanup() {
     echo "stability log: ${LOG_FILE}"
   fi
 }
-trap cleanup EXIT INT TERM
+on_signal() {
+  local exit_code="$1"
+  cleanup
+  exit "$exit_code"
+}
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 cd "${WORK_DIR}"
 printf 'sample\telapsed_s\trss_kb\tstatus_bytes\n' >"${METRICS_FILE}"
