@@ -48,7 +48,7 @@
 - Probe 接口：支持按全部节点、按组进行可配置延迟探测。
 - 智能规则：支持观察数据采集、推荐写回与规则持久化。
 
-TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未实现的高级 TUN 字段会明确返回错误，不会静默假装生效。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权；应用启动和普通测速不会触发该授权。
+TUN 后端当前实际支持范围见 `Supercore/docs/tun-capabilities.md`。未实现的高级 TUN 字段会明确返回错误，不会静默假装生效。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权；应用启动和普通测速不会触发该授权。旧的临时 TUN 测试残留可用 `Scripts/cleanup_macos_test_residue.sh` 清理；该命令使用 `sudo -n`，没有缓存授权时只跳过，不弹密码框。
 
 正式运行默认使用本机 9197 控制端口；隔离测试可通过 `SKYHOOK_TEST_CONTROL_PORT` 指定测试端口，不会改变正式 App 的默认配置。
 

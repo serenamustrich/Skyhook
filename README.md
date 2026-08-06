@@ -93,7 +93,7 @@ App 数据位置：
 
 ## TUN
 
-TUN 模式需要 root/LaunchDaemon 才能完整接管 macOS 路由和 DNS。普通 App 启动可用于 mixed 代理、订阅、测速和界面调试；需要长期免输密码运行 TUN 时，使用 `Supercore/scripts/install_macos_launch_daemon.sh` 走 Supercore 的 LaunchDaemon 路径。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权，应用启动和普通测速不会触发该授权。只有启用 TUN 或复用已运行的 daemon 时，App 才会接入权限服务。
+TUN 模式需要 root/LaunchDaemon 才能完整接管 macOS 路由和 DNS。普通 App 启动可用于 mixed 代理、订阅、测速和界面调试；需要长期免输密码运行 TUN 时，使用 `Supercore/scripts/install_macos_launch_daemon.sh` 走 Supercore 的 LaunchDaemon 路径。真实 TUN 生命周期矩阵是单独的运维测试，只有显式执行 `Scripts/tun_macos_matrix.sh --with-tun --root` 才需要管理员授权，应用启动和普通测速不会触发该授权。只有启用 TUN 或复用已运行的 daemon 时，App 才会接入权限服务。旧的临时 TUN 测试残留可用 `Scripts/cleanup_macos_test_residue.sh` 清理；该命令使用 `sudo -n`，没有缓存授权时只跳过，不弹密码框。
 
 `Supercore` 是本项目原生核心，不会自动拉取第三方核心更新。
 正式运行默认使用本机 9197 控制端口；隔离测试可通过 `SKYHOOK_TEST_CONTROL_PORT` 指定测试端口，不会改变正式 App 的默认配置。

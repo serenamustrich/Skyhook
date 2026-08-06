@@ -15,6 +15,7 @@
 - TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出；管理员 trace 已取得动态启停证据（新增 `utun6` 后关闭并恢复原接口集合），但正常退出/强杀清理段因旧 trace 进程等待卡住，完整管理员矩阵仍未宣称通过。
 - macOS 用户 LaunchAgent、root LaunchDaemon、手动 TUN 启动/卸载脚本已补齐并通过 `bash -n`、可执行权限和配置检查。
 - 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；矩阵默认改用隔离的 mixed/control 端口，并用本次 Token 认证，避免接入其他核心。普通权限预检按约定返回 `77/SKIP`。管理员 trace 已证明动态启停和 utun 清理，但完整正常退出/强杀矩阵仍待一次干净运行。
+- 新增 `Scripts/cleanup_macos_test_residue.sh`，只匹配 `/tmp/skyhook-tun-matrix-trace.sh` 和 `/tmp/skyhook-supercore-matrix` 测试进程；清理使用 `sudo -n`，无缓存授权时返回 `77/SKIP`，不会弹出密码框或触碰其他 root 进程。
 - `dist/玥球电梯.dmg` 已重新生成并只读挂载验收：Finder 背景、Applications 链接、arm64 App、内嵌 Supercore、签名和核心 `--help` 均通过；DMG 构建依赖记录在 `Scripts/requirements-dmg.txt`。
 - TUN cleanup 的系统代理检测已修正为只识别启用中的 loopback 代理；当前机器 dry-run 显示无 198.18 路由、系统代理 clean，针对关闭开关但保留 127.0.0.1 配置的回归测试通过。
 - App 启动代理现在只有在启用 TUN 或复用已加载 daemon 时才使用 LaunchDaemon；已安装但未加载的权限服务不会被普通代理启动强行加载，也不会因此重复请求管理员授权。TUN 矩阵和 24 小时稳定性脚本的停止路径改为有界等待，SIGTERM 无效时会进入 SIGKILL，并避免无界 `wait` 挂住；稳定性脚本启动时还会强制核验 TUN runtime 为 `disabled`。
