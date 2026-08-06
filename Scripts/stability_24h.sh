@@ -131,6 +131,8 @@ PY
 cd "${WORK_DIR}"
 prepare_isolated_config
 "${CORE}" check -c "${RUNTIME_CONFIG}" >/dev/null
+printf 'stability run started: duration=%ss sample=%ss control=%s mixed=127.0.0.1:%s tun=disabled\n' \
+  "${DURATION_SECS}" "${SAMPLE_SECS}" "${CONTROL_URL}" "${MIXED_PORT}"
 printf 'sample\telapsed_s\trss_kb\tstatus_bytes\n' >"${METRICS_FILE}"
 "${CORE}" run -c "${RUNTIME_CONFIG}" >"${LOG_FILE}" 2>&1 &
 PID=$!
@@ -153,6 +155,18 @@ if (( ready == 0 )); then
   cat "${LOG_FILE}" >&2
   exit 1
 fi
+
+tun_body="$(curl --noproxy '*' --fail --silent --show-error --max-time 3 "${CONTROL_URL}/v1/tun")"
+printf '%s' "${tun_body}" | python3 -c '
+import json
+import sys
+
+body = json.load(sys.stdin)
+tun = body.get("tun", {})
+runtime = body.get("runtime", {})
+if tun.get("enabled") is not False or runtime.get("state") != "disabled":
+    raise SystemExit(f"stability runtime must start with TUN disabled: {body}")
+'
 
 deadline=$((SECONDS + DURATION_SECS))
 samples=0
