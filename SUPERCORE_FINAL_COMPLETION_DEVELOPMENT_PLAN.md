@@ -17,10 +17,10 @@
 - 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；当前机器无免密 sudo，预检按约定返回 `77/SKIP`，未伪造管理员 TUN 通过。
 - `dist/玥球电梯.dmg` 已重新生成并只读挂载验收：Finder 背景、Applications 链接、arm64 App、内嵌 Supercore、签名和核心 `--help` 均通过；DMG 构建依赖记录在 `Scripts/requirements-dmg.txt`。
 - TUN cleanup 的系统代理检测已修正为只识别启用中的 loopback 代理；当前机器 dry-run 显示无 198.18 路由、系统代理 clean，针对关闭开关但保留 127.0.0.1 配置的回归测试通过。
-- DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`。同一环境对 `cloudflare-dns.com:853` 的直连 TCP 探测超时，DoT 外部互操作仍保留为环境门，不能据此宣称失败或通过。
+- DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`，并通过 `Scripts/dot_external_e2e.sh` 使用 `8.8.8.8:853` + `dns.google` 完成真实 DoT 查询并返回 `NOERROR`。Cloudflare 的 `853` 端口在本机单独探测超时只属于该 resolver 的环境差异，不再阻塞 DoT 基础能力结论；其他第三方 DoT 变体仍未覆盖。
 - 全量测试默认高并发执行时曾出现一次 Hysteria 本地 QUIC 测试长时间等待；随后带 120 秒 watchdog 的默认 `cargo test --all --no-fail-fast`、`RUST_TEST_THREADS=4` 并发和串行验收均通过，当前未能复现，稳定性脚本保留 watchdog。
 - 最新 release App 已完成 Rust/Swift 构建、签名验证和启动退出冒烟验证，已包含本轮 Swift 订阅空响应保护。
-- 尚未被本机环境完全覆盖的门：真实管理员 macOS TUN/LaunchDaemon 网络矩阵、MPTCP entitlement、官方 OpenVPN UDP、需要外部账号的 Tailscale、TrustTunnel H3，以及 DNS over TLS 的外部服务端互操作；DoH 已有公共 resolver 的 Supercore listener 实际验证，但仍不代表所有第三方 DoH 服务端变体都已覆盖。
+- 尚未被本机环境完全覆盖的门：真实管理员 macOS TUN/LaunchDaemon 网络矩阵、MPTCP entitlement、官方 OpenVPN UDP、需要外部账号的 Tailscale、TrustTunnel H3，以及其他第三方 DoT/DoH 服务端变体；DoH 公共 resolver 与 DoT `8.8.8.8:853` 已有 Supercore listener 实际验证。
 
 ## 历史阶段记录（截至2026-07-17）
 
@@ -1033,9 +1033,9 @@ swift build -c release
    保存动态启停、正常退出和强杀清理证据。
 2. 在 Wi-Fi、有线、DHCP 变化、休眠唤醒、第三方 VPN、IPv6-only/双栈环境补齐
    TUN 网络矩阵，并确认 App 的网络恢复状态与系统实际状态一致。
-3. 为 MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale、TrustTunnel H3 和
-   DoT resolver 提供目标环境凭据后，运行对应 ignored/外部互操作测试；没有凭据时
-   必须保留为明确的环境门，不能改成绿色通过。
+3. 为 MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale 和 TrustTunnel H3 提供
+   目标环境凭据后，运行对应 ignored/外部互操作测试；DoT 基础外部 resolver 已由
+   `Scripts/dot_external_e2e.sh` 验证，但其他第三方 DoT/DoH 变体仍必须保留为环境门。
 4. 运行 `Scripts/stability_24h.sh 86400`，保留完整日志、采样数、退出码和无残留
    进程证据；短时冒烟不能替代 24 小时门。
 5. 重新执行 Rust/Swift 全量回归、严格 Clippy、敏感数据扫描、release 构建、DMG

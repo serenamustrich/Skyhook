@@ -108,7 +108,7 @@
 1. `faketcp` 依赖平台级 packet backend；macOS 上由 OpenVPN/Hysteria v1 在拨号前明确拒绝，不能静默退化为 TCP。
 2. Tailscale 需要用户提供有效 auth key 或已有 Skyhook state file；仓库不包含 tailnet 凭据，也不自动使用系统 Tailscale 安装。
 3. DNS outbound 和 Rematch 是核心控制能力，不是普通 TCP 代理节点；其能力由规则和 runtime 选择器调用。
-4. 本机 CI 已覆盖协议 parser、native outbound、mock/本地服务端真实拨号和错误边界；DoH 已通过 release Supercore DNS listener 对公共 `cloudflare-dns.com/dns-query` 实际查询验证。以下互操作门仍需要目标环境凭据或系统能力，不能仅凭本机结果宣称完成：MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale tailnet、TrustTunnel H3 外部服务端、DNS over TLS 外部 resolver，以及其他第三方 DoH 服务端变体。
+4. 本机 CI 已覆盖协议 parser、native outbound、mock/本地服务端真实拨号和错误边界；DoH 已通过 release Supercore DNS listener 对公共 `cloudflare-dns.com/dns-query` 实际查询验证，DoT 已通过 `8.8.8.8:853`（SNI `dns.google`）实际查询验证。以下互操作门仍需要目标环境凭据或系统能力，不能仅凭本机结果宣称完成：MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale tailnet、TrustTunnel H3 外部服务端，以及其他第三方 DoT/DoH 服务端变体。
 5. `full` 表示该协议适用的核心 TCP/UDP 路径已经实现并有本地或 mock 证据，不表示所有第三方服务端变体、平台内核能力和外部账号场景都已在当前机器上执行。
 
 ## 已有测试
