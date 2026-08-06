@@ -4,7 +4,7 @@
 
 ## 下载
 
-[下载玥球电梯 v0.2.0 DMG](https://github.com/serenamustrich/Skyhook/releases/download/v0.2.0/YueqiuElevator-v0.2.0-49686de.dmg)
+[下载玥球电梯 v0.2.0 DMG](https://github.com/serenamustrich/Skyhook/releases/download/v0.2.0/YueqiuElevator-v0.2.0-f9b19e9.dmg)
 
 ## 功能
 
