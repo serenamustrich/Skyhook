@@ -14,6 +14,11 @@ impl Runtime {
         let next_state = build_runtime_state(config, self.telemetry.clone())?;
         let next_config = next_state.config.clone();
         let next_smart_config = effective_smart_config(&next_state.config);
+        self.fakeip_store.reconfigure(
+            next_state.config.dns.fake_ip_ttl as u64,
+            next_state.config.dns.fake_ip_filter.clone(),
+            next_state.config.dns.fake_ip_filter_mode,
+        )?;
 
         let mut state = self
             .state

@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use anyhow::anyhow;
 use tokio::sync::RwLock;
 
 use crate::config::FakeIpFilterMode;
@@ -55,6 +56,30 @@ impl FakeIpStore {
                 filter_mode,
             })),
         }
+    }
+
+    /// Apply DNS Fake-IP policy changes without replacing the shared store.
+    /// Existing mappings are discarded whenever policy changes so a mapping
+    /// created under the previous filter cannot survive a reload.
+    pub fn reconfigure(
+        &self,
+        ttl_secs: u64,
+        filter: Vec<String>,
+        filter_mode: FakeIpFilterMode,
+    ) -> anyhow::Result<()> {
+        let mut inner = self
+            .inner
+            .try_write()
+            .map_err(|_| anyhow!("fake-ip store is busy during reconfiguration"))?;
+        let ttl = Duration::from_secs(ttl_secs.max(10));
+        if inner.ttl != ttl || inner.filter != filter || inner.filter_mode != filter_mode {
+            inner.domain_to_ip.clear();
+            inner.ip_to_domain.clear();
+        }
+        inner.ttl = ttl;
+        inner.filter = filter;
+        inner.filter_mode = filter_mode;
+        Ok(())
     }
 
     pub async fn lookup_or_create(&self, domain: &str) -> Option<Ipv4Addr> {
@@ -324,6 +349,30 @@ mod tests {
 
         assert!(store.lookup_or_create("api.example.com").await.is_some());
         assert_eq!(store.lookup_or_create("example.net").await, None);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_replaces_policy_and_invalidates_old_mappings() {
+        let store = FakeIpStore::new(
+            60,
+            vec!["+.example.com".to_string()],
+            FakeIpFilterMode::Blacklist,
+        );
+
+        assert_eq!(store.lookup_or_create("api.example.com").await, None);
+        let old_ip = store.lookup_or_create("example.net").await.unwrap();
+        assert_eq!(store.reverse_lookup(&old_ip).await.as_deref(), Some("example.net"));
+
+        store.reconfigure(
+            120,
+            vec!["+.example.net".to_string()],
+            FakeIpFilterMode::Blacklist,
+        )
+        .expect("reconfigure");
+
+        assert_eq!(store.len().await, 0);
+        assert_eq!(store.lookup_or_create("example.net").await, None);
+        assert!(store.lookup_or_create("api.example.com").await.is_some());
     }
 
     #[tokio::test]

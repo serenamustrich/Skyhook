@@ -5,7 +5,9 @@ use std::{
 };
 
 use supercore::{
-    config::{OutboundConfig, RouteRule, RuleTarget, SmartRouteRule, SuperConfig},
+    config::{
+        FakeIpFilterMode, OutboundConfig, RouteRule, RuleTarget, SmartRouteRule, SuperConfig,
+    },
     core::{ProbeOptions, Runtime},
     routing::{AppIdentity, Destination, RouteDecision, RouteDecisionSource},
     smart::SmartRecommendationAction,
@@ -234,6 +236,33 @@ fn runtime_reload_replaces_router_and_outbounds_for_new_connections() {
     let decision = runtime.decide(&Destination::new("example.com", 443));
 
     assert_eq!(decision.outbound, "direct-alt");
+}
+
+#[tokio::test]
+async fn runtime_reload_applies_fake_ip_policy_to_the_shared_store() {
+    let mut config = SuperConfig::default();
+    config.dns.fake_ip_filter = vec!["+.initial.example".to_string()];
+    config.dns.fake_ip_filter_mode = FakeIpFilterMode::Blacklist;
+    let runtime = Runtime::new(config).expect("runtime");
+
+    assert_eq!(runtime.fakeip_store().lookup_or_create("api.initial.example").await, None);
+    assert!(runtime
+        .fakeip_store()
+        .lookup_or_create("initial-proxy.example")
+        .await
+        .is_some());
+
+    let mut next = runtime.config();
+    next.dns.fake_ip_filter = vec!["+.reloaded.example".to_string()];
+    runtime.reload_config(next).expect("reload");
+
+    assert_eq!(runtime.fakeip_store().len().await, 0);
+    assert_eq!(runtime.fakeip_store().lookup_or_create("api.reloaded.example").await, None);
+    assert!(runtime
+        .fakeip_store()
+        .lookup_or_create("reloaded-proxy.example")
+        .await
+        .is_some());
 }
 
 #[test]

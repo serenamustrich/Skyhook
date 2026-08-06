@@ -57,16 +57,22 @@ wait_for_process_exit() {
 
 stop_core() {
   local pid="$1"
+  local timed_out=0
   kill -0 "$pid" 2>/dev/null || return 0
-  terminate_process_tree "$pid" TERM
-  if ! wait_for_process_exit "$pid" 40; then
-    terminate_process_tree "$pid" KILL
-    if ! wait_for_process_exit "$pid" 30; then
-      echo "ERROR: core pid ${pid} did not exit after SIGTERM/SIGKILL" >&2
-      return 1
+  {
+    terminate_process_tree "$pid" TERM
+    if ! wait_for_process_exit "$pid" 40; then
+      terminate_process_tree "$pid" KILL
+      if ! wait_for_process_exit "$pid" 30; then
+        timed_out=1
+      fi
     fi
+    wait "$pid" 2>/dev/null || true
+  } 2>/dev/null
+  if (( timed_out == 1 )); then
+    echo "ERROR: core pid ${pid} did not exit after SIGTERM/SIGKILL" >&2
+    return 1
   fi
-  wait "$pid" 2>/dev/null || true
 }
 
 cleanup() {
