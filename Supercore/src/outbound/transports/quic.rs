@@ -116,6 +116,7 @@ pub(crate) fn quic_client_config_with_resumption_tuning_and_chain_pin(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quic_client_config_advanced(
     skip_cert_verify: bool,
     alpn: Option<&str>,

@@ -61,6 +61,38 @@ final class SupercoreAPIClient: @unchecked Sendable {
         try await request(path: "/v1/status")
     }
 
+    func waitForTunReady(timeoutInterval: TimeInterval = 12) async throws {
+        try await waitForTunState("running", timeoutInterval: timeoutInterval)
+    }
+
+    func waitForTunDisabled(timeoutInterval: TimeInterval = 12) async throws {
+        try await waitForTunState("disabled", timeoutInterval: timeoutInterval)
+    }
+
+    private func waitForTunState(_ expectedState: String, timeoutInterval: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(timeoutInterval)
+        while Date() < deadline {
+            let snapshot: SupercoreTunStatus = try await request(
+                path: "/v1/tun",
+                timeoutInterval: min(2, max(0.5, deadline.timeIntervalSinceNow))
+            )
+            switch snapshot.runtime.state {
+            case expectedState:
+                return
+            case "failed":
+                throw AppError.processFailed(
+                    "Supercore TUN 启动失败：\(snapshot.runtime.error ?? "未知错误")"
+                )
+            default:
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        if expectedState == "running" {
+            throw AppError.processFailed("Supercore TUN 启动超时，未检测到虚拟网卡")
+        }
+        throw AppError.processFailed("Supercore TUN 停止超时，虚拟网卡可能仍在运行")
+    }
+
     func getGroups() async throws -> [SupercoreProxyGroup] {
         try await requestAllPages(
             path: "/v1/groups",
@@ -911,6 +943,15 @@ struct SupercoreStatus: Decodable, Sendable {
         case rules
         case smartRulesEnabled = "smart_rules_enabled"
         case traffic
+    }
+}
+
+struct SupercoreTunStatus: Decodable, Sendable {
+    let runtime: Runtime
+
+    struct Runtime: Decodable, Sendable {
+        let state: String
+        let error: String?
     }
 }
 

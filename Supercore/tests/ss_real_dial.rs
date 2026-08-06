@@ -835,7 +835,7 @@ async fn run_ss2022_tcp_real_dial(method: &'static str, keys: Vec<Vec<u8>>) -> a
         let server_key = server_keys
             .last()
             .ok_or_else(|| anyhow::anyhow!("missing ss2022 user key"))?;
-        let request_key = ss2022_subkey(&server_key, &request_salt, key_len);
+        let request_key = ss2022_subkey(server_key, &request_salt, key_len);
         let mut request_nonce = [0u8; 12];
 
         let mut fixed = vec![0u8; 11 + 16];
@@ -877,7 +877,7 @@ async fn run_ss2022_tcp_real_dial(method: &'static str, keys: Vec<Vec<u8>>) -> a
         assert_eq!(payload, b"ping");
 
         let response_salt = vec![0x42; key_len];
-        let response_key = ss2022_subkey(&server_key, &response_salt, key_len);
+        let response_key = ss2022_subkey(server_key, &response_salt, key_len);
         let mut response_nonce = [0u8; 12];
         let mut response_header = Vec::with_capacity(1 + 8 + key_len + 2);
         response_header.push(1);

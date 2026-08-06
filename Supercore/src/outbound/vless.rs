@@ -1081,7 +1081,7 @@ pub(super) fn decode_reality_short_id(value: Option<&str>) -> anyhow::Result<Vec
     if value.len() > 16 {
         return Err(anyhow!("vless reality short_id cannot exceed 8 bytes"));
     }
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(anyhow!(
             "vless reality short_id must be hex with even length"
         ));

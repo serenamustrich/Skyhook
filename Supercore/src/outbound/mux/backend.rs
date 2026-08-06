@@ -37,9 +37,11 @@ impl MuxBackend {
     ) -> anyhow::Result<Self> {
         match protocol {
             SmuxProtocol::Smux => {
-                let mut config = smux::Config::default();
-                config.version = 1;
-                config.enable_keep_alive = false;
+                let config = smux::Config {
+                    version: 1,
+                    enable_keep_alive: false,
+                    ..Default::default()
+                };
                 let session = within_context(context, "smux session handshake", async move {
                     smux::Session::client(wire, config)
                         .await

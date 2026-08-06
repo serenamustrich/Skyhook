@@ -15,9 +15,13 @@ permission. A normal user LaunchAgent cannot remove the password prompt if
 
 Use this when TUN is disabled, or when another privileged helper owns TUN setup.
 
+The copied config should be a generated runtime config without user subscription
+URLs. Set `SKYHOOK_CONTROL_TOKEN` to reuse a known token, or let the installer
+generate a random one for the user LaunchAgent.
+
 ```bash
-./scripts/install_macos_launch_agent.sh
-./scripts/uninstall_macos_launch_agent.sh
+./Scripts/install_macos_launch_agent.sh
+./Scripts/uninstall_macos_launch_agent.sh
 ```
 
 Installed paths:
@@ -32,9 +36,13 @@ Installed paths:
 Use this when Supercore owns TUN setup. It asks for the admin password once
 during installation, then launchd starts the core as root.
 
+Set `SKYHOOK_CONTROL_TOKEN` before installing. The daemon stores only the
+root-owned control token and runtime config; subscription source URLs remain in
+the App's user profile store.
+
 ```bash
-./scripts/install_macos_launch_daemon.sh
-./scripts/uninstall_macos_launch_daemon.sh
+./Scripts/install_macos_launch_daemon.sh
+./Scripts/uninstall_macos_launch_daemon.sh
 ```
 
 Installed paths:
@@ -49,7 +57,7 @@ Installed paths:
 For development and diagnosis:
 
 ```bash
-./scripts/run_macos_tun.sh supercore.example.yaml
+./Scripts/run_macos_tun.sh Supercore/supercore.example.yaml
 ```
 
 This validates the config, builds the release binary when needed, and runs:
@@ -57,6 +65,22 @@ This validates the config, builds the release binary when needed, and runs:
 ```bash
 sudo -E env RUST_LOG=supercore=info,info supercore run -c <config>
 ```
+
+## TUN Lifecycle Matrix
+
+For an operator-assisted system test, review a config with `tun.setup: false`,
+authorize sudo once, and run:
+
+```bash
+sudo -v
+./Scripts/tun_macos_matrix.sh --with-tun --root --keep-artifacts
+```
+
+The matrix records route/DNS/proxy/interface snapshots and verifies dynamic
+TUN start, dynamic stop, normal core termination, and forced core termination.
+It exits with code `77` when administrator authorization is unavailable; that
+is a skipped environment gate, not a successful TUN test. Route-changing
+configs require an explicit `--allow-route-changes` review flag.
 
 ## Configuration Notes
 

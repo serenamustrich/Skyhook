@@ -203,6 +203,10 @@ impl Outbound for ConfiguredOutbound {
         }
     }
 
+    fn rematch_target(&self) -> Option<super::RematchTarget> {
+        self.inner.rematch_target()
+    }
+
     async fn connect(
         &self,
         destination: &Destination,

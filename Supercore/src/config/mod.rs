@@ -428,11 +428,82 @@ pub struct DnsFallbackFilter {
     pub domain: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenVpnOptions {
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub proto: Option<String>,
+    #[serde(default)]
+    pub dev: Option<String>,
+    #[serde(default)]
+    pub cipher: Option<String>,
+    #[serde(default, alias = "data-ciphers", alias = "data_ciphers")]
+    pub data_ciphers: Option<String>,
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default, alias = "comp-lzo", alias = "comp_lzo")]
+    pub comp_lzo: Option<String>,
+    #[serde(default)]
+    pub ca: Option<String>,
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default, alias = "tls-crypt", alias = "tls_crypt")]
+    pub tls_crypt: Option<String>,
+    #[serde(default, alias = "tls-auth", alias = "tls_auth")]
+    pub tls_auth: Option<String>,
+    #[serde(default, alias = "key-direction", alias = "key_direction")]
+    pub key_direction: Option<u8>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default, alias = "peer-info", alias = "peer_info")]
+    pub peer_info: BTreeMap<String, String>,
+    #[serde(default)]
+    pub ping: Option<u64>,
+    #[serde(default, alias = "ping-restart", alias = "ping_restart")]
+    pub ping_restart: Option<u64>,
+    #[serde(default, alias = "handshake-timeout", alias = "handshake_timeout")]
+    pub handshake_timeout: Option<u64>,
+    #[serde(default, alias = "reneg-sec", alias = "reneg_sec")]
+    pub reneg_sec: Option<u64>,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default, alias = "remote-dns-resolve", alias = "remote_dns_resolve")]
+    pub remote_dns_resolve: bool,
+    #[serde(default)]
+    pub dns: Vec<String>,
+    #[serde(default, alias = "remote-cert-tls", alias = "remote_cert_tls")]
+    pub remote_cert_tls: Option<String>,
+    #[serde(default, alias = "verify-x509-name", alias = "verify_x509_name")]
+    pub verify_x509_name: Option<String>,
+    #[serde(default)]
+    pub sni: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum OutboundConfig {
     Direct {
         name: String,
+    },
+    Dns {
+        name: String,
+    },
+    Rematch {
+        name: String,
+        #[serde(default, alias = "target-rematch-name")]
+        target_rematch_name: Option<String>,
+        #[serde(default, alias = "target-sub-rule")]
+        target_sub_rule: Option<String>,
     },
     Reject {
         name: String,
@@ -849,6 +920,66 @@ pub enum OutboundConfig {
         profile: Option<PathBuf>,
         #[serde(default)]
         inline_profile: Option<String>,
+        #[serde(flatten)]
+        options: OpenVpnOptions,
+    },
+    Tailscale {
+        name: String,
+        #[serde(default, alias = "auth-key", alias = "auth_key")]
+        auth_key: Option<String>,
+        #[serde(default, alias = "state-file", alias = "state_file")]
+        state_file: Option<PathBuf>,
+        #[serde(default, alias = "control-url", alias = "control_server_url")]
+        control_server_url: Option<String>,
+        #[serde(default)]
+        hostname: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    TrustTunnel {
+        name: String,
+        server: String,
+        port: u16,
+        username: String,
+        password: String,
+        #[serde(default)]
+        sni: Option<String>,
+        #[serde(default)]
+        skip_cert_verify: bool,
+        #[serde(default)]
+        transport: Option<String>,
+    },
+    Sudoku {
+        name: String,
+        server: String,
+        port: u16,
+        key: String,
+        #[serde(default, alias = "aead-method", alias = "aead_method")]
+        aead_method: Option<String>,
+        #[serde(default, alias = "padding-min", alias = "padding_min")]
+        padding_min: Option<u8>,
+        #[serde(default, alias = "padding-max", alias = "padding_max")]
+        padding_max: Option<u8>,
+        #[serde(default, alias = "table-type", alias = "table_type")]
+        table_type: Option<String>,
+        #[serde(default, alias = "enable-pure-downlink", alias = "enable_pure_downlink")]
+        enable_pure_downlink: Option<bool>,
+        #[serde(default, alias = "http-mask", alias = "http_mask")]
+        http_mask: Option<bool>,
+        #[serde(default, alias = "http-mask-mode", alias = "http_mask_mode")]
+        http_mask_mode: Option<String>,
+        #[serde(default, alias = "http-mask-tls", alias = "http_mask_tls")]
+        http_mask_tls: bool,
+        #[serde(default, alias = "http-mask-host", alias = "http_mask_host")]
+        http_mask_host: Option<String>,
+        #[serde(default, alias = "path-root", alias = "path_root")]
+        path_root: Option<String>,
+        #[serde(default)]
+        multiplex: Option<String>,
+        #[serde(default, alias = "custom-table", alias = "custom_table")]
+        custom_table: Option<String>,
+        #[serde(default, alias = "custom-tables", alias = "custom_tables")]
+        custom_tables: Vec<String>,
     },
     Unknown {
         name: String,
@@ -1093,10 +1224,12 @@ pub enum RuleTarget {
     AppPath,
     AppPathRegex,
     AppBundle,
+    RematchName,
     RuleSet,
     GeoIp,
     InPort,
     SrcIpCidr,
+    SrcPort,
     DstPort,
     Network,
     Match,
@@ -1301,6 +1434,8 @@ impl OutboundConfig {
     pub fn name(&self) -> &str {
         match self {
             Self::Direct { name }
+            | Self::Dns { name }
+            | Self::Rematch { name, .. }
             | Self::Reject { name }
             | Self::Http { name, .. }
             | Self::Socks5 { name, .. }
@@ -1322,6 +1457,9 @@ impl OutboundConfig {
             | Self::Juicity { name, .. }
             | Self::Masque { name, .. }
             | Self::OpenVpn { name, .. }
+            | Self::Tailscale { name, .. }
+            | Self::TrustTunnel { name, .. }
+            | Self::Sudoku { name, .. }
             | Self::Unknown { name, .. }
             | Self::Group { name, .. } => name,
         }
@@ -1364,7 +1502,9 @@ fn default_tun_dns_strategy() -> TunDnsStrategy {
 }
 
 fn default_tun_dns_addr() -> std::net::IpAddr {
-    "8.8.8.8".parse().expect("valid default DNS address")
+    // A local sentinel keeps the Rust default independent of any public DNS
+    // provider. App-generated profiles always replace this with user choice.
+    "127.0.0.1".parse().expect("valid local DNS address")
 }
 
 fn default_tun_dns_hijack() -> Vec<String> {
@@ -1411,7 +1551,10 @@ fn default_dns_enabled() -> bool {
 }
 
 fn default_dns_server() -> SocketAddr {
-    "8.8.8.8:53".parse().expect("valid default DNS server")
+    // The resolver implementation discovers the system resolver when no
+    // explicit nameserver is configured; this is only a schema-compatible
+    // local sentinel and is never a public upstream.
+    "127.0.0.1:53".parse().expect("valid local DNS server")
 }
 
 fn default_dns_enhanced_mode() -> DnsEnhancedMode {
@@ -1447,11 +1590,11 @@ fn default_dns_use_system_hosts() -> bool {
 }
 
 fn default_dns_default_nameserver() -> Vec<String> {
-    vec![default_dns_server().to_string()]
+    Vec::new()
 }
 
 fn default_dns_nameserver() -> Vec<String> {
-    vec![default_dns_server().to_string()]
+    Vec::new()
 }
 
 fn default_dns_fallback_filter_geoip() -> bool {

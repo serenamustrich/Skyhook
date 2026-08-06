@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CORE="${SUPERCORE_BINARY:-${ROOT}/Supercore/target/release/supercore}"
+CONFIG="${SUPERCORE_STABILITY_CONFIG:-${ROOT}/Supercore/supercore.example.yaml}"
+DURATION_SECS="${1:-86400}"
+SAMPLE_SECS="${SUPERCORE_STABILITY_SAMPLE_SECS:-30}"
+CONTROL_URL="${SUPERCORE_STABILITY_CONTROL_URL:-http://127.0.0.1:9197}"
+
+if ! [[ "${DURATION_SECS}" =~ ^[0-9]+$ ]] || (( DURATION_SECS < 1 )); then
+  echo "duration must be a positive integer number of seconds" >&2
+  exit 2
+fi
+if ! [[ "${SAMPLE_SECS}" =~ ^[0-9]+$ ]] || (( SAMPLE_SECS < 1 )); then
+  echo "SUPERCORE_STABILITY_SAMPLE_SECS must be a positive integer" >&2
+  exit 2
+fi
+if [[ ! -x "${CORE}" ]]; then
+  cargo build --release --manifest-path "${ROOT}/Supercore/Cargo.toml"
+fi
+
+WORK_DIR="$(mktemp -d /tmp/skyhook-stability.XXXXXX)"
+LOG_FILE="${WORK_DIR}/supercore.log"
+METRICS_FILE="${WORK_DIR}/metrics.tsv"
+PID=""
+BASE_RSS_KB=""
+MAX_RSS_KB=0
+
+cleanup() {
+  if [[ -n "${PID}" ]] && kill -0 "${PID}" 2>/dev/null; then
+    kill -TERM "${PID}" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "${PID}" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "${PID}" 2>/dev/null || true
+  fi
+  if [[ "${KEEP_STABILITY_LOG:-0}" != "1" ]]; then
+    find "${WORK_DIR}" -type f -delete 2>/dev/null || true
+    rmdir "${WORK_DIR}" 2>/dev/null || true
+  else
+    echo "stability log: ${LOG_FILE}"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+cd "${WORK_DIR}"
+printf 'sample\telapsed_s\trss_kb\tstatus_bytes\n' >"${METRICS_FILE}"
+"${CORE}" run -c "${CONFIG}" >"${LOG_FILE}" 2>&1 &
+PID=$!
+
+ready=0
+for _ in {1..60}; do
+  if ! kill -0 "${PID}" 2>/dev/null; then
+    echo "Supercore exited before health became ready" >&2
+    cat "${LOG_FILE}" >&2
+    exit 1
+  fi
+  if curl --noproxy '*' --fail --silent --max-time 3 "${CONTROL_URL}/health" >/dev/null; then
+    ready=1
+    break
+  fi
+  sleep 0.5
+done
+if (( ready == 0 )); then
+  echo "Supercore health endpoint did not become ready" >&2
+  cat "${LOG_FILE}" >&2
+  exit 1
+fi
+
+deadline=$((SECONDS + DURATION_SECS))
+samples=0
+while (( SECONDS < deadline )); do
+  if ! kill -0 "${PID}" 2>/dev/null; then
+    echo "Supercore exited during stability run after ${samples} samples" >&2
+    cat "${LOG_FILE}" >&2
+    exit 1
+  fi
+  curl --noproxy '*' --fail --silent --max-time 3 "${CONTROL_URL}/health" >/dev/null
+  status_body="$(curl --noproxy '*' --fail --silent --max-time 3 "${CONTROL_URL}/v1/status")"
+  rss_kb="$(ps -o rss= -p "${PID}" | tr -d ' ' || true)"
+  [[ "${rss_kb}" =~ ^[0-9]+$ ]] || rss_kb=0
+  status_bytes="$(printf '%s' "${status_body}" | wc -c | tr -d ' ')"
+  elapsed=$((SECONDS))
+  if [[ -z "${BASE_RSS_KB}" ]]; then
+    BASE_RSS_KB="${rss_kb}"
+  fi
+  (( rss_kb > MAX_RSS_KB )) && MAX_RSS_KB="${rss_kb}"
+  samples=$((samples + 1))
+  printf '%s\t%s\t%s\t%s\n' "${samples}" "${elapsed}" "${rss_kb}" "${status_bytes}" >>"${METRICS_FILE}"
+  remaining=$((deadline - SECONDS))
+  sleep "$((remaining < SAMPLE_SECS ? remaining : SAMPLE_SECS))"
+done
+
+RSS_GROWTH_KB=$((MAX_RSS_KB - ${BASE_RSS_KB:-0}))
+echo "stability run passed: duration=${DURATION_SECS}s samples=${samples} base_rss_kb=${BASE_RSS_KB:-0} peak_rss_kb=${MAX_RSS_KB} rss_growth_kb=${RSS_GROWTH_KB}"
+if [[ "${KEEP_STABILITY_LOG:-0}" == "1" ]]; then
+  echo "stability metrics: ${METRICS_FILE}"
+fi

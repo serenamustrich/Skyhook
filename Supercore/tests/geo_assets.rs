@@ -77,6 +77,7 @@ async fn geo_assets_download_to_cache_and_prepare_geoip_database() {
 }
 
 #[tokio::test]
+#[allow(clippy::field_reassign_with_default)]
 async fn prepare_geo_assets_uses_cached_geoip_when_no_url_is_configured() {
     let cache_dir = unique_test_dir("geo-cached");
     fs::create_dir_all(&cache_dir).unwrap();

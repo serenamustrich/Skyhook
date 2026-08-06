@@ -595,8 +595,10 @@ mod tests {
         let wire = accept_protocol_stream(base, protocol, padding).await?;
         match protocol {
             SmuxProtocol::Smux => {
-                let mut config = smux::Config::default();
-                config.enable_keep_alive = false;
+                let config = smux::Config {
+                    enable_keep_alive: false,
+                    ..Default::default()
+                };
                 let session = smux::Session::server(wire, config).await?;
                 while let Ok(stream) = session.accept_stream().await {
                     let logical_streams = Arc::clone(&logical_streams);

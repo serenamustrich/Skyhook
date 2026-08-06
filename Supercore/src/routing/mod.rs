@@ -12,6 +12,16 @@ pub struct Destination {
     pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<AppIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rematch_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_ip: Option<IpAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -30,11 +40,32 @@ impl Destination {
             host: host.into(),
             port,
             app: None,
+            rematch_name: None,
+            src_ip: None,
+            src_port: None,
+            in_port: None,
+            network: None,
         }
     }
 
     pub fn with_app(mut self, app: AppIdentity) -> Self {
         self.app = Some(app);
+        self
+    }
+
+    pub fn with_source(mut self, src_ip: IpAddr, src_port: u16) -> Self {
+        self.src_ip = Some(src_ip);
+        self.src_port = Some(src_port);
+        self
+    }
+
+    pub fn with_in_port(mut self, in_port: u16) -> Self {
+        self.in_port = Some(in_port);
+        self
+    }
+
+    pub fn with_network(mut self, network: impl Into<String>) -> Self {
+        self.network = Some(network.into().to_ascii_lowercase());
         self
     }
 
@@ -320,12 +351,42 @@ pub fn target_matches(target: RuleTarget, value: &str, destination: &Destination
             .and_then(|app| app.bundle_id.as_ref())
             .map(|bundle_id| bundle_id.eq_ignore_ascii_case(&value))
             .unwrap_or(false),
-        RuleTarget::InPort => destination.port.to_string() == value,
-        RuleTarget::SrcIpCidr => false,
-        RuleTarget::DstPort => destination.port.to_string() == value,
-        RuleTarget::Network => false,
+        RuleTarget::RematchName => destination
+            .rematch_name
+            .as_deref()
+            .map(|name| name.eq_ignore_ascii_case(&value))
+            .unwrap_or(false),
+        RuleTarget::InPort => destination
+            .in_port
+            .is_some_and(|port| port_matches(port, &value)),
+        RuleTarget::SrcIpCidr => destination
+            .src_ip
+            .is_some_and(|ip| value.parse::<IpNet>().map(|net| net.contains(&ip)).unwrap_or(false)),
+        RuleTarget::SrcPort => destination
+            .src_port
+            .is_some_and(|port| port_matches(port, &value)),
+        RuleTarget::DstPort => port_matches(destination.port, &value),
+        RuleTarget::Network => destination
+            .network
+            .as_deref()
+            .is_some_and(|network| network.eq_ignore_ascii_case(&value)),
         RuleTarget::RuleSet | RuleTarget::GeoIp => false,
     }
+}
+
+fn port_matches(port: u16, value: &str) -> bool {
+    let value = value.trim();
+    if let Ok(expected) = value.parse::<u16>() {
+        return port == expected;
+    }
+    let Some((start, end)) = value.split_once('-') else {
+        return false;
+    };
+    let (Ok(start), Ok(end)) = (start.trim().parse::<u16>(), end.trim().parse::<u16>()) else {
+        return false;
+    };
+    let (start, end) = if start <= end { (start, end) } else { (end, start) };
+    (start..=end).contains(&port)
 }
 
 impl CompiledRuleSet {

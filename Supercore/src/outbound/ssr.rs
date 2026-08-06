@@ -548,8 +548,8 @@ impl SsrProtocolEncoder {
         let aes_key = evp_bytes_to_key(aes_password.as_bytes(), 16);
         let encrypted_auth = ssr_aes128_cbc_encrypt_block(&aes_key, auth_plaintext)?;
         let mut auth = [0u8; 20];
-        for index in 0..4 {
-            auth[index] = self.uid[index] ^ self.last_client_hash[8 + index];
+        for (index, byte) in auth.iter_mut().take(4).enumerate() {
+            *byte = self.uid[index] ^ self.last_client_hash[8 + index];
         }
         auth[4..].copy_from_slice(&encrypted_auth);
         self.last_server_hash = ssr_hmac_md5(&self.user_key, &auth);
@@ -627,9 +627,11 @@ impl SsrProtocolDecoder {
 
     fn decode(&mut self, payload: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
         if self.kind == SsrProtocolKind::Origin {
-            return Ok((!payload.is_empty())
-                .then(|| vec![payload.to_vec()])
-                .unwrap_or_default());
+            return Ok(if !payload.is_empty() {
+                vec![payload.to_vec()]
+            } else {
+                Vec::new()
+            });
         }
         if matches!(
             self.kind,
@@ -1208,6 +1210,7 @@ fn spawn_ssr_random_head_stream(
     app_side
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_ssr_tls12_ticket_stream(
     cipher: SsrCipher,
     key: Vec<u8>,
@@ -1932,6 +1935,7 @@ fn build_ssr_legacy_adler_data(payload: &[u8], extended: bool) -> anyhow::Result
     Ok(frame)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ssr_auth_aes128_header(
     kind: SsrProtocolKind,
     payload: &[u8],
@@ -2191,7 +2195,7 @@ async fn relay_ssr_download<R, W>(
         let _ = writer.shutdown().await;
         return;
     }
-    let Ok(mut download) = cipher.decryptor(&key, &iv) else {
+    let Ok(mut download) = cipher.decryptor(key, &iv) else {
         let _ = writer.shutdown().await;
         return;
     };

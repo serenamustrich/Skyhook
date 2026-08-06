@@ -78,6 +78,7 @@ pub(super) struct ShadowsocksOutbound {
 }
 
 impl ShadowsocksOutbound {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         name: String,
         server: String,
@@ -2126,28 +2127,20 @@ pub(super) fn spawn_simple_obfs_transport(
 
     tokio::spawn(async move {
         if plugin_is_http_obfs(Some(&plugin)) {
-            match read_http_obfs_response(&mut remote_read).await {
-                Ok(leftover) => {
-                    if !leftover.is_empty() && local_write.write_all(&leftover).await.is_err() {
-                        return;
-                    }
-                    let _ = tokio::io::copy(&mut remote_read, &mut local_write).await;
+            if let Ok(leftover) = read_http_obfs_response(&mut remote_read).await {
+                if !leftover.is_empty() && local_write.write_all(&leftover).await.is_err() {
+                    return;
                 }
-                Err(_) => {}
+                let _ = tokio::io::copy(&mut remote_read, &mut local_write).await;
             }
         } else if plugin_is_tls_obfs(Some(&plugin)) {
             let mut decoder = SimpleObfsTlsDecoder::new();
-            loop {
-                match decoder
-                    .read_some_or_eof(&mut remote_read, SIMPLE_OBFS_TLS_MAX_APP_DATA_LEN)
-                    .await
-                {
-                    Ok(Some(payload)) => {
-                        if local_write.write_all(&payload).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) | Err(_) => break,
+            while let Ok(Some(payload)) = decoder
+                .read_some_or_eof(&mut remote_read, SIMPLE_OBFS_TLS_MAX_APP_DATA_LEN)
+                .await
+            {
+                if local_write.write_all(&payload).await.is_err() {
+                    break;
                 }
             }
         }
@@ -2641,14 +2634,14 @@ pub(super) fn wrap_simple_obfs_tls_app_data(payload: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn plugin_is_http_obfs(plugin: Option<&ShadowsocksPluginConfig>) -> bool {
-    plugin.map_or(false, |p| {
+    plugin.is_some_and(|p| {
         let mode = p.mode.to_ascii_lowercase();
         mode == "http_simple" || mode == "http_post"
     })
 }
 
 fn plugin_is_v2ray_ws(plugin: Option<&ShadowsocksPluginConfig>) -> bool {
-    plugin.map_or(false, |p| {
+    plugin.is_some_and(|p| {
         let mode = p.mode.to_ascii_lowercase();
         mode == "v2ray-plugin" || mode == "websocket"
     })

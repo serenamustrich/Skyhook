@@ -8,8 +8,8 @@ use url::Url;
 
 use crate::{
     config::{
-        OutboundCommonConfig, OutboundConfig, ShadowsocksPluginConfig, SmuxBrutalConfig,
-        SmuxConfig, SmuxProtocol, WireGuardPeerConfig,
+        OpenVpnOptions, OutboundCommonConfig, OutboundConfig, ShadowsocksPluginConfig,
+        SmuxBrutalConfig, SmuxConfig, SmuxProtocol, WireGuardPeerConfig,
     },
     outbound::context::IpVersionStrategy,
 };
@@ -119,6 +119,8 @@ pub enum NodeProtocol {
     Juicity,
     Masque,
     OpenVpn,
+    Tailscale,
+    Sudoku,
     Unknown(String),
 }
 
@@ -132,6 +134,7 @@ impl SubscriptionDocument {
 }
 
 impl SubscriptionNode {
+    #[allow(clippy::field_reassign_with_default)]
     pub fn common_options(&self) -> anyhow::Result<Option<OutboundCommonConfig>> {
         let mut options = OutboundCommonConfig::default();
         options.ip_version = match first_param(&self.params, &["ip-version", "ip_version"])
@@ -777,10 +780,118 @@ impl SubscriptionNode {
                 ),
                 dns: string_list_param(&self.params, &["dns"]),
             }),
+            NodeProtocol::Sudoku => Ok(OutboundConfig::Sudoku {
+                name: self.name.clone(),
+                server: self.server.clone(),
+                port: self.port,
+                key: required_param(&self.params, &["key", "password"], "sudoku key")?,
+                aead_method: first_param(&self.params, &["aead-method", "aead_method", "aead"]),
+                padding_min: first_param(&self.params, &["padding-min", "padding_min"])
+                    .map(|value| value.parse::<u8>())
+                    .transpose()?,
+                padding_max: first_param(&self.params, &["padding-max", "padding_max"])
+                    .map(|value| value.parse::<u8>())
+                    .transpose()?,
+                table_type: first_param(&self.params, &["table-type", "table_type", "ascii"]),
+                enable_pure_downlink: first_param(
+                    &self.params,
+                    &["enable-pure-downlink", "enable_pure_downlink"],
+                ).map(|value| parse_bool_text(&value, "sudoku enable-pure-downlink"))
+                    .transpose()?,
+                http_mask: first_param(&self.params, &["http-mask", "http_mask"])
+                    .map(|value| parse_bool_text(&value, "sudoku http-mask"))
+                    .transpose()?,
+                http_mask_mode: first_param(&self.params, &["http-mask-mode", "http_mask_mode"]),
+                http_mask_tls: bool_param_any(&self.params, &["http-mask-tls", "http_mask_tls"]),
+                http_mask_host: first_param(&self.params, &["http-mask-host", "http_mask_host", "host"]),
+                path_root: first_param(&self.params, &["path-root", "path_root"]),
+                multiplex: first_param(&self.params, &["multiplex"]),
+                custom_table: first_param(&self.params, &["custom-table", "custom_table"]),
+                custom_tables: string_list_param(&self.params, &["custom-tables", "custom_tables"]),
+            }),
             NodeProtocol::OpenVpn => Ok(OutboundConfig::OpenVpn {
                 name: self.name.clone(),
                 profile: first_param(&self.params, &["profile", "path"]).map(Into::into),
                 inline_profile: first_param(&self.params, &["inline-profile", "inline_profile"]),
+                options: OpenVpnOptions {
+                    server: (!self.server.is_empty()).then(|| self.server.clone()),
+                    port: (self.port != 0).then_some(self.port),
+                    proto: first_param(&self.params, &["proto"]),
+                    dev: first_param(&self.params, &["dev"]),
+                    cipher: first_param(&self.params, &["cipher"]),
+                    data_ciphers: first_param(&self.params, &["data-ciphers", "data_ciphers"]),
+                    auth: first_param(&self.params, &["auth"]),
+                    comp_lzo: first_param(&self.params, &["comp-lzo", "comp_lzo"]),
+                    ca: first_param(&self.params, &["ca"]),
+                    cert: first_param(&self.params, &["cert"]),
+                    key: first_param(&self.params, &["key"]),
+                    tls_crypt: first_param(&self.params, &["tls-crypt", "tls_crypt"]),
+                    tls_auth: first_param(&self.params, &["tls-auth", "tls_auth"]),
+                    key_direction: first_param(
+                        &self.params,
+                        &["key-direction", "key_direction"],
+                    )
+                    .map(|value| value.parse::<u8>())
+                    .transpose()?,
+                    username: first_param(&self.params, &["username"]),
+                    password: first_param(&self.params, &["password"]),
+                    peer_info: self
+                        .params
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            key.strip_prefix("peer-info:")
+                                .map(|key| (key.to_string(), value.clone()))
+                        })
+                        .collect(),
+                    ping: first_param(&self.params, &["ping"])
+                        .map(|value| value.parse::<u64>())
+                        .transpose()?,
+                    ping_restart: first_param(
+                        &self.params,
+                        &["ping-restart", "ping_restart"],
+                    )
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?,
+                    handshake_timeout: first_param(
+                        &self.params,
+                        &["handshake-timeout", "handshake_timeout"],
+                    )
+                    .map(|value| value.parse::<u64>())
+                    .transpose()?,
+                    reneg_sec: first_param(&self.params, &["reneg-sec", "reneg_sec"])
+                        .map(|value| value.parse::<u64>())
+                        .transpose()?,
+                    mtu: first_param(&self.params, &["mtu", "tun-mtu"])
+                        .map(|value| value.parse::<u16>())
+                        .transpose()?,
+                    udp: bool_param(&self.params, "udp"),
+                    remote_dns_resolve: bool_param_any(
+                        &self.params,
+                        &["remote-dns-resolve", "remote_dns_resolve"],
+                    ),
+                    dns: string_list_param(&self.params, &["dns"]),
+                    remote_cert_tls: first_param(
+                        &self.params,
+                        &["remote-cert-tls", "remote_cert_tls"],
+                    ),
+                    verify_x509_name: first_param(
+                        &self.params,
+                        &["verify-x509-name", "verify_x509_name"],
+                    ),
+                    sni: first_param(&self.params, &["sni", "tls-remote"]),
+                },
+            }),
+            NodeProtocol::Tailscale => Ok(OutboundConfig::Tailscale {
+                name: self.name.clone(),
+                auth_key: first_param(&self.params, &["auth-key", "auth_key", "authkey"]),
+                state_file: first_param(&self.params, &["state-file", "state_file", "state-path"])
+                    .map(Into::into),
+                control_server_url: first_param(
+                    &self.params,
+                    &["control-url", "control_url", "login-server", "login_server"],
+                ),
+                hostname: first_param(&self.params, &["hostname", "host-name", "host_name"]),
+                tags: string_list_param(&self.params, &["tags", "tag"]),
             }),
             NodeProtocol::Vmess => {
                 let uuid = self
@@ -1192,6 +1303,16 @@ fn parse_clash_proxy(value: &Value) -> anyhow::Result<SubscriptionNode> {
                 key.to_string(),
                 serde_yaml::to_string(value).context("failed to preserve wireguard peers")?,
             );
+            continue;
+        }
+        if key == "peer-info" && matches!(&protocol, NodeProtocol::OpenVpn) {
+            if let Some(mapping) = value.as_mapping() {
+                for (name, value) in mapping {
+                    if let (Some(name), Some(value)) = (name.as_str(), yaml_scalar_to_string(value)) {
+                        params.insert(format!("peer-info:{name}"), value);
+                    }
+                }
+            }
             continue;
         }
         if let Some(value) = yaml_scalar_to_string(value) {
@@ -1781,7 +1902,7 @@ fn parse_node_uri(value: &str) -> anyhow::Result<SubscriptionNode> {
         "http" | "https" | "socks" | "socks5" | "trojan" | "vless" | "hysteria2" | "hy2"
         | "tuic" | "snell" | "hysteria" | "hy" | "wireguard" | "wg" | "anytls" | "shadowtls"
         | "shadow-tls" | "naive" | "ssh" | "mieru" | "mierus" | "juicity" | "masque"
-        | "openvpn" => parse_url_like_node(value),
+        | "openvpn" | "tailscale" => parse_url_like_node(value),
         _ => parse_url_like_node(value).or_else(|_| {
             Ok(SubscriptionNode {
                 name: scheme.clone(),
@@ -1990,6 +2111,14 @@ fn bool_param(params: &BTreeMap<String, String>, key: &str) -> bool {
 
 fn bool_param_any(params: &BTreeMap<String, String>, keys: &[&str]) -> bool {
     keys.iter().any(|key| bool_param(params, key))
+}
+
+fn parse_bool_text(value: &str, label: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(anyhow!("invalid {label} value {other}")),
+    }
 }
 
 fn parse_u64_text(value: &str, label: &str) -> anyhow::Result<u64> {
@@ -2375,6 +2504,8 @@ fn protocol_from_str(value: &str) -> NodeProtocol {
         "juicity" => NodeProtocol::Juicity,
         "masque" => NodeProtocol::Masque,
         "openvpn" | "open-vpn" => NodeProtocol::OpenVpn,
+        "tailscale" | "tailnet" => NodeProtocol::Tailscale,
+        "sudoku" => NodeProtocol::Sudoku,
         other => NodeProtocol::Unknown(other.to_string()),
     }
 }
@@ -2470,7 +2601,7 @@ fn decode_base64_text(value: &str) -> Option<String> {
         return None;
     }
     let mut padded = compact.clone();
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
     for engine in [
@@ -2545,6 +2676,45 @@ rules:
         assert_eq!(doc.nodes[0].protocol, NodeProtocol::Shadowsocks);
         assert_eq!(doc.groups[0].members, vec!["HK-01"]);
         assert_eq!(doc.rules, vec!["DOMAIN-SUFFIX,example.com,Auto"]);
+    }
+
+    #[test]
+    fn parses_tailscale_yaml_and_preserves_userspace_identity_options() {
+        let text = r#"
+proxies:
+  - name: Tailnet
+    type: tailscale
+    server: 100.64.0.10
+    port: 443
+    auth-key: tskey-auth-example
+    state-file: /tmp/skyhook-tailscale-state.json
+    control-url: https://control.example.com
+    hostname: skyhook-mac
+    tags: [tag:skyhook, tag:proxy]
+"#;
+
+        let doc = parse_subscription(text).unwrap();
+        assert_eq!(doc.nodes[0].protocol, NodeProtocol::Tailscale);
+        let outbound = doc.nodes[0].to_outbound_config().unwrap();
+        match outbound {
+            OutboundConfig::Tailscale {
+                auth_key,
+                state_file,
+                control_server_url,
+                hostname,
+                tags,
+                ..
+            } => {
+                assert_eq!(auth_key.as_deref(), Some("tskey-auth-example"));
+                assert_eq!(state_file.as_deref(), Some(std::path::Path::new(
+                    "/tmp/skyhook-tailscale-state.json",
+                )));
+                assert_eq!(control_server_url.as_deref(), Some("https://control.example.com"));
+                assert_eq!(hostname.as_deref(), Some("skyhook-mac"));
+                assert_eq!(tags, vec!["tag:skyhook", "tag:proxy"]);
+            }
+            other => panic!("unexpected outbound: {}", other.name()),
+        }
     }
 
     #[test]

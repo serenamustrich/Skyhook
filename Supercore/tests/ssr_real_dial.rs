@@ -575,6 +575,7 @@ fn auth_chain_udp_rand_len(hash: &[u8; 16]) -> usize {
     (TestShift128Plus::from_hash(hash, None).next() % 127) as usize
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_auth_chain_frame(
     kind: TestAuthChainKind,
     stream: &mut TcpStream,
@@ -609,6 +610,7 @@ async fn read_auth_chain_frame(
     Ok((payload, next_hash))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_auth_chain_frame(
     kind: TestAuthChainKind,
     payload: &[u8],

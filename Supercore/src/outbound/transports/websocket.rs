@@ -264,6 +264,7 @@ struct LazyWebSocketInit<S> {
 type WebSocketHandshakeFuture =
     Pin<Box<dyn Future<Output = Result<DuplexStream, Error>> + Send + 'static>>;
 
+#[allow(clippy::large_enum_variant)]
 enum LazyWebSocketState<S> {
     Initial(Option<LazyWebSocketInit<S>>),
     Handshaking {

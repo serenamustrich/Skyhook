@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     reload::{build_runtime_state, effective_smart_config},
-    Runtime,
+    Runtime, TunRuntimeStatus,
 };
 
 impl Runtime {
@@ -37,6 +37,7 @@ impl Runtime {
             telemetry,
             fakeip_store,
             shutdown: CancellationToken::new(),
+            tun_status: std::sync::RwLock::new(TunRuntimeStatus::Disabled),
         })
     }
 
@@ -68,6 +69,21 @@ impl Runtime {
 
     pub fn is_shutting_down(&self) -> bool {
         self.shutdown.is_cancelled()
+    }
+
+    pub fn set_tun_runtime_status(&self, status: TunRuntimeStatus) {
+        if let Ok(mut current) = self.tun_status.write() {
+            *current = status;
+        }
+    }
+
+    pub fn tun_runtime_status(&self) -> TunRuntimeStatus {
+        self.tun_status
+            .read()
+            .map(|status| status.clone())
+            .unwrap_or(TunRuntimeStatus::Failed(
+                "TUN status lock poisoned".to_string(),
+            ))
     }
 
     pub fn shutdown(&self) {

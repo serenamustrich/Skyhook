@@ -932,7 +932,7 @@ async fn snell_v4_reuse_supports_concurrent_streams() -> anyhow::Result<()> {
         outbound.connect(&destinations[2], 3000),
         outbound.connect(&destinations[3], 3000),
     );
-    let mut tunnels = vec![first?, second?, third?, fourth?];
+    let mut tunnels = [first?, second?, third?, fourth?];
     let payloads = [b"stream-0", b"stream-1", b"stream-2", b"stream-3"];
     for (tunnel, payload) in tunnels.iter_mut().zip(payloads) {
         tunnel.write_all(payload).await?;

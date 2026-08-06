@@ -11,8 +11,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     task::JoinSet,
-    time::{timeout, Duration},
+    time::{timeout_at, Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::core::Runtime;
 use crate::inbound::fakeip::{build_fake_ip_dns_response, extract_domain_from_dns_query};
@@ -139,33 +140,25 @@ async fn fallback_system_dns(runtime: &Runtime, query: &[u8]) -> anyhow::Result<
         !is_core_listener && seen.insert(*server)
     });
 
+    let timeout_ms = config.dns.timeout_ms.clamp(100, 10_000);
     let mut errors = Vec::new();
     for server in servers {
-        let bind_addr = match server.ip() {
-            IpAddr::V4(_) => "0.0.0.0:0",
-            IpAddr::V6(_) => "[::]:0",
-        };
-        let sock = UdpSocket::bind(bind_addr).await?;
-        let sent = tokio::select! {
-            _ = cancellation.cancelled() => return Err(anyhow!("dns fallback cancelled")),
-            result = sock.send_to(query, server) => result,
-        };
-        if let Err(error) = sent {
-            errors.push(format!("{server}: {error}"));
-            continue;
-        }
-        let mut buf = vec![0u8; 65_535];
-        let received = tokio::select! {
-            _ = cancellation.cancelled() => return Err(anyhow!("dns fallback cancelled")),
-            result = timeout(Duration::from_secs(1), sock.recv(&mut buf)) => result,
-        };
-        match received {
-            Ok(Ok(len)) => {
-                buf.truncate(len);
-                return Ok(buf);
+        match exchange_system_dns_server(
+            server,
+            query,
+            Duration::from_millis(timeout_ms),
+            &cancellation,
+        )
+        .await
+        {
+            Ok(response) => {
+                runtime
+                    .telemetry()
+                    .log("debug", format!("system DNS fallback succeeded via {server}"))
+                    .await;
+                return Ok(response);
             }
-            Ok(Err(error)) => errors.push(format!("{server}: {error}")),
-            Err(_) => errors.push(format!("{server}: timed out")),
+            Err(error) => errors.push(format!("{server}: {error}")),
         }
     }
     Err(anyhow!(
@@ -174,7 +167,111 @@ async fn fallback_system_dns(runtime: &Runtime, query: &[u8]) -> anyhow::Result<
     ))
 }
 
-fn discover_system_dns_servers() -> Vec<SocketAddr> {
+pub(crate) async fn exchange_system_dns_server(
+    server: SocketAddr,
+    query: &[u8],
+    timeout_budget: Duration,
+    cancellation: &CancellationToken,
+) -> anyhow::Result<Vec<u8>> {
+    if query.len() > u16::MAX as usize {
+        anyhow::bail!("dns query is too large");
+    }
+    let deadline = Instant::now() + timeout_budget;
+    // Reserve half of the resolver budget for TCP. A silent UDP resolver must
+    // not consume the entire budget and prevent the reliable fallback path.
+    let udp_deadline = Instant::now() + timeout_budget / 2;
+    let bind_addr = match server.ip() {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    let udp_result = tokio::select! {
+        _ = cancellation.cancelled() => return Err(anyhow!("dns fallback cancelled")),
+        result = timeout_at(udp_deadline, exchange_system_dns_udp(&socket, server, query)) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("udp timed out")),
+            }
+        }
+    };
+    match udp_result {
+        Ok(response) => Ok(response),
+        Err(udp_error) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(udp_error.context("udp failed and no time remained for tcp"));
+            }
+            let tcp_result = tokio::select! {
+                _ = cancellation.cancelled() => return Err(anyhow!("dns fallback cancelled")),
+                result = timeout_at(deadline, exchange_system_dns_tcp(server, query)) => {
+                    match result {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow!("tcp timed out")),
+                    }
+                }
+            };
+            tcp_result.map_err(|tcp_error| {
+                anyhow!("udp: {udp_error}; tcp: {tcp_error}")
+            })
+        }
+    }
+}
+
+async fn exchange_system_dns_udp(
+    socket: &UdpSocket,
+    server: SocketAddr,
+    query: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    socket.send_to(query, server).await?;
+    let mut buf = vec![0u8; 65_535];
+    loop {
+        let (len, source) = socket.recv_from(&mut buf).await?;
+        if source != server {
+            continue;
+        }
+        let response = &buf[..len];
+        validate_dns_response(query, response)?;
+        if response[2] & 0x02 != 0 {
+            anyhow::bail!("udp response is truncated");
+        }
+        return Ok(response.to_vec());
+    }
+}
+
+async fn exchange_system_dns_tcp(
+    server: SocketAddr,
+    query: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(server).await?;
+    stream.set_nodelay(true)?;
+    stream.write_all(&(query.len() as u16).to_be_bytes()).await?;
+    stream.write_all(query).await?;
+    let mut len = [0u8; 2];
+    stream.read_exact(&mut len).await?;
+    let response_len = u16::from_be_bytes(len) as usize;
+    if response_len < 12 {
+        anyhow::bail!("tcp DNS response is too short");
+    }
+    let mut response = vec![0u8; response_len];
+    stream.read_exact(&mut response).await?;
+    validate_dns_response(query, &response)?;
+    Ok(response)
+}
+
+fn validate_dns_response(query: &[u8], response: &[u8]) -> anyhow::Result<()> {
+    if query.len() < 2 || response.len() < 12 {
+        anyhow::bail!("invalid DNS response");
+    }
+    if response[0..2] != query[0..2] {
+        anyhow::bail!("DNS transaction id mismatch");
+    }
+    if response[2] & 0x80 == 0 {
+        anyhow::bail!("DNS response is not a response packet");
+    }
+    Ok(())
+}
+
+pub(crate) fn discover_system_dns_servers() -> Vec<SocketAddr> {
     let mut servers = Vec::new();
     #[cfg(target_os = "macos")]
     {
@@ -225,7 +322,7 @@ fn parse_dns_ip(value: &str) -> Option<IpAddr> {
         .and_then(|value| value.trim().parse().ok())
 }
 
-fn parse_plain_dns_server(value: &str) -> Option<SocketAddr> {
+pub(crate) fn parse_plain_dns_server(value: &str) -> Option<SocketAddr> {
     let value = value.trim();
     if let Ok(server) = value.parse() {
         return Some(server);
@@ -364,5 +461,55 @@ mod tests {
                 "[2001:4860:4860::8888]:53".parse().unwrap(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_tcp_when_udp_has_no_responder() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = listener.local_addr().unwrap();
+        let query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let response = {
+            let mut response = query.clone();
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response
+        };
+        let response_for_server = response.clone();
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut incoming = vec![0u8; u16::from_be_bytes(len) as usize];
+            stream.read_exact(&mut incoming).await.unwrap();
+            stream
+                .write_all(&(response_for_server.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&response_for_server).await.unwrap();
+        });
+
+        let cancellation = CancellationToken::new();
+        let result = exchange_system_dns_server(
+            server,
+            &query,
+            Duration::from_secs(1),
+            &cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, response);
+        server_task.await.unwrap();
+    }
+
+    #[test]
+    fn rejects_dns_response_with_wrong_transaction_id() {
+        let query = [0x12, 0x34];
+        let mut response = vec![0u8; 12];
+        response[2] = 0x80;
+        assert!(validate_dns_response(&query, &response).is_err());
     }
 }

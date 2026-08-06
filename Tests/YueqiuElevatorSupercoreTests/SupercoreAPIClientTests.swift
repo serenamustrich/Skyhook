@@ -225,6 +225,41 @@ final class SupercoreAPIClientTests: XCTestCase {
         )
     }
 
+    func testWaitForTunReadyAcceptsRuntimeRunning() async throws {
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/tun",
+            body: Data("{\"runtime\":{\"state\":\"running\",\"error\":null}}".utf8)
+        )
+
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        try await client.waitForTunReady(timeoutInterval: 1)
+    }
+
+    func testWaitForTunReadySurfacesRuntimeFailure() async throws {
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/tun",
+            body: Data("{\"runtime\":{\"state\":\"failed\",\"error\":\"Operation not permitted\"}}".utf8)
+        )
+
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        do {
+            try await client.waitForTunReady(timeoutInterval: 1)
+            XCTFail("TUN failure should be surfaced")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Operation not permitted"))
+        }
+    }
+
+    func testWaitForTunDisabledAcceptsRuntimeDisabled() async throws {
+        SupercoreProbeGroupCaptureProtocol.setResponse(
+            path: "/v1/tun",
+            body: Data("{\"runtime\":{\"state\":\"disabled\",\"error\":null}}".utf8)
+        )
+
+        let client = SupercoreAPIClient(baseURL: URL(string: "http://127.0.0.1:9197")!)
+        try await client.waitForTunDisabled(timeoutInterval: 1)
+    }
+
     func testListClientFollowsOpaquePaginationCursorAndMergesEveryPage() async throws {
         let first = """
         {

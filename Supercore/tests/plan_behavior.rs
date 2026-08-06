@@ -3,7 +3,7 @@ use supercore::routing::{AppIdentity, Destination, target_matches};
 use supercore::config::RuleTarget;
 use supercore::subscription_store::SubscriptionStore;
 
-use std::{collections::HashSet, fs};
+use std::{collections::HashSet, fs, net::IpAddr};
 
 #[test]
 fn test_tun_bypass_includes_lan_ranges() {
@@ -173,7 +173,7 @@ fn test_rule_target_coverage() {
         RuleTarget::DomainRegex, RuleTarget::IpCidr, RuleTarget::IpCidr6,
         RuleTarget::GeoSite, RuleTarget::AppName, RuleTarget::AppPath,
         RuleTarget::AppPathRegex, RuleTarget::AppBundle,
-        RuleTarget::InPort, RuleTarget::SrcIpCidr, RuleTarget::DstPort,
+        RuleTarget::InPort, RuleTarget::SrcIpCidr, RuleTarget::SrcPort, RuleTarget::DstPort,
         RuleTarget::Network, RuleTarget::Match,
     ];
 
@@ -220,14 +220,34 @@ fn test_rule_target_coverage() {
     ));
     assert!(target_matches(RuleTarget::AppBundle, "com.tencent.xinWeChat", &app_target));
 
-    assert!(target_matches(RuleTarget::InPort, "80", &Destination::new("api.example.com", 80)));
-    assert!(!target_matches(RuleTarget::InPort, "443", &Destination::new("api.example.com", 80)));
+    assert!(target_matches(
+        RuleTarget::InPort,
+        "80",
+        &Destination::new("api.example.com", 443).with_in_port(80)
+    ));
+    assert!(!target_matches(
+        RuleTarget::InPort,
+        "443",
+        &Destination::new("api.example.com", 80)
+    ));
     assert!(target_matches(RuleTarget::DstPort, "80", &Destination::new("api.example.com", 80)));
+
+    let contextual = Destination::new("api.example.com", 8443)
+        .with_source("192.168.1.10".parse::<IpAddr>().unwrap(), 53124)
+        .with_in_port(7890)
+        .with_network("tcp");
+    assert!(target_matches(RuleTarget::SrcIpCidr, "192.168.1.0/24", &contextual));
+    assert!(target_matches(RuleTarget::SrcPort, "53000-53200", &contextual));
+    assert!(target_matches(RuleTarget::InPort, "7890", &contextual));
+    assert!(target_matches(RuleTarget::DstPort, "8400-8500", &contextual));
+    assert!(target_matches(RuleTarget::Network, "TCP", &contextual));
+    assert!(!target_matches(RuleTarget::Network, "udp", &contextual));
 
     let ip = Destination::new("8.8.8.8", 443);
     assert!(!target_matches(RuleTarget::SrcIpCidr, "8.8.8.0/24", &ip));
     assert!(!target_matches(RuleTarget::GeoIp, "CN", &ip));
     assert!(!target_matches(RuleTarget::Network, "tcp", &ip));
+    assert!(!target_matches(RuleTarget::InPort, "443", &ip));
     assert!(target_matches(RuleTarget::Match, "any", &ip));
 }
 

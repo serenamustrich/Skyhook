@@ -14,9 +14,46 @@ use supercore::{
     geo, inbound, subscription,
     subscription_store::{SubscriptionStore, SubscriptionUpdateOptions, DEFAULT_STORE_DIR},
 };
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Duration};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+fn system_proxy_points_to_loopback(scutil_proxy_output: &str) -> bool {
+    let mut enabled = HashMap::new();
+    let mut servers = HashMap::new();
+    for line in scutil_proxy_output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "HTTPEnable" | "HTTPSEnable" | "SOCKSEnable" => {
+                enabled.insert(key, value == "1");
+            }
+            "HTTPProxy" | "HTTPSProxy" | "SOCKSProxy" => {
+                servers.insert(key, value);
+            }
+            _ => {}
+        }
+    }
+
+    [
+        ("HTTPEnable", "HTTPProxy"),
+        ("HTTPSEnable", "HTTPSProxy"),
+        ("SOCKSEnable", "SOCKSProxy"),
+    ]
+    .into_iter()
+    .any(|(enable_key, server_key)| {
+        enabled.get(enable_key).copied().unwrap_or(false)
+            && matches!(
+                servers.get(server_key).copied(),
+                Some("127.0.0.1" | "localhost" | "::1")
+            )
+    })
+}
 
 #[derive(Parser)]
 #[command(name = "supercore")]
@@ -160,9 +197,7 @@ async fn main() -> anyhow::Result<()> {
 
             let mut tasks = JoinSet::new();
             tasks.spawn(api::serve(runtime.clone()));
-            if runtime.config().tun.enabled {
-                tasks.spawn(inbound::tun::serve(runtime.clone()));
-            }
+            tasks.spawn(supervise_tun(runtime.clone()));
             if runtime.config().dns.enabled && runtime.config().dns.listen.is_some() {
                 tasks.spawn(inbound::dns::serve(runtime.clone()));
             }
@@ -357,7 +392,7 @@ async fn main() -> anyhow::Result<()> {
                     .output();
                 if let Ok(o) = proxy_check {
                     let stdout = String::from_utf8_lossy(&o.stdout);
-                    if stdout.contains("127.0.0.1") {
+                    if system_proxy_points_to_loopback(&stdout) {
                         println!("\nSystem proxy still points to 127.0.0.1");
                         if !dry_run {
                             println!("  Restoring system proxy...");
@@ -401,6 +436,99 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Keep the TUN task aligned with runtime config reloads.
+///
+/// A root LaunchDaemon is intentionally long-lived so normal App launches do
+/// not ask for administrator authorization again. TUN itself is therefore a
+/// child task that can be started/stopped when `tun.enabled` changes.
+async fn supervise_tun(runtime: Arc<Runtime>) -> anyhow::Result<()> {
+    let process_shutdown = runtime.cancellation_token();
+    let mut child: Option<(CancellationToken, JoinHandle<anyhow::Result<()>>)> = None;
+
+    loop {
+        if process_shutdown.is_cancelled() {
+            if let Some((shutdown, handle)) = child.take() {
+                let _ = stop_tun_child(shutdown, handle).await;
+            }
+            return Ok(());
+        }
+
+        let desired = runtime.config().tun.enabled;
+        if desired && child.is_none() {
+            let shutdown = CancellationToken::new();
+            let task_shutdown = shutdown.clone();
+            let task_runtime = runtime.clone();
+            child = Some((
+                shutdown,
+                tokio::spawn(async move {
+                    inbound::tun::serve_with_shutdown(task_runtime, task_shutdown).await
+                }),
+            ));
+            runtime
+                .telemetry()
+                .log(
+                    "info",
+                    "TUN supervisor started a runtime instance".to_string(),
+                )
+                .await;
+        } else if !desired {
+            if let Some((shutdown, handle)) = child.take() {
+                stop_tun_child(shutdown, handle).await?;
+                runtime
+                    .telemetry()
+                    .log(
+                        "info",
+                        "TUN supervisor stopped the runtime instance".to_string(),
+                    )
+                    .await;
+            }
+        }
+
+        let child_finished = child
+            .as_ref()
+            .map(|(_, handle)| handle.is_finished())
+            .unwrap_or(false);
+        if child_finished {
+            if let Some((shutdown, finished)) = child.take() {
+                let result = finished
+                    .await
+                    .map_err(|error| anyhow::anyhow!("TUN task join failed: {error}"))?;
+                if runtime.config().tun.enabled {
+                    result.map_err(|error| {
+                        anyhow::anyhow!("TUN task stopped unexpectedly: {error}")
+                    })?;
+                    return Err(anyhow::anyhow!("TUN task stopped unexpectedly"));
+                }
+                let _ = shutdown;
+            }
+        }
+
+        tokio::select! {
+            _ = process_shutdown.cancelled() => {}
+            _ = sleep(Duration::from_millis(250)) => {}
+        }
+    }
+}
+
+async fn stop_tun_child(
+    shutdown: CancellationToken,
+    mut handle: JoinHandle<anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    shutdown.cancel();
+    match timeout(Duration::from_secs(5), &mut handle).await {
+        Ok(joined) => {
+            let result =
+                joined.map_err(|error| anyhow::anyhow!("TUN task join failed: {error}"))?;
+            result
+        }
+        Err(_) => {
+            handle.abort();
+            let _ = handle.await;
+            Err(anyhow::anyhow!("TUN shutdown timed out; task aborted"))
+        }
+    }
 }
 
 async fn load_runtime_config(path: &Path) -> anyhow::Result<SuperConfig> {
@@ -608,6 +736,8 @@ fn outbound_api_kind(config: &supercore::config::OutboundConfig) -> String {
     use supercore::config::OutboundConfig;
     match config {
         OutboundConfig::Direct { .. } => "direct".to_string(),
+        OutboundConfig::Dns { .. } => "dns".to_string(),
+        OutboundConfig::Rematch { .. } => "rematch".to_string(),
         OutboundConfig::Reject { .. } => "reject".to_string(),
         OutboundConfig::Http { .. } => "http".to_string(),
         OutboundConfig::Socks5 { .. } => "socks5".to_string(),
@@ -629,6 +759,9 @@ fn outbound_api_kind(config: &supercore::config::OutboundConfig) -> String {
         OutboundConfig::Juicity { .. } => "juicity".to_string(),
         OutboundConfig::Masque { .. } => "masque".to_string(),
         OutboundConfig::OpenVpn { .. } => "openvpn".to_string(),
+        OutboundConfig::Tailscale { .. } => "tailscale".to_string(),
+        OutboundConfig::TrustTunnel { .. } => "trusttunnel".to_string(),
+        OutboundConfig::Sudoku { .. } => "sudoku".to_string(),
         OutboundConfig::Unknown { protocol, .. } => format!("unknown:{}", protocol),
         OutboundConfig::Group { kind, .. } => format!("group:{}", kind),
     }
@@ -750,11 +883,14 @@ fn classify_outbound_without_runtime(
         OutboundConfig::Group { .. } => OutboundSupportState::Full,
         OutboundConfig::Hysteria { .. }
         | OutboundConfig::Mieru { .. }
-        | OutboundConfig::Juicity { .. } => OutboundSupportState::Full,
-        OutboundConfig::Reject { .. } => OutboundSupportState::Unsupported,
-        OutboundConfig::Unknown { .. }
+        | OutboundConfig::Juicity { .. }
         | OutboundConfig::Masque { .. }
-        | OutboundConfig::OpenVpn { .. } => OutboundSupportState::ParseOnly,
+        | OutboundConfig::OpenVpn { .. }
+        | OutboundConfig::Tailscale { .. }
+        | OutboundConfig::TrustTunnel { .. } => OutboundSupportState::Full,
+        OutboundConfig::Sudoku { .. } => OutboundSupportState::Full,
+        OutboundConfig::Reject { .. } => OutboundSupportState::Unsupported,
+        OutboundConfig::Unknown { .. } => OutboundSupportState::ParseOnly,
         _ => OutboundSupportState::Partial,
     }
 }
@@ -787,14 +923,54 @@ async fn read_subscription_source(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod doctor_summary_tests {
     use super::*;
     use std::collections::BTreeMap;
     use supercore::config::OutboundConfig;
 
     #[test]
+    fn proxy_cleanup_only_reports_enabled_loopback_proxy() {
+        let disabled = r#"
+HTTPEnable : 0
+HTTPProxy : 127.0.0.1
+HTTPSEnable : 0
+HTTPSProxy : 127.0.0.1
+SOCKSEnable : 0
+SOCKSProxy : 127.0.0.1
+"#;
+        assert!(!system_proxy_points_to_loopback(disabled));
+
+        let enabled = r#"
+HTTPEnable : 1
+HTTPProxy : 127.0.0.1
+"#;
+        assert!(system_proxy_points_to_loopback(enabled));
+
+        let remote = r#"
+HTTPEnable : 1
+HTTPProxy : 192.0.2.10
+"#;
+        assert!(!system_proxy_points_to_loopback(remote));
+    }
+
+    #[test]
     fn default_runtime_never_updates_subscriptions_during_startup() {
         assert!(!SuperConfig::default().subscriptions.update_on_start);
+    }
+
+    #[tokio::test]
+    async fn stop_tun_child_cancels_the_owned_task() {
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+            Ok(())
+        });
+
+        stop_tun_child(shutdown, handle)
+            .await
+            .expect("cooperative TUN task should stop cleanly");
     }
 
     #[test]
@@ -850,6 +1026,7 @@ mod doctor_summary_tests {
                 name: "ovpn-node".to_string(),
                 profile: None,
                 inline_profile: None,
+                options: Default::default(),
             },
             OutboundConfig::Group {
                 name: "group:us".to_string(),
@@ -868,8 +1045,8 @@ mod doctor_summary_tests {
         let summary = summarize_outbound_support(&config);
         assert_eq!(summary.full_count, 5);
         assert_eq!(summary.partial_count, 0);
-        assert_eq!(summary.parse_only_count, 2);
-        assert_eq!(summary.unsupported_count, 1);
+        assert_eq!(summary.parse_only_count, 1);
+        assert_eq!(summary.unsupported_count, 2);
         assert_eq!(summary.group_count, 1);
 
         assert_eq!(
@@ -930,8 +1107,8 @@ mod doctor_summary_tests {
             Some(ProtocolSupportSummary {
                 full_count: 0,
                 partial_count: 0,
-                parse_only_count: 1,
-                unsupported_count: 0,
+                parse_only_count: 0,
+                unsupported_count: 1,
             })
         );
         assert_eq!(

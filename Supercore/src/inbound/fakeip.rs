@@ -33,6 +33,8 @@ pub struct FakeIpStore {
 struct FakeIpInner {
     domain_to_ip: HashMap<String, FakeIpEntry>,
     ip_to_domain: HashMap<Ipv4Addr, FakeIpEntry>,
+    range_start: u32,
+    range_end: u32,
     next_ip: u32,
     ttl: Duration,
     filter: Vec<String>,
@@ -45,6 +47,8 @@ impl FakeIpStore {
             inner: Arc::new(RwLock::new(FakeIpInner {
                 domain_to_ip: HashMap::new(),
                 ip_to_domain: HashMap::new(),
+                range_start: FAKE_IP_RANGE_START,
+                range_end: FAKE_IP_RANGE_END,
                 next_ip: FAKE_IP_RANGE_START,
                 ttl: Duration::from_secs(ttl_secs.max(10)),
                 filter,
@@ -54,11 +58,12 @@ impl FakeIpStore {
     }
 
     pub async fn lookup_or_create(&self, domain: &str) -> Option<Ipv4Addr> {
+        let domain = canonical_domain(domain)?;
         let mut inner = self.inner.write().await;
         let filter_matches = inner
             .filter
             .iter()
-            .any(|item| domain_matches_filter(domain, item));
+            .any(|item| domain_matches_filter(&domain, item));
         let should_fake = match inner.filter_mode {
             FakeIpFilterMode::Blacklist | FakeIpFilterMode::Rule => !filter_matches,
             FakeIpFilterMode::Whitelist => filter_matches,
@@ -67,16 +72,26 @@ impl FakeIpStore {
             return None;
         }
 
-        if let Some(entry) = inner.domain_to_ip.get(domain) {
+        if let Some(entry) = inner.domain_to_ip.get(&domain) {
             if !entry.is_expired() {
                 return Some(entry.ip);
             }
+            let old_ip = entry.ip;
+            inner.domain_to_ip.remove(&domain);
+            if inner
+                .ip_to_domain
+                .get(&old_ip)
+                .is_some_and(|current| current.domain == domain)
+            {
+                inner.ip_to_domain.remove(&old_ip);
+            }
         }
 
-        loop {
+        let range_size = inner.range_end - inner.range_start + 1;
+        for _ in 0..range_size {
             let ip = Ipv4Addr::from(inner.next_ip);
-            inner.next_ip = if inner.next_ip >= FAKE_IP_RANGE_END {
-                FAKE_IP_RANGE_START
+            inner.next_ip = if inner.next_ip >= inner.range_end {
+                inner.range_start
             } else {
                 inner.next_ip + 1
             };
@@ -87,35 +102,51 @@ impl FakeIpStore {
             }
 
             if let Some(old_domain) = inner.ip_to_domain.get(&ip).map(|e| e.domain.clone()) {
-                inner.domain_to_ip.remove(&old_domain);
+                if inner
+                    .domain_to_ip
+                    .get(&old_domain)
+                    .is_some_and(|current| current.ip == ip)
+                {
+                    inner.domain_to_ip.remove(&old_domain);
+                }
+                inner.ip_to_domain.remove(&ip);
             }
 
             let entry = FakeIpEntry {
                 ip,
-                domain: domain.to_string(),
+                domain: domain.clone(),
                 created_at: Instant::now(),
                 ttl: inner.ttl,
             };
-            inner.domain_to_ip.insert(domain.to_string(), entry.clone());
+            inner.domain_to_ip.insert(domain.clone(), entry.clone());
             inner.ip_to_domain.insert(ip, entry);
             return Some(ip);
         }
+
+        None
     }
 
     pub async fn reverse_lookup(&self, ip: &Ipv4Addr) -> Option<String> {
-        let inner = self.inner.read().await;
-        inner.ip_to_domain.get(ip).and_then(|entry| {
-            if entry.is_expired() {
-                None
-            } else {
-                Some(entry.domain.clone())
+        let mut inner = self.inner.write().await;
+        let entry = inner.ip_to_domain.get(ip).cloned()?;
+        if entry.is_expired() {
+            inner.ip_to_domain.remove(ip);
+            if inner
+                .domain_to_ip
+                .get(&entry.domain)
+                .is_some_and(|current| current.ip == *ip)
+            {
+                inner.domain_to_ip.remove(&entry.domain);
             }
-        })
+            None
+        } else {
+            Some(entry.domain)
+        }
     }
 
     pub async fn is_fake_ip(&self, ip: &Ipv4Addr) -> bool {
         let num: u32 = (*ip).into();
-        num >= FAKE_IP_RANGE_START && num <= FAKE_IP_RANGE_END
+        (FAKE_IP_RANGE_START..=FAKE_IP_RANGE_END).contains(&num)
     }
 
     pub async fn cleanup_expired(&self) {
@@ -157,11 +188,33 @@ fn domain_matches_filter(domain: &str, filter: &str) -> bool {
     if filter == "*" {
         return true;
     }
-    let suffix = filter
+    if let Some(suffix) = filter
         .strip_prefix("*.")
         .or_else(|| filter.strip_prefix("+."))
-        .unwrap_or(filter.trim_start_matches('.'));
-    domain == suffix || domain.ends_with(&format!(".{suffix}"))
+        .or_else(|| filter.strip_prefix('.'))
+    {
+        return domain == suffix || domain.ends_with(&format!(".{suffix}"));
+    }
+    domain == filter
+}
+
+fn canonical_domain(value: &str) -> Option<String> {
+    let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() || domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
+        return None;
+    }
+    if domain.split('.').any(|label| {
+        label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte >= 0x80)
+    }) {
+        return None;
+    }
+    Some(domain)
 }
 
 pub fn build_fake_ip_dns_response(
@@ -271,5 +324,48 @@ mod tests {
 
         assert!(store.lookup_or_create("api.example.com").await.is_some());
         assert_eq!(store.lookup_or_create("example.net").await, None);
+    }
+
+    #[tokio::test]
+    async fn domain_keys_are_canonical_and_exact_filters_stay_exact() {
+        let store = FakeIpStore::new(60, vec!["example.com".to_string()], FakeIpFilterMode::Blacklist);
+
+        assert_eq!(store.lookup_or_create("Example.COM.").await, None);
+        let first = store.lookup_or_create("Example.NET.").await.unwrap();
+        assert_eq!(store.lookup_or_create("example.net").await, Some(first));
+        assert_eq!(store.lookup_or_create("api.example.net").await, Some(Ipv4Addr::new(198, 18, 0, 2)));
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_removed_from_both_indexes() {
+        let store = FakeIpStore::new(60, Vec::new(), FakeIpFilterMode::Blacklist);
+        let ip = store.lookup_or_create("expired.example").await.unwrap();
+        {
+            let mut inner = store.inner.write().await;
+            inner.domain_to_ip.get_mut("expired.example").unwrap().ttl = Duration::ZERO;
+            inner.ip_to_domain.get_mut(&ip).unwrap().ttl = Duration::ZERO;
+            assert!(inner.ip_to_domain.contains_key(&ip));
+        }
+        assert_eq!(store.reverse_lookup(&ip).await, None);
+        assert_eq!(store.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn full_pool_returns_none_without_overwriting_live_entries() {
+        let store = FakeIpStore {
+            inner: Arc::new(RwLock::new(FakeIpInner {
+                domain_to_ip: HashMap::new(),
+                ip_to_domain: HashMap::new(),
+                range_start: 1,
+                range_end: 1,
+                next_ip: 1,
+                ttl: Duration::from_secs(60),
+                filter: Vec::new(),
+                filter_mode: FakeIpFilterMode::Blacklist,
+            })),
+        };
+        let first = store.lookup_or_create("one.example").await.unwrap();
+        assert_eq!(store.lookup_or_create("two.example").await, None);
+        assert_eq!(store.reverse_lookup(&first).await.as_deref(), Some("one.example"));
     }
 }

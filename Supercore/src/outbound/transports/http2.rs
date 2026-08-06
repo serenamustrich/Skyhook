@@ -71,6 +71,52 @@ where
     })
 }
 
+pub(crate) async fn open_h2_connect<S>(
+    stream: S,
+    authority: &str,
+    authorization: Option<&str>,
+    user_agent: &str,
+    timeout_ms: u64,
+) -> anyhow::Result<Http2TunnelStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let context = active_dial_context();
+    let (sender, connection) = run_h2_phase(
+        context.as_ref(),
+        timeout_ms,
+        "h2 handshake",
+        h2::client::Builder::new().handshake(stream),
+    )
+    .await?
+    .context("h2 handshake failed")?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            tracing::debug!(error = %error, "h2 connection ended");
+        }
+    });
+    let mut sender = run_h2_phase(
+        context.as_ref(),
+        timeout_ms,
+        "h2 client readiness",
+        sender.ready(),
+    )
+    .await?
+    .context("h2 client is not ready")?;
+    let mut request = http::Request::builder()
+        .method(http::Method::CONNECT)
+        .version(http::Version::HTTP_2)
+        .uri(format!("https://{authority}"))
+        .header(http::header::USER_AGENT, user_agent);
+    if let Some(authorization) = authorization {
+        request = request.header(http::header::PROXY_AUTHORIZATION, authorization);
+    }
+    let (response, send) = sender
+        .send_request(request.body(()).context("failed to build h2 CONNECT request")?, false)
+        .context("failed to send h2 CONNECT request")?;
+    Ok(Http2TunnelStream::from_parts(send, response))
+}
+
 async fn run_h2_phase<F, T>(
     context: Option<&DialContext>,
     timeout_ms: u64,

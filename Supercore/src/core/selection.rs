@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::anyhow;
 use serde::Serialize;
@@ -108,17 +108,53 @@ impl Runtime {
     }
 
     pub fn decide(&self, destination: &Destination) -> RouteDecision {
-        if let Some(decision) = self.smart_rules.decide(destination) {
-            return decision;
-        }
-        match self.state.read() {
-            Ok(state) => state.router.decide(destination),
-            Err(_) => RouteDecision {
+        self.resolve_route(destination)
+            .unwrap_or_else(|_| RouteDecision {
                 outbound: "direct".to_string(),
                 matched_rule: None,
                 source: crate::routing::RouteDecisionSource::Default,
-            },
+            })
+    }
+
+    pub fn resolve_route(&self, destination: &Destination) -> anyhow::Result<RouteDecision> {
+        const MAX_REMATCH_DEPTH: usize = 8;
+        let mut current = destination.clone();
+        let mut visited = HashSet::new();
+        for _ in 0..=MAX_REMATCH_DEPTH {
+            let (decision, rematch) = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| anyhow!("runtime state lock poisoned"))?;
+                let decision = if let Some(decision) = self.smart_rules.decide(&current) {
+                    decision
+                } else {
+                    state.router.decide(&current)
+                };
+                let rematch = state
+                    .outbounds
+                    .get(&decision.outbound)
+                    .and_then(|outbound| outbound.rematch_target());
+                (decision, rematch)
+            };
+            let Some(rematch) = rematch else {
+                return Ok(decision);
+            };
+            if !visited.insert(decision.outbound.clone()) {
+                return Err(anyhow!(
+                    "rematch cycle detected at outbound '{}'",
+                    decision.outbound
+                ));
+            }
+            let Some(name) = rematch.rematch_name else {
+                return Err(anyhow!("rematch outbound has no target context"));
+            };
+            current.rematch_name = Some(name);
         }
+        Err(anyhow!(
+            "rematch exceeded maximum depth of {}",
+            MAX_REMATCH_DEPTH
+        ))
     }
 
     pub async fn proxy_groups(&self) -> Vec<ProxyGroupSnapshot> {
@@ -363,6 +399,8 @@ fn country_groups_from_config(
         if matches!(
             outbound,
             OutboundConfig::Direct { .. }
+                | OutboundConfig::Dns { .. }
+                | OutboundConfig::Rematch { .. }
                 | OutboundConfig::Reject { .. }
                 | OutboundConfig::Group { .. }
         ) {
@@ -435,11 +473,16 @@ fn outbound_server(outbound: &OutboundConfig) -> Option<&str> {
         | OutboundConfig::Ssh { server, .. }
         | OutboundConfig::Mieru { server, .. }
         | OutboundConfig::Juicity { server, .. }
-        | OutboundConfig::Masque { server, .. } => Some(server),
+        | OutboundConfig::Masque { server, .. }
+        | OutboundConfig::TrustTunnel { server, .. }
+        | OutboundConfig::Sudoku { server, .. } => Some(server),
         OutboundConfig::Unknown { server, .. } => server.as_deref(),
         OutboundConfig::Direct { .. }
+        | OutboundConfig::Dns { .. }
+        | OutboundConfig::Rematch { .. }
         | OutboundConfig::Reject { .. }
         | OutboundConfig::OpenVpn { .. }
+        | OutboundConfig::Tailscale { .. }
         | OutboundConfig::Group { .. } => None,
     }
 }
@@ -581,6 +624,8 @@ fn detect_country(value: &str) -> Option<(&'static str, &'static str)> {
 fn outbound_config_kind(config: &OutboundConfig) -> String {
     match config {
         OutboundConfig::Direct { .. } => "direct".to_string(),
+        OutboundConfig::Dns { .. } => "dns".to_string(),
+        OutboundConfig::Rematch { .. } => "rematch".to_string(),
         OutboundConfig::Reject { .. } => "reject".to_string(),
         OutboundConfig::Http { .. } => "http".to_string(),
         OutboundConfig::Socks5 { .. } => "socks5".to_string(),
@@ -602,6 +647,9 @@ fn outbound_config_kind(config: &OutboundConfig) -> String {
         OutboundConfig::Juicity { .. } => "juicity".to_string(),
         OutboundConfig::Masque { .. } => "masque".to_string(),
         OutboundConfig::OpenVpn { .. } => "openvpn".to_string(),
+        OutboundConfig::Tailscale { .. } => "tailscale".to_string(),
+        OutboundConfig::TrustTunnel { .. } => "trusttunnel".to_string(),
+        OutboundConfig::Sudoku { .. } => "sudoku".to_string(),
         OutboundConfig::Unknown { protocol, .. } => format!("unknown:{protocol}"),
         OutboundConfig::Group { kind, .. } => format!("group:{kind}"),
     }

@@ -121,7 +121,7 @@ impl Runtime {
                     .filter(|outbound| {
                         requested_names
                             .as_ref()
-                            .map_or(true, |names| names.contains(outbound.name()))
+                            .is_none_or(|names| names.contains(outbound.name()))
                     })
                     .cloned()
                     .collect::<Vec<_>>(),
@@ -545,10 +545,10 @@ mod tests {
     use super::{classify_probe_failure, ProbeOptions, Runtime};
 
     #[test]
-    fn test_classify_probe_failure_protocol_not_implemented() {
+    fn test_classify_probe_failure_protocol_unsupported() {
         assert_eq!(
             classify_probe_failure(
-                "protocol hysteria is recognized but native dialing is not implemented yet"
+                "protocol example is recognized but native dialing is not implemented yet"
             ),
             "protocol_unsupported"
         );

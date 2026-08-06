@@ -83,16 +83,12 @@ impl Runtime {
         &self,
         destination: &Destination,
     ) -> anyhow::Result<(BoxedStream, RouteDecision, String)> {
+        let decision = self.resolve_route(destination)?;
         let (decision, outbound, connect_timeout_ms) = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| anyhow!("runtime state lock poisoned"))?;
-            let decision = if let Some(decision) = self.smart_rules.decide(destination) {
-                decision
-            } else {
-                state.router.decide(destination)
-            };
             let outbound = state
                 .outbounds
                 .get(&decision.outbound)
@@ -196,16 +192,12 @@ impl Runtime {
         destination: Destination,
         payload: &[u8],
     ) -> anyhow::Result<Vec<u8>> {
+        let decision = self.resolve_route(&destination)?;
         let (decision, outbound, connect_timeout_ms) = {
             let state = self
                 .state
                 .read()
                 .map_err(|_| anyhow!("runtime state lock poisoned"))?;
-            let decision = if let Some(decision) = self.smart_rules.decide(&destination) {
-                decision
-            } else {
-                state.router.decide(&destination)
-            };
             let outbound = state
                 .outbounds
                 .get(&decision.outbound)

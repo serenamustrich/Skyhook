@@ -32,7 +32,12 @@
 | Mieru | full | full | full | full | tcp/udp | full | 原生 Mieru v3：PBKDF2-HMAC-SHA256、XChaCha20-Poly1305、用户名/密码认证、官方 `mierus://` 与完整 protobuf `mieru://` 分享格式、固定端口和 `port-range`、TCP/UDP underlay、标准/no-wait 握手、off/low/middle/high multiplexing、随机 padding、MTU 分片、累计 ACK、重排、RTT/RTO、快速重传、CUBIC、心跳和 SOCKS5 UDP ASSOCIATE；已与官方 `mita` 服务端完成 TCP/UDP、多路复用、UDP ASSOCIATE 及丢包乱序互通 |
 | Juicity | full | full | full | full | quic/tls/h3-alpn | full | 原生 Juicity v0：UUID/password TLS exporter 鉴权、QUIC 双向流 TCP、可靠 UDP-over-stream、endpoint-independent 会话池、BBR/Cubic/NewReno、keepalive、TLS session cache、断线重建及官方证书链 SHA-256 pin；本地真实 QUIC 覆盖 TCP/UDP、错误鉴权、证书 pin 和 session 恢复，并与官方 v0.5.0 服务端完成双 TCP 流复用、UDP relay 与错误密码互操作 |
 | MASQUE | full | full | full | full | h2/h3/connect-ip/connect-udp | full | 原生 Cloudflare Access H3/H2 CONNECT-IP、H3 L4 CONNECT 与 RFC 9298 CONNECT-UDP；支持 ECDSA mTLS、服务端 SPKI pin、IPv4/IPv6 用户态 TCP/UDP、远端 DNS、TTL/hop 修正、route advertisement、H2 capsule、标准和旧版 H3 datagram setting、flow/context ID、URI template、会话池、BBR/Cubic/NewReno、CWND profile、keepalive 和握手超时；本地真实 H2/H3 服务端覆盖 TCP/UDP 和错误公钥拒绝 |
-| OpenVPN | parse-only | parse-only | none | none | - | parse-only | 解析器可识别配置，native 拨号未实现 |
+| OpenVPN | full | full | full | full | tcp/udp/tun-userspace | full | 原生 TLS control/data channel、TCP/UDP、push route/DNS、重连与用户态 L3 relay；官方 TCP 互操作和本地 UDP/L3 测试已通过 |
+| Sudoku | full | full | full | full | tcp/http-mask/ws/uot | full | KIP 握手、AEAD、纯 Sudoku/6-bit packed 下行、UoT、ASCII/entropy/custom table、custom_tables 轮换及 legacy/stream/poll/auto/ws HTTP 伪装 |
+| TrustTunnel | full | full | full | full | h2/h3/udp2 | full | Basic 认证、TLS+HTTP/2 CONNECT、HTTP/3 CONNECT、TCP relay 和 `_udp2` 帧；本地 TLS/H2 双向真实拨号已验证 |
+| Tailscale | full | full | full | full | native-userspace | full | 独立 Rust userspace Device、持久化 identity/control state、TCP/UDP、hostname/tags 和可选 auth key；不调用系统 Tailscale 进程、不修改主机路由 |
+| DNS outbound | full | full | none | full | udp/tcp/dot/doh | full | 作为规则目标提供 raw DNS query 的 UDP、TCP、DoT 与 DoH upstream |
+| Rematch | full | full | rule-control | rule-control | rule re-entry | full | 重新进入规则决策，支持命名上下文、sub-rule 映射、循环检测和最大深度保护 |
 
 ## 传输层支持
 
@@ -98,11 +103,13 @@
 - 跨协议精确读取 helper 位于 `src/outbound/io.rs`；协议私有 crypto/framing 不进入
   公共 outbound 根模块。
 
-## 未完成协议边界
+## 当前边界
 
-1. **OpenVPN**: 当前仍为 `parse-only`
-2. **DNS outbound / Rematch / Sudoku / Tailscale / TrustTunnel**: 尚未进入正式出站模型
-3. **SSR public interoperability**: 当前目标协议、混淆、TCP/UDP 与多用户路径均已实拨；仍可继续扩大公开服务端组合互操作覆盖
+1. `faketcp` 依赖平台级 packet backend；macOS 上由 OpenVPN/Hysteria v1 在拨号前明确拒绝，不能静默退化为 TCP。
+2. Tailscale 需要用户提供有效 auth key 或已有 Skyhook state file；仓库不包含 tailnet 凭据，也不自动使用系统 Tailscale 安装。
+3. DNS outbound 和 Rematch 是核心控制能力，不是普通 TCP 代理节点；其能力由规则和 runtime 选择器调用。
+4. 本机 CI 已覆盖协议 parser、native outbound、mock/本地服务端真实拨号和错误边界；DoH 已通过 release Supercore DNS listener 对公共 `cloudflare-dns.com/dns-query` 实际查询验证。以下互操作门仍需要目标环境凭据或系统能力，不能仅凭本机结果宣称完成：MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale tailnet、TrustTunnel H3 外部服务端、DNS over TLS 外部 resolver，以及其他第三方 DoH 服务端变体。
+5. `full` 表示该协议适用的核心 TCP/UDP 路径已经实现并有本地或 mock 证据，不表示所有第三方服务端变体、平台内核能力和外部账号场景都已在当前机器上执行。
 
 ## 已有测试
 

@@ -842,7 +842,7 @@ fn trim_observations(
         .values()
         .map(|item| (item.last_seen_at, item.key.clone()))
         .collect::<Vec<_>>();
-    keys.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+    keys.sort_by_key(|item| item.0);
     let remove_count = observations.len().saturating_sub(max_observations);
     for (_, key) in keys.into_iter().take(remove_count) {
         observations.remove(&key);
@@ -905,11 +905,13 @@ fn normalized_value(target: RuleTarget, value: &str) -> String {
         | RuleTarget::AppPath
         | RuleTarget::AppPathRegex
         | RuleTarget::AppBundle
+        | RuleTarget::RematchName
         | RuleTarget::RuleSet
         | RuleTarget::GeoIp
         | RuleTarget::GeoSite
         | RuleTarget::InPort
         | RuleTarget::SrcIpCidr
+        | RuleTarget::SrcPort
         | RuleTarget::DstPort
         | RuleTarget::Network => value.to_ascii_lowercase(),
         RuleTarget::Match => value.to_string(),

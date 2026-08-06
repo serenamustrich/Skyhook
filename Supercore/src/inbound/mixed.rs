@@ -8,6 +8,7 @@ use tokio::{
     task::JoinSet,
 };
 use url::Url;
+use std::net::SocketAddr;
 
 use crate::{core::Runtime, routing::Destination};
 
@@ -45,7 +46,7 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
                 let (stream, peer) = accepted?;
                 let runtime = runtime.clone();
                 clients.spawn(async move {
-                    if let Err(error) = handle_client(runtime.clone(), stream).await {
+                    if let Err(error) = handle_client(runtime.clone(), stream, peer).await {
                         runtime
                             .telemetry()
                             .log("warn", format!("mixed client {peer} failed: {error:#}"))
@@ -60,19 +61,27 @@ pub async fn serve(runtime: Arc<Runtime>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_client(runtime: Arc<Runtime>, stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_client(
+    runtime: Arc<Runtime>,
+    stream: TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
     let mut first = [0u8; 1];
     let n = stream.peek(&mut first).await?;
     if n == 0 {
         return Ok(());
     }
     match first[0] {
-        0x05 => handle_socks5(runtime, stream).await,
-        _ => handle_http(runtime, stream).await,
+        0x05 => handle_socks5(runtime, stream, peer).await,
+        _ => handle_http(runtime, stream, peer).await,
     }
 }
 
-async fn handle_socks5(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_socks5(
+    runtime: Arc<Runtime>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
     let mut header = [0u8; 2];
     stream.read_exact(&mut header).await?;
     if header[0] != 0x05 {
@@ -93,14 +102,23 @@ async fn handle_socks5(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::
     }
     if request[1] == 0x03 {
         let _destination = read_socks5_destination(&mut stream, request[3]).await?;
-        return handle_socks5_udp_associate(runtime, stream).await;
+        return handle_socks5_udp_associate(
+            runtime,
+            stream,
+            peer,
+        )
+        .await;
     }
     if request[1] != 0x01 {
         return Err(anyhow!(
             "only socks5 CONNECT and UDP ASSOCIATE are supported"
         ));
     }
-    let destination = read_socks5_destination(&mut stream, request[3]).await?;
+    let destination = read_socks5_destination(&mut stream, request[3])
+        .await?
+        .with_source(peer.ip(), peer.port())
+        .with_in_port(runtime.config().core.mixed_listen.port())
+        .with_network("tcp");
     stream
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
@@ -110,6 +128,7 @@ async fn handle_socks5(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::
 async fn handle_socks5_udp_associate(
     runtime: Arc<Runtime>,
     mut stream: TcpStream,
+    _control_peer: SocketAddr,
 ) -> anyhow::Result<()> {
     let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let local = udp.local_addr()?;
@@ -162,7 +181,14 @@ async fn handle_socks5_udp_associate(
                 let udp = udp.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    match handle_socks5_udp_datagram(runtime.clone(), &packet).await {
+                    match handle_socks5_udp_datagram(
+                        runtime.clone(),
+                        &packet,
+                        peer,
+                        runtime.config().core.mixed_listen.port(),
+                    )
+                    .await
+                    {
                         Ok(Some(response)) => {
                             let _ = udp.send_to(&response, peer).await;
                         }
@@ -183,8 +209,14 @@ async fn handle_socks5_udp_associate(
 async fn handle_socks5_udp_datagram(
     runtime: Arc<Runtime>,
     packet: &[u8],
+    peer: SocketAddr,
+    in_port: u16,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let (destination, payload_offset) = parse_socks5_udp_packet(packet)?;
+    let destination = destination
+        .with_source(peer.ip(), peer.port())
+        .with_in_port(in_port)
+        .with_network("udp");
     let config = runtime.config();
     if destination.port == 53 && config.dns.enabled && config.dns.hijack_udp_53 {
         let response = runtime
@@ -326,7 +358,11 @@ fn encode_socks5_udp_destination(
     Ok(())
 }
 
-async fn handle_http(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_http(
+    runtime: Arc<Runtime>,
+    mut stream: TcpStream,
+    peer: SocketAddr,
+) -> anyhow::Result<()> {
     let head = read_http_head(&mut stream).await?;
     let text = std::str::from_utf8(&head)?;
     let mut lines = text.split("\r\n");
@@ -336,7 +372,10 @@ async fn handle_http(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Re
         return Err(anyhow!("invalid http request line"));
     }
     if parts[0].eq_ignore_ascii_case("CONNECT") {
-        let destination = parse_authority(parts[1], 443)?;
+        let destination = parse_authority(parts[1], 443)?
+            .with_source(peer.ip(), peer.port())
+            .with_in_port(runtime.config().core.mixed_listen.port())
+            .with_network("tcp");
         stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
@@ -350,7 +389,10 @@ async fn handle_http(runtime: Arc<Runtime>, mut stream: TcpStream) -> anyhow::Re
         .ok_or_else(|| anyhow!("absolute-form request is missing host"))?
         .to_string();
     let port = url.port_or_known_default().unwrap_or(80);
-    let destination = Destination::new(host, port);
+    let destination = Destination::new(host, port)
+        .with_source(peer.ip(), peer.port())
+        .with_in_port(runtime.config().core.mixed_listen.port())
+        .with_network("tcp");
     let rewritten = rewrite_absolute_form_request(&head, &url)?;
     let (_client_read, mut client_write) = stream.into_split();
     let (mut remote_stream, decision, outbound_name) =

@@ -390,6 +390,7 @@ final class AppState: ObservableObject {
         }
         Task {
             defer { isStartingSupercoreProxy = false }
+            var daemonStartupRequested = false
             do {
                 autoDelayTask?.cancel()
                 autoDelayTask = nil
@@ -400,6 +401,7 @@ final class AppState: ObservableObject {
                 let daemonStatus = tunLaunchDaemonManager.status()
                 tunLaunchDaemonStatus = daemonStatus
                 let shouldUseTunDaemon = daemonStatus.installed
+                daemonStartupRequested = shouldUseTunDaemon && tunEnabled
                 if tunEnabled && !daemonStatus.installed && getuid() != 0 {
                     appendLog("Supercore TUN 需要先安装 LaunchDaemon 权限服务；当前从 App 启动将尝试普通用户模式")
                 }
@@ -427,15 +429,28 @@ final class AppState: ObservableObject {
                     }
                     supercoreAPIClient.setControlToken(controlToken)
                     try copyRuntimeToDaemonRuntime(profileID: profile.id)
+                    // An already loaded daemon can accept reload directly. Re-bootstrap only
+                    // after an actual bootout so normal launches do not prompt for admin auth.
+                    if !daemonStatus.loaded {
+                        try tunLaunchDaemonManager.ensureLoaded()
+                    }
+                    let loaded = tunLaunchDaemonManager.waitUntilLoaded(true).loaded
+                    guard loaded else {
+                        throw AppError.processFailed("TUN 权限服务启动后未进入运行状态")
+                    }
+                    usingTunLaunchDaemon = true
                     setOperation(.startingCore, "正在热重载 TUN 权限服务...")
                     try await supercoreAPIClient.reloadConfig(path: paths.supercoreDaemonRuntimeProfile)
                     let version = try await supercoreAPIClient.getVersion(timeoutInterval: 1.5).version
+                    try await supercoreAPIClient.waitForTunReady()
                     coreState = .running(version: version)
-                    usingTunLaunchDaemon = true
                     refreshTunLaunchDaemonStatus()
                 } else {
                     usingTunLaunchDaemon = false
                     try await supercoreManager.start(configPath: paths.supercoreRuntimeProfile(id: profile.id))
+                    if tunEnabled {
+                        try await supercoreAPIClient.waitForTunReady()
+                    }
                 }
                 try await LocalPortAllocator.waitUntilLocalPortAcceptsConnections(options.mixedPort)
                 runtimePurpose = .proxy
@@ -466,6 +481,11 @@ final class AppState: ObservableObject {
                     scheduleStartupNodeHealthCheck(restoredNode)
                 }
             } catch {
+                if daemonStartupRequested || usingTunLaunchDaemon {
+                    await rollbackTunAfterStartupFailure()
+                } else {
+                    await supercoreManager.stop()
+                }
                 try? proxyManager.restoreIfOwned()
                 userMessage = "Supercore 启动失败：\(error.localizedDescription)"
                 appendLog(userMessage)
@@ -495,9 +515,18 @@ final class AppState: ObservableObject {
                     )
                     try copyRuntimeToDaemonRuntime(profileID: profileID)
                     try await supercoreAPIClient.reloadConfig(path: paths.supercoreDaemonRuntimeProfile)
-                    refreshTunLaunchDaemonStatus()
+                    try await supercoreAPIClient.waitForTunDisabled()
+                    tunLaunchDaemonStatus = tunLaunchDaemonManager.waitUntilLoaded(true)
                 } catch {
                     appendLog("关闭 TUN daemon 配置失败：\(error.localizedDescription)")
+                    do {
+                        try tunLaunchDaemonManager.stopForRecovery()
+                        tunLaunchDaemonStatus = tunLaunchDaemonManager.waitUntilLoaded(false)
+                        appendLog("TUN daemon 已执行强制停止回滚")
+                    } catch {
+                        appendLog("TUN daemon 强制停止失败：\(error.localizedDescription)")
+                        networkRecoveryNeeded = true
+                    }
                 }
             } else {
                 await supercoreManager.stop()
@@ -508,6 +537,40 @@ final class AppState: ObservableObject {
             traffic = TrafficFrame(up: 0, down: 0)
             userMessage = tunLaunchDaemonStatus.loaded ? "已停止代理，TUN 权限服务保持待命" : "已停止 Supercore"
         }
+    }
+
+    private func rollbackTunAfterStartupFailure() async {
+        if let profileID = activeSubscription?.id {
+            do {
+                try configManager.regenerateSupercoreRuntime(
+                    profileID: profileID,
+                    tunEnabled: false,
+                    runtimeOptions: runtimeOptions,
+                    probeURL: probeURL
+                )
+                try copyRuntimeToDaemonRuntime(profileID: profileID)
+                if tunLaunchDaemonManager.status().loaded {
+                    try await supercoreAPIClient.reloadConfig(path: paths.supercoreDaemonRuntimeProfile)
+                    try await supercoreAPIClient.waitForTunDisabled()
+                }
+            } catch {
+                appendLog("启动失败后的 TUN 关闭请求失败：\(error.localizedDescription)")
+            }
+        }
+        if tunLaunchDaemonManager.status().loaded {
+            do {
+                try tunLaunchDaemonManager.stopForRecovery()
+                tunLaunchDaemonStatus = tunLaunchDaemonManager.waitUntilLoaded(false)
+            } catch {
+                appendLog("启动失败后的 TUN daemon 回滚失败：\(error.localizedDescription)")
+                tunLaunchDaemonStatus = tunLaunchDaemonManager.status()
+                networkRecoveryNeeded = true
+            }
+        } else {
+            tunLaunchDaemonStatus = tunLaunchDaemonManager.status()
+        }
+        usingTunLaunchDaemon = false
+        await supercoreManager.stop()
     }
 
     func setSelectedCountry(_ country: String?) {
@@ -1104,6 +1167,7 @@ final class AppState: ObservableObject {
                             )
                             try copyRuntimeToDaemonRuntime(profileID: profileID)
                             try await supercoreAPIClient.reloadConfig(path: paths.supercoreDaemonRuntimeProfile)
+                            try await supercoreAPIClient.waitForTunDisabled()
                             appendLog("TUN daemon 已重置为关闭状态")
                         }
                     } catch {
@@ -1363,8 +1427,15 @@ final class AppState: ObservableObject {
                 )
                 try copyRuntimeToDaemonRuntime(profileID: profileID)
                 try await supercoreAPIClient.reloadConfig(path: paths.supercoreDaemonRuntimeProfile)
+                try await supercoreAPIClient.waitForTunDisabled()
             } catch {
                 appendLog("退出时关闭 TUN daemon 配置失败：\(error.localizedDescription)")
+                do {
+                    try tunLaunchDaemonManager.stopForRecovery()
+                    tunLaunchDaemonStatus = tunLaunchDaemonManager.waitUntilLoaded(false)
+                } catch {
+                    appendLog("退出时停止 TUN daemon 失败：\(error.localizedDescription)")
+                }
             }
         } else {
             await supercoreManager.stop()

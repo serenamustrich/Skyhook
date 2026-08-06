@@ -207,6 +207,7 @@ async fn handle_h2_echo(
     Ok(())
 }
 
+#[allow(clippy::never_loop)]
 async fn start_h2_server(
     connections: Arc<AtomicUsize>,
 ) -> anyhow::Result<(

@@ -54,6 +54,32 @@ pub struct SubscriptionMeta {
     pub traffic_upload_total: u64,
     #[serde(default)]
     pub traffic_download_total: u64,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    #[serde(default)]
+    pub subscription_userinfo: Option<SubscriptionUserInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionUserInfo {
+    #[serde(default)]
+    pub upload: Option<u64>,
+    #[serde(default)]
+    pub download: Option<u64>,
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default)]
+    pub expire: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct SubscriptionFetchResult {
+    text: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    subscription_userinfo: Option<SubscriptionUserInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,14 +197,15 @@ impl SubscriptionStore {
             .filter(|item| !item.trim().is_empty())
             .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
         self.resolve_proxy_providers(&id, &mut document)?;
+        ensure_usable_subscription_nodes(&document)?;
 
         if let Some(position) = index.subscriptions.iter().position(|item| item.id == id) {
             let previous = index.subscriptions[position].clone();
             let mut meta = meta_from_document(
-                previous.id,
+                previous.id.clone(),
                 name.filter(|item| !item.trim().is_empty())
-                    .unwrap_or(previous.name),
-                url.or(previous.url),
+                    .unwrap_or(previous.name.clone()),
+                url.or(previous.url.clone()),
                 &document,
                 previous.created_at,
                 now,
@@ -186,6 +213,7 @@ impl SubscriptionStore {
             );
             meta.traffic_upload_total = previous.traffic_upload_total;
             meta.traffic_download_total = previous.traffic_download_total;
+            preserve_subscription_metadata(&mut meta, &previous);
 
             self.resolve_rule_providers(&meta.id, &mut document)?;
             self.write_subscription_files(&meta, text, &document)?;
@@ -221,6 +249,7 @@ impl SubscriptionStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn import_text_with_id_async(
         &self,
         id: Option<String>,
@@ -256,6 +285,7 @@ impl SubscriptionStore {
             &mut stats,
         )
         .await?;
+        ensure_usable_subscription_nodes(&document)?;
         if cancellation.is_cancelled() {
             return Err(anyhow!("subscription import cancelled"));
         }
@@ -265,6 +295,7 @@ impl SubscriptionStore {
     pub fn replace_text(&self, id: &str, text: &str) -> anyhow::Result<SubscriptionMeta> {
         let mut document = parse_subscription(text)?;
         self.resolve_proxy_providers(id, &mut document)?;
+        ensure_usable_subscription_nodes(&document)?;
         self.resolve_rule_providers(id, &mut document)?;
         self.replace_document(id, text, document)
     }
@@ -298,6 +329,7 @@ impl SubscriptionStore {
             &mut stats,
         )
         .await?;
+        ensure_usable_subscription_nodes(&document)?;
         if cancellation.is_cancelled() {
             return Err(anyhow!("subscription update cancelled"));
         }
@@ -381,6 +413,33 @@ impl SubscriptionStore {
         item.last_update_error = Some(error.into());
         item.updated_at = Utc::now();
         self.save_index(&index)
+    }
+
+    fn update_fetch_metadata(
+        &self,
+        id: &str,
+        fetched: &SubscriptionFetchResult,
+    ) -> anyhow::Result<()> {
+        let mut index = self.load_index()?;
+        let item = index
+            .subscriptions
+            .iter_mut()
+            .find(|item| item.id == id)
+            .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
+        if fetched.etag.is_some() {
+            item.etag = fetched.etag.clone();
+        }
+        if fetched.last_modified.is_some() {
+            item.last_modified = fetched.last_modified.clone();
+        }
+        if fetched.subscription_userinfo.is_some() {
+            item.subscription_userinfo = fetched.subscription_userinfo.clone();
+        }
+        item.last_update_error = None;
+        item.updated_at = Utc::now();
+        let meta = item.clone();
+        self.save_index(&index)?;
+        write_json_atomic(&self.subscription_dir(id).join("meta.json"), &meta)
     }
 
     pub fn set_active(&self, id: &str) -> anyhow::Result<SubscriptionMeta> {
@@ -479,18 +538,23 @@ impl SubscriptionStore {
                 error: Some("subscription has no url".to_string()),
             });
         };
-        let result: anyhow::Result<()> = async {
-            let text = fetch_subscription_url_with_options(&url, options, cancellation).await?;
-            self.replace_text_async(&meta.id, &text, options.timeout_secs, cancellation)
-                .await?;
-            Ok(())
+        let result: anyhow::Result<bool> = async {
+            let fetched =
+                fetch_subscription_url_with_options(&url, &meta, options, cancellation).await?;
+            let changed = fetched.text.is_some();
+            if let Some(text) = fetched.text.as_deref() {
+                self.replace_text_async(&meta.id, text, options.timeout_secs, cancellation)
+                    .await?;
+            }
+            self.update_fetch_metadata(&meta.id, &fetched)?;
+            Ok(changed)
         }
         .await;
         Ok(match result {
-            Ok(()) => SubscriptionUpdateSummary {
+            Ok(updated) => SubscriptionUpdateSummary {
                 id: meta.id,
                 name: meta.name,
-                updated: true,
+                updated,
                 error: None,
             },
             Err(_error) if cancellation.is_cancelled() => {
@@ -566,21 +630,35 @@ impl SubscriptionStore {
                         };
                     }
                 };
-                let result: anyhow::Result<()> = async {
-                    let text =
-                        fetch_subscription_url_with_options(&url, options, &cancellation).await?;
-                    store
-                        .replace_text_async(&meta.id, &text, options.timeout_secs, &cancellation)
-                        .await?;
-                    Ok(())
+                let result: anyhow::Result<bool> = async {
+                    let fetched = fetch_subscription_url_with_options(
+                        &url,
+                        &meta,
+                        options,
+                        &cancellation,
+                    )
+                    .await?;
+                    let changed = fetched.text.is_some();
+                    if let Some(text) = fetched.text.as_deref() {
+                        store
+                            .replace_text_async(
+                                &meta.id,
+                                text,
+                                options.timeout_secs,
+                                &cancellation,
+                            )
+                            .await?;
+                    }
+                    store.update_fetch_metadata(&meta.id, &fetched)?;
+                    Ok(changed)
                 }
                 .await;
 
                 match result {
-                    Ok(()) => SubscriptionUpdateSummary {
+                    Ok(updated) => SubscriptionUpdateSummary {
                         id: meta.id,
                         name: meta.name,
-                        updated: true,
+                        updated,
                         error: None,
                     },
                     Err(error) => {
@@ -687,9 +765,9 @@ impl SubscriptionStore {
             .ok_or_else(|| anyhow!("subscription {id} does not exist"))?;
         let previous = index.subscriptions[position].clone();
         let mut meta = meta_from_document(
-            previous.id,
-            previous.name,
-            previous.url,
+            previous.id.clone(),
+            previous.name.clone(),
+            previous.url.clone(),
             &document,
             previous.created_at,
             Utc::now(),
@@ -697,6 +775,7 @@ impl SubscriptionStore {
         );
         meta.traffic_upload_total = previous.traffic_upload_total;
         meta.traffic_download_total = previous.traffic_download_total;
+        preserve_subscription_metadata(&mut meta, &previous);
         self.write_subscription_files(&meta, source, &document)?;
         index.subscriptions[position] = meta.clone();
         self.save_index(&index)?;
@@ -717,10 +796,10 @@ impl SubscriptionStore {
         if let Some(position) = index.subscriptions.iter().position(|item| item.id == id) {
             let previous = index.subscriptions[position].clone();
             let mut meta = meta_from_document(
-                previous.id,
+                previous.id.clone(),
                 name.filter(|item| !item.trim().is_empty())
-                    .unwrap_or(previous.name),
-                url.or(previous.url),
+                    .unwrap_or(previous.name.clone()),
+                url.or(previous.url.clone()),
                 &document,
                 previous.created_at,
                 now,
@@ -728,6 +807,7 @@ impl SubscriptionStore {
             );
             meta.traffic_upload_total = previous.traffic_upload_total;
             meta.traffic_download_total = previous.traffic_download_total;
+            preserve_subscription_metadata(&mut meta, &previous);
             self.write_subscription_files(&meta, source, &document)?;
             let active_changed = index.active_id.is_none() || switch;
             if active_changed {
@@ -1256,7 +1336,8 @@ fn document_runtime_outbounds(document: &SubscriptionDocument) -> Vec<OutboundCo
             let members = provider
                 .nodes
                 .iter()
-                .filter_map(|node| leaf_names.contains(&node.name).then(|| node.name.clone()))
+                .filter(|node| leaf_names.contains(&node.name))
+                .map(|node| node.name.clone())
                 .collect::<Vec<_>>();
             (provider.name.clone(), members)
         })
@@ -1347,7 +1428,18 @@ fn clash_rule_to_route_rule(rule: &str, known_outbounds: &HashSet<String>) -> Op
             parts.get(1)?.to_string(),
             parts.get(2)?,
         ),
-        "IP-CIDR" | "IP-CIDR6" => (RuleTarget::IpCidr, parts.get(1)?.to_string(), parts.get(2)?),
+        "DOMAIN-REGEX" => (
+            RuleTarget::DomainRegex,
+            parts.get(1)?.to_string(),
+            parts.get(2)?,
+        ),
+        "IP-CIDR" => (RuleTarget::IpCidr, parts.get(1)?.to_string(), parts.get(2)?),
+        "IP-CIDR6" => (RuleTarget::IpCidr6, parts.get(1)?.to_string(), parts.get(2)?),
+        "SRC-IP-CIDR" => (RuleTarget::SrcIpCidr, parts.get(1)?.to_string(), parts.get(2)?),
+        "SRC-PORT" => (RuleTarget::SrcPort, parts.get(1)?.to_string(), parts.get(2)?),
+        "DST-PORT" => (RuleTarget::DstPort, parts.get(1)?.to_string(), parts.get(2)?),
+        "IN-PORT" => (RuleTarget::InPort, parts.get(1)?.to_string(), parts.get(2)?),
+        "NETWORK" => (RuleTarget::Network, parts.get(1)?.to_string(), parts.get(2)?),
         "PROCESS-NAME" => (
             RuleTarget::AppName,
             parts.get(1)?.to_string(),
@@ -1662,7 +1754,16 @@ fn meta_from_document(
         last_update_error,
         traffic_upload_total: 0,
         traffic_download_total: 0,
+        etag: None,
+        last_modified: None,
+        subscription_userinfo: None,
     }
+}
+
+fn preserve_subscription_metadata(meta: &mut SubscriptionMeta, previous: &SubscriptionMeta) {
+    meta.etag = previous.etag.clone();
+    meta.last_modified = previous.last_modified.clone();
+    meta.subscription_userinfo = previous.subscription_userinfo.clone();
 }
 
 fn inferred_name(url: Option<&str>, document: &SubscriptionDocument, id: &str) -> String {
@@ -1702,9 +1803,10 @@ where
 
 async fn fetch_subscription_url_with_options(
     url: &str,
+    meta: &SubscriptionMeta,
     options: SubscriptionUpdateOptions,
     cancellation: &CancellationToken,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SubscriptionFetchResult> {
     let timeout_secs = options.timeout_secs.clamp(1, 300);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -1716,8 +1818,8 @@ async fn fetch_subscription_url_with_options(
         if cancellation.is_cancelled() {
             return Err(anyhow!("subscription update cancelled"));
         }
-        match fetch_subscription_url_once(&client, url, cancellation).await {
-            Ok(text) => return Ok(text),
+        match fetch_subscription_url_once(&client, url, meta, cancellation).await {
+            Ok(result) => return Ok(result),
             Err(error) => {
                 last_error = Some(error);
                 if attempt + 1 < attempts {
@@ -1737,25 +1839,56 @@ async fn fetch_subscription_url_with_options(
 async fn fetch_subscription_url_once(
     client: &reqwest::Client,
     url: &str,
+    meta: &SubscriptionMeta,
     cancellation: &CancellationToken,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SubscriptionFetchResult> {
     let parsed = url::Url::parse(url).context("subscription url is invalid")?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("subscription url must use http or https"));
     }
     let source = provider_source_label(url);
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("Supercore/", env!("CARGO_PKG_VERSION")))
+        .header(
+            reqwest::header::ACCEPT,
+            "text/plain, application/x-yaml, application/yaml, application/json, */*",
+        );
+    if let Some(etag) = meta.etag.as_deref() {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    if let Some(last_modified) = meta.last_modified.as_deref() {
+        request = request.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+    }
     let response = tokio::select! {
         _ = cancellation.cancelled() => return Err(anyhow!("subscription update cancelled")),
-        response = client
-            .get(url)
-            .header(
-                "User-Agent",
-                concat!("Supercore/", env!("CARGO_PKG_VERSION")),
-            )
-            .send() => {
+        response = request.send() => {
                 response.with_context(|| format!("failed to download subscription from {source}"))?
             }
     };
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let last_modified = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let subscription_userinfo = response
+        .headers()
+        .get("subscription-userinfo")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_subscription_userinfo);
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(SubscriptionFetchResult {
+            text: None,
+            etag,
+            last_modified,
+            subscription_userinfo,
+        });
+    }
     let mut response = response
         .error_for_status()
         .with_context(|| format!("subscription endpoint returned an error from {source}"))?;
@@ -1791,5 +1924,58 @@ async fn fetch_subscription_url_once(
         }
         body.extend_from_slice(&chunk);
     }
-    String::from_utf8(body).with_context(|| format!("subscription body from {source} is not UTF-8"))
+    let text = String::from_utf8(body)
+        .with_context(|| format!("subscription body from {source} is not UTF-8"))?;
+    if text.trim().is_empty() {
+        return Err(anyhow!("subscription response body is empty from {source}"));
+    }
+    let subscription_userinfo = subscription_userinfo.or_else(|| {
+        response
+            .headers()
+            .get("subscription-userinfo")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_subscription_userinfo)
+    });
+    Ok(SubscriptionFetchResult {
+        text: Some(text),
+        etag,
+        last_modified,
+        subscription_userinfo,
+    })
+}
+
+fn ensure_usable_subscription_nodes(document: &SubscriptionDocument) -> anyhow::Result<()> {
+    if document.nodes.is_empty() {
+        return Err(anyhow!(
+            "subscription contains no usable proxy nodes after provider resolution"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_subscription_userinfo(value: &str) -> Option<SubscriptionUserInfo> {
+    let mut info = SubscriptionUserInfo {
+        upload: None,
+        download: None,
+        total: None,
+        expire: None,
+    };
+    for field in value.split(',') {
+        let Some((key, raw)) = field.trim().split_once('=') else {
+            continue;
+        };
+        let parsed = raw.trim().parse::<u64>().ok();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "upload" => info.upload = parsed,
+            "download" => info.download = parsed,
+            "total" => info.total = parsed,
+            "expire" => info.expire = parsed.and_then(|value| i64::try_from(value).ok()),
+            _ => {}
+        }
+    }
+    (info.upload.is_some()
+        || info.download.is_some()
+        || info.total.is_some()
+        || info.expire.is_some())
+    .then_some(info)
 }

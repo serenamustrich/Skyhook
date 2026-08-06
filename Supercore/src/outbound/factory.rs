@@ -6,13 +6,14 @@ use std::{
 use anyhow::anyhow;
 
 use crate::{
-    config::{OutboundCommonConfig, OutboundConfig},
+    config::{DnsConfig, OutboundCommonConfig, OutboundConfig},
     telemetry::Telemetry,
 };
 
 use super::{
     anytls::AnyTlsOutbound,
     configured::{outbound_registry, ConfiguredOutbound},
+    dns::DnsOutbound,
     direct::DirectOutbound,
     http_proxy::HttpOutbound,
     hysteria::HysteriaOutbound,
@@ -21,15 +22,20 @@ use super::{
     masque::MasqueOutbound,
     mieru::MieruOutbound,
     naive::NaiveOutbound,
+    openvpn::OpenVpnOutbound,
     registry::{attach_groups, insert_leaf},
     reject::RejectOutbound,
+    rematch::RematchOutbound,
     shadowsocks::ShadowsocksOutbound,
     shadowtls::ShadowTlsOutbound,
     snell::SnellOutbound,
     socks5::Socks5Outbound,
     ssh::SshOutbound,
     ssr::SsrOutbound,
+    sudoku::SudokuOutbound,
+    tailscale::TailscaleOutbound,
     traits::{Outbound, OutboundMap},
+    trusttunnel::TrustTunnelOutbound,
     trojan::TrojanOutbound,
     tuic::TuicOutbound,
     unsupported::UnsupportedProtocolOutbound,
@@ -50,6 +56,15 @@ pub fn build_outbounds_with_options(
     common_options: &BTreeMap<String, OutboundCommonConfig>,
     telemetry: Option<Arc<Telemetry>>,
 ) -> anyhow::Result<OutboundMap> {
+    build_outbounds_with_options_and_dns(configs, common_options, telemetry, None)
+}
+
+pub fn build_outbounds_with_options_and_dns(
+    configs: &[OutboundConfig],
+    common_options: &BTreeMap<String, OutboundCommonConfig>,
+    telemetry: Option<Arc<Telemetry>>,
+    dns_config: Option<&DnsConfig>,
+) -> anyhow::Result<OutboundMap> {
     validate_common_options(configs, common_options)?;
     let mut outbounds: OutboundMap = HashMap::new();
     let registry = outbound_registry();
@@ -57,7 +72,7 @@ pub fn build_outbounds_with_options(
         if matches!(config, OutboundConfig::Group { .. }) {
             continue;
         }
-        let outbound = build_leaf_outbound(config)?;
+        let outbound = build_leaf_outbound(config, dns_config)?;
         let outbound = Arc::new(ConfiguredOutbound::new(
             outbound,
             common_options
@@ -136,9 +151,25 @@ fn validate_common_options(
     Ok(())
 }
 
-fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbound>> {
+fn build_leaf_outbound(
+    config: &OutboundConfig,
+    dns_config: Option<&DnsConfig>,
+) -> anyhow::Result<Arc<dyn Outbound>> {
     let outbound: Arc<dyn Outbound> = match config {
         OutboundConfig::Direct { name } => Arc::new(DirectOutbound::new(name.clone())),
+        OutboundConfig::Dns { name } => Arc::new(DnsOutbound::new(
+            name.clone(),
+            dns_config.cloned().unwrap_or_default(),
+        )),
+        OutboundConfig::Rematch {
+            name,
+            target_rematch_name,
+            target_sub_rule,
+        } => Arc::new(RematchOutbound::new(
+            name.clone(),
+            target_rematch_name.clone(),
+            target_sub_rule.clone(),
+        )?),
         OutboundConfig::Reject { name } => Arc::new(RejectOutbound::new(name.clone())),
         OutboundConfig::Http {
             name,
@@ -626,10 +657,88 @@ fn build_leaf_outbound(config: &OutboundConfig) -> anyhow::Result<Arc<dyn Outbou
             *remote_dns_resolve,
             dns.clone(),
         )),
-        OutboundConfig::OpenVpn { name, .. } => Arc::new(UnsupportedProtocolOutbound::new(
+        OutboundConfig::OpenVpn {
+            name,
+            profile,
+            inline_profile,
+            options,
+        } => Arc::new(OpenVpnOutbound::new(
             name.clone(),
-            "openvpn".to_string(),
+            profile.clone(),
+            inline_profile.clone(),
+            options.clone(),
         )),
+        OutboundConfig::Tailscale {
+            name,
+            auth_key,
+            state_file,
+            control_server_url,
+            hostname,
+            tags,
+        } => Arc::new(TailscaleOutbound::new(
+            name.clone(),
+            auth_key.clone(),
+            state_file.clone(),
+            control_server_url.clone(),
+            hostname.clone(),
+            tags.clone(),
+        )?),
+        OutboundConfig::TrustTunnel {
+            name,
+            server,
+            port,
+            username,
+            password,
+            sni,
+            skip_cert_verify,
+            transport,
+        } => Arc::new(TrustTunnelOutbound::new(
+            name.clone(),
+            server.clone(),
+            *port,
+            username.clone(),
+            password.clone(),
+            sni.clone(),
+            *skip_cert_verify,
+            transport.clone(),
+        )),
+        OutboundConfig::Sudoku {
+            name,
+            server,
+            port,
+            key,
+            aead_method,
+            padding_min,
+            padding_max,
+            table_type,
+            enable_pure_downlink,
+            http_mask,
+            http_mask_mode,
+            http_mask_tls,
+            http_mask_host,
+            path_root,
+            multiplex,
+            custom_table,
+            custom_tables,
+        } => Arc::new(SudokuOutbound::new(
+            name.clone(),
+            server.clone(),
+            *port,
+            key.clone(),
+            aead_method.clone(),
+            *padding_min,
+            *padding_max,
+            table_type.clone(),
+            *enable_pure_downlink,
+            *http_mask,
+            http_mask_mode.clone(),
+            *http_mask_tls,
+            http_mask_host.clone(),
+            path_root.clone(),
+            multiplex.clone(),
+            custom_table.clone(),
+            custom_tables.clone(),
+        )?),
         OutboundConfig::Unknown { name, protocol, .. } => Arc::new(
             UnsupportedProtocolOutbound::new(name.clone(), protocol.clone()),
         ),

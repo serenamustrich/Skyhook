@@ -292,7 +292,7 @@ impl TaskManager {
             .values()
             .map(|task| task.record.clone())
             .collect::<Vec<_>>();
-        tasks.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.created_at));
         tasks
     }
 

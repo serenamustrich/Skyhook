@@ -55,7 +55,7 @@ pub(super) fn normalized_control_token(token: Option<String>) -> anyhow::Result<
     if token.is_empty() {
         return Ok(None);
     }
-    if token.as_bytes().len() < MIN_CONTROL_TOKEN_BYTES {
+    if token.len() < MIN_CONTROL_TOKEN_BYTES {
         return Err(anyhow!(
             "control token must contain at least {MIN_CONTROL_TOKEN_BYTES} bytes"
         ));

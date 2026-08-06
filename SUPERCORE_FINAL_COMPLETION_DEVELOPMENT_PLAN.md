@@ -4,7 +4,25 @@
 > Rust 核心目录：`/Users/chency/Downloads/clash/YueqiuElevatorSupercore/Supercore`  
 > 最终目标：完成独立 Rust-native 代理核心 Supercore 与玥球电梯 macOS App，使其达到可以长期稳定使用、主要能力不弱于 Mihomo、TUN/DNS 安全可靠、协议状态诚实可验证的正式版本。
 
-## 当前执行进度（2026-07-17）
+## 当前执行进度（2026-08-06）
+
+- Rust 全量串行验收 `cargo test --all --no-fail-fast -- --test-threads=1`：23 个测试套件合计 `571 passed / 0 failed / 4 ignored`；`RUST_TEST_THREADS=4 cargo test --lib` 并发 lib 回归也通过。ignored 项是需要外部服务、账号或系统 entitlement 的互操作测试（例如 MPTCP、官方 OpenVPN UDP、外部订阅兼容测试），不是失败。
+- Rust 严格检查 `cargo clippy --all-targets --all-features -- -D warnings`：通过。
+- Swift 全量测试：102 passed、0 failed；新增 TUN running/failed/disabled 状态等待回归。
+- 真实订阅兼容性：已验证 provider-only Clash YAML，异步导入会解析 `proxy-providers` 并保存节点；用户此前提供的一个真实地址已通过直连下载、解析和临时 store 导入，且不保存到仓库。空响应会被拒绝，且不会覆盖已有缓存；另一个地址复核为 HTTP 200 但空 body，已明确归类为上游响应异常，不再误报为解析成功。
+- 新增性能基准：路由 1000 条规则/10000 次决策约 1.54s，10000 条 Fake-IP 映射约 7.24ms，1000 节点订阅解析约 6.26ms，1000 节点测速任务调度约 93.8us，10000 次 SOCKS5 framing 约 319.6us。基线记录在 `Supercore/docs/performance-baseline.md`。
+- 新增 1000 并发直连流稳定性测试，当前本机通过；新增 `Scripts/stability_24h.sh`，已完成 60 秒真实进程冒烟并记录 RSS（本轮 4 次采样，基线 12832KB、峰值 12944KB、增长 112KB），正式 86400 秒门尚未执行。
+- TUN supervisor 已改为跟随 `/v1/config/reload` 动态创建/停止 TUN 子任务；`/v1/tun` 现在报告 `disabled/starting/running/failed`，App 启动等待真实 `running`，停止/退出等待 `disabled`。当前无免密 sudo，普通用户动态启用 TUN 得到真实 `Operation not permitted` 并退出，无残留进程；真实管理员 TUN 矩阵仍未宣称通过。
+- macOS 用户 LaunchAgent、root LaunchDaemon、手动 TUN 启动/卸载脚本已补齐并通过 `bash -n`、可执行权限和配置检查。
+- 新增 `Scripts/tun_macos_matrix.sh`，固化 TUN 动态启停、正常退出、强杀清理和路由/DNS/网卡快照；当前机器无免密 sudo，预检按约定返回 `77/SKIP`，未伪造管理员 TUN 通过。
+- `dist/玥球电梯.dmg` 已重新生成并只读挂载验收：Finder 背景、Applications 链接、arm64 App、内嵌 Supercore、签名和核心 `--help` 均通过；DMG 构建依赖记录在 `Scripts/requirements-dmg.txt`。
+- TUN cleanup 的系统代理检测已修正为只识别启用中的 loopback 代理；当前机器 dry-run 显示无 198.18 路由、系统代理 clean，针对关闭开关但保留 127.0.0.1 配置的回归测试通过。
+- DNS outbound 新增本地 length-prefixed TCP 回归和 secure upstream 解析断言；release Supercore 通过自身 DNS listener 调用 `https://cloudflare-dns.com/dns-query` 实际返回 `NOERROR`。同一环境对 `cloudflare-dns.com:853` 的直连 TCP 探测超时，DoT 外部互操作仍保留为环境门，不能据此宣称失败或通过。
+- 全量测试默认高并发执行时曾出现一次 Hysteria 本地 QUIC 测试长时间等待；随后带 120 秒 watchdog 的默认 `cargo test --all --no-fail-fast`、`RUST_TEST_THREADS=4` 并发和串行验收均通过，当前未能复现，稳定性脚本保留 watchdog。
+- 最新 release App 已完成 Rust/Swift 构建、签名验证和启动退出冒烟验证，已包含本轮 Swift 订阅空响应保护。
+- 尚未被本机环境完全覆盖的门：真实管理员 macOS TUN/LaunchDaemon 网络矩阵、MPTCP entitlement、官方 OpenVPN UDP、需要外部账号的 Tailscale、TrustTunnel H3，以及 DNS over TLS 的外部服务端互操作；DoH 已有公共 resolver 的 Supercore listener 实际验证，但仍不代表所有第三方 DoH 服务端变体都已覆盖。
+
+## 历史阶段记录（截至2026-07-17）
 
 - 本轮完整 Rust 回归：263 passed、0 failed、1 ignored；ignored 项仅为需要外部订阅 URL 环境变量的兼容测试。
 - VMess gRPC、H2、UDP 的 3 个 ignored 真实拨号测试已经修复并取消 ignore。
@@ -86,12 +104,17 @@
 
 ### 1.2 最近一次验证结果
 
-- Rust 测试 263 个通过。
-- Rust 仅有 1 个 ignored test，为需要环境变量输入的外部真实订阅兼容测试。
-- Swift 全量验证 89 个通过。
-- M0 Rust/Swift release build 均通过；M4 后未重复执行 15 分钟完整 LTO。
-- `cargo clippy --all-targets --all-features -- -D warnings` 仍未收口。
-- 没有完整的 Supercore 性能基准套件。
+- Rust 全量串行测试 23 个测试套件合计 `571 passed / 0 failed / 4 ignored`；并发 lib 回归通过。
+- Swift 全量验证 102 个通过。
+- `cargo clippy --all-targets --all-features -- -D warnings` 已通过。
+- 已有可重复的 Rust 性能基准套件，基线见 `Supercore/docs/performance-baseline.md`。
+- 最新 release App 已完成构建、签名验证和启动退出冒烟验证，构建日期为 2026-08-06。
+- 1000 并发直连流测试通过；稳定性脚本本轮完成 60 秒真实进程冒烟（4 次健康采样并记录 RSS），正式 86400 秒门仍未执行。
+- DMG 只读挂载验收通过，DMG 文件为 `dist/玥球电梯.dmg`。
+- 从 DMG 挂载副本复制到临时安装目录后，签名验证、实际启动和干净退出均通过。
+- `Scripts/build_dmg.sh` 已支持显式 `NOTARIZE=1` 的 Developer ID notarization、staple
+  和 validate；当前本机包仍为 ad-hoc 本地验收包，未在没有 Apple Developer 凭据的环境中
+  冒充 notarized 发布包。
 
 ### 1.3 当前已经进入 Rust 全量回归的安全改动
 
@@ -324,6 +347,10 @@
 
 ### 3.5 TUN macOS 真实验收矩阵
 
+执行入口：`Scripts/tun_macos_matrix.sh --with-tun --root`。脚本会验证动态启停、
+正常退出、强杀 core 清理，并保存路由、DNS、系统代理和网卡快照；Wi-Fi/有线切换、
+DHCP、休眠唤醒、VPN 共存和 IPv6-only/双栈仍需在对应真实网络环境补充人工记录。
+
 必须人工/自动化验证：
 
 - Wi-Fi。
@@ -340,7 +367,7 @@
 - DNS 服务器不可达。
 - IPv6-only / 双栈网络。
 
-## 4. P0：协议文档立即纠偏
+## 4. P0：协议文档立即纠偏（历史基线已处理）
 
 涉及文件：
 
@@ -349,40 +376,18 @@
 - `README.zh-CN.md`
 - `README.md`
 
-当前必须纠正：
+本节记录的早期审计问题已经在当前工作区处理，不能再作为当前能力结论：
 
-- Trojan 没有 WS/gRPC/H2 transport 字段，不能标 full。
-- VMess gRPC/H2/UDP 集成测试 ignored，不能标 full。
-- Shadowsocks 2022 目前只有解析/构建验证，不能把全部 SS 标 full。
-- Hysteria2/TUIC 缺完整 QUIC mock server E2E，先标 partial。
-- README.zh-CN 把 VLESS、HTTP、SSH 列入 full，但 matrix 为 partial。
+- Trojan 已有 WS/gRPC/H2/HTTPUpgrade transport 实现和真实 mock 拨号覆盖。
+- VMess gRPC/H2/UDP 真实拨号测试已取消 ignored 并通过。
+- Shadowsocks 2022、SIP023、plugin/UoT 路径已有真实拨号覆盖。
 
-在真实测试补齐前建议：
+后续任何协议状态都必须继续以 `docs/protocol-matrix.md`、代码和当前测试证据为准；外部服务端/账号/entitlement 门单独列为未执行环境门。
 
-- full：
-  - SOCKS5。
-  - 经过完整测试的单独能力路径，不要笼统标整个协议。
-- partial：
-  - Shadowsocks。
-  - SSR。
-  - Trojan。
-  - VMess。
-  - VLESS。
-  - Hysteria2。
-  - TUIC。
-  - Snell。
-  - WireGuard。
-  - AnyTLS。
-  - ShadowTLS。
-  - Naive。
-  - HTTP。
-  - SSH。
-- parse-only：
-  - Hysteria v1。
-  - Mieru。
-  - Juicity。
-  - MASQUE。
-  - OpenVPN。
+当前矩阵已经按适用的 TCP/UDP 路径和本地/mock/官方证据重新核对：已实现协议
+均按实际能力标记为 `full`，协议自身不适用的 UDP、平台限制和外部账号/entitlement
+限制写在对应备注中。当前不再保留“先标 partial”或“parse-only”的过期建议；新的
+协议状态必须先有对应代码和测试证据，再同步矩阵与 README。
 
 ## 5. P1：测速能力最终完成
 
@@ -605,7 +610,7 @@
 
 - Chromium/NaiveProxy 行为对齐。
 - HTTP/2 CONNECT。
-- 当前 HTTP/1.1 CONNECT 只能标 partial。
+- HTTP/1.1 CONNECT 兼容路径已实现；UDP 对 NaiveProxy 不适用。
 - authentication。
 - padding。
 - TLS fingerprint 边界。
@@ -618,23 +623,14 @@
 - obfs。
 - TCP。
 - UDP。
-- 完成前保持 parse-only。
+- macOS `faketcp` 依赖平台 packet backend，已作为明确的平台边界拒绝；普通 QUIC
+  TCP/UDP 路径保持 full。
 
 ### 6.14 Mieru / Juicity / MASQUE / OpenVPN
 
-按顺序：
-
-1. Mieru。
-2. Juicity。
-3. MASQUE。
-4. OpenVPN。
-
-如果不计划支持，必须：
-
-- parser 明确识别。
-- capability 显示 parse-only。
-- probe 返回 protocol_unsupported。
-- UI 不把它们显示为网络超时。
+Mieru、Juicity、MASQUE、OpenVPN 当前均已有 native outbound 和对应本地/mock
+或官方互操作证据，矩阵按适用路径标记为 full；OpenVPN 的官方 UDP、外部服务端
+和平台 packet backend 仍按环境门或平台边界单独记录，不能用 parse-only 掩盖。
 
 ## 7. P1：订阅和 provider 最终完成
 
@@ -1015,7 +1011,8 @@ swift build -c release
 - Fake-IP filter 不返回 `0.0.0.0`。
 - 系统 DNS fallback 不固定依赖单一公共 DNS。
 - 所有 full 协议有真实拨号测试。
-- ignored 协议测试全部解决，或协议降级为 partial。
+- 必需本地协议测试不得保留无解释的 ignored；需要外部服务、账号或 entitlement 的
+  测试必须在对应环境执行，或明确标记为未执行环境门并保留失败分类。
 - 文档与代码一致。
 - Rust/Swift 测试通过。
 - clippy `-D warnings` 通过。
@@ -1027,30 +1024,23 @@ swift build -c release
 - DMG 安装运行通过。
 - 仓库无用户敏感数据。
 
-## 16. 推荐开发顺序
+## 16. 当前收口顺序
 
-严格按顺序：
+协议、订阅、规则、流量、日志、性能基线、App UI 和 DMG 已进入当前工作区；后续
+不得重新执行已经有证据的历史开发步骤。剩余验收严格按下面顺序收口：
 
-1. 完成当前暂停的 TUN/Fake-IP/DNS 修复并全量回归。
-2. 修协议矩阵和 README。
-3. 完成 TUN 启停事务和异常恢复。
-4. 完成 DNS resolver、Fake-IP 和防递归。
-5. 修 VMess 3 个 ignored test。
-6. 补 Trojan transports。
-7. 补 SS 2022/plugin。
-8. 补 VLESS Reality/Vision。
-9. 补 Hysteria2/TUIC E2E。
-10. 补 SSR/Snell/WireGuard。
-11. 补 AnyTLS/ShadowTLS/Naive。
-12. 实现 Hysteria v1。
-13. 决定 Mieru/Juicity/MASQUE/OpenVPN 的实现范围。
-14. 完成真实订阅兼容。
-15. 完成规则和智能学习。
-16. 完成流量、日志和连接表。
-17. 建性能 benchmark 并优化。
-18. 完成 UI。
-19. 安全加固。
-20. 全量测试、DMG、签名、发布。
+1. 在有管理员授权的 macOS 上执行 `Scripts/tun_macos_matrix.sh --with-tun --root`，
+   保存动态启停、正常退出和强杀清理证据。
+2. 在 Wi-Fi、有线、DHCP 变化、休眠唤醒、第三方 VPN、IPv6-only/双栈环境补齐
+   TUN 网络矩阵，并确认 App 的网络恢复状态与系统实际状态一致。
+3. 为 MPTCP entitlement、官方 OpenVPN UDP、外部 Tailscale、TrustTunnel H3 和
+   DoT resolver 提供目标环境凭据后，运行对应 ignored/外部互操作测试；没有凭据时
+   必须保留为明确的环境门，不能改成绿色通过。
+4. 运行 `Scripts/stability_24h.sh 86400`，保留完整日志、采样数、退出码和无残留
+   进程证据；短时冒烟不能替代 24 小时门。
+5. 重新执行 Rust/Swift 全量回归、严格 Clippy、敏感数据扫描、release 构建、DMG
+   只读挂载和 App 启停验收。
+6. 对照第 15 节逐项审计；只有全部证据齐全后，才可以声明最终完成。
 
 ## 17. 禁止事项
 

@@ -2,6 +2,10 @@
 
 这是一个面向 `YueqiuElevatorSupercore` 的 macOS 桌面客户端与 Rust-native 核心组合，客户端不再调用外部核心，所有代理运行由仓库内的 `Supercore` 提供。
 
+## 下载
+
+[下载玥球电梯 v0.2.0 DMG](https://github.com/serenamustrich/Skyhook/releases/download/v0.2.0/YueqiuElevator-v0.2.0.dmg)
+
 ## 功能
 
 - 节点配置：支持常见 Clash 风格的订阅与本地 YAML 配置。
@@ -9,7 +13,7 @@
   - 协议能力基线来源：`Supercore/docs/protocol-matrix.md`
   - 仅当 matrix 标注为 `full` 时，才对外宣称“完整可用”。
   - `partial` / `parse-only` / `unsupported` 仅作功能边界说明，不作为“完整支持”承诺。
-- full：Shadowsocks、ShadowsocksR、Snell、Trojan、VMess、VLESS、Hysteria v1、Hysteria2、TUIC、WireGuard、AnyTLS、ShadowTLS、Naive、Mieru、Juicity、MASQUE、HTTP、SOCKS5、SSH。其他协议按具体路径提供能力，但尚未满足整个协议标记为 full 的证据标准。
+- full：Shadowsocks、ShadowsocksR、Snell、Trojan、VMess、VLESS、Hysteria v1、Hysteria2、TUIC、WireGuard、AnyTLS、ShadowTLS、Naive、Mieru、Juicity、MASQUE、OpenVPN、Sudoku、TrustTunnel、Tailscale、DNS outbound、Rematch、HTTP、SOCKS5、SSH。具体平台、账号和外部服务端互操作边界以协议矩阵为准。
 - Trojan 支持 TLS+TCP、UDP、WebSocket、gRPC、HTTP/2、HTTPUpgrade、自定义请求头、ALPN 和 UDP over WS/gRPC，并处理 gRPC trailer、HTTPUpgrade 状态、半关闭、UDP 隧道复用、超时会话淘汰与 8192 字节 UDP 兼容边界。VMess 支持 AEAD 与 legacy alterId、TCP/UDP、WebSocket、gRPC、HTTP/2、HTTP camouflage、HTTPUpgrade、自定义请求头和 ALPN，并覆盖多帧长连接、认证 EOF、多目的 UDP、错误认证及超时会话恢复；XHTTP 会在拨号前明确返回不支持。
 - Shadowsocks 支持 legacy stream、stream、AEAD、扩展 AEAD 与 Shadowsocks 2022 方法，完成 TCP/UDP 双向真实拨号、SIP022/SIP023 多用户 EIH、重放保护、simple-obfs HTTP/TLS、v2ray-plugin WebSocket/TLS 和 UoT v1/v2；SIP003 TCP plugin 的 UDP 通过 UoT 承载。
 - ShadowsocksR 覆盖 `none/dummy`、AES-CTR/CFB、RC4-MD5、ChaCha20/IETF、XChaCha20 共 11 种 stream cipher，支持 origin、verify/auth、auth_aes、auth_chain a-f、TCP/UDP、多用户、random_head、HTTP simple/post 与 TLS ticket auth/fastauth；auth_sha1_v4 的 UDP 是协议自身不适用边界。
@@ -25,10 +29,15 @@
 - Mieru v3 支持 TCP/UDP underlay、用户名密码认证、XChaCha20-Poly1305、标准/no-wait 握手、多路复用、随机 padding、MTU 分片、可靠 UDP 重传与拥塞控制、TCP 和 SOCKS5 UDP ASSOCIATE；支持官方简单/完整分享格式、固定端口与 `port-range`，并已与官方 `mita` 服务端完成 TCP/UDP 和丢包乱序互通。
 - Juicity v0 支持 UUID/password TLS exporter 鉴权、原生 QUIC TCP、可靠 UDP stream relay、BBR/Cubic/NewReno、keepalive、连接与 UDP 会话复用、断线重建和官方证书链 SHA-256 pin；本地真实 QUIC 与官方 v0.5.0 服务端均已验证 TCP/UDP 和错误鉴权。
 - MASQUE 支持 Cloudflare Access HTTP/3/HTTP/2 CONNECT-IP、HTTP/3 L4 CONNECT 和 RFC 9298 CONNECT-UDP；实现 ECDSA mTLS、服务端 SPKI pin、用户态 IPv4/IPv6 TCP/UDP、远端 DNS、标准与旧版 H3 datagram setting、capsule、flow/context ID、URI template、会话池、QUIC keepalive、BBR/Cubic/NewReno、CWND profile 和握手超时。本地真实 H2/H3 服务端覆盖 TCP/UDP、错误公钥拒绝和三种隧道模式。
+- OpenVPN 使用自研 TLS control/data channel，支持 TCP、UDP、服务端 push route/DNS、重连和用户态 L3 relay，不启动外部 OpenVPN 进程。
+- Sudoku 支持 KIP 握手、AEAD、纯 Sudoku/6-bit packed 下行、UoT UDP、ASCII/entropy/custom table、custom_tables 轮换，以及 legacy/stream/poll/auto/WebSocket HTTP 伪装。
+- TrustTunnel 支持 TLS+HTTP/2、HTTP/3 CONNECT、Basic 认证、TCP relay 与 `_udp2` UDP 帧。
+- Tailscale 使用独立 Rust userspace，支持持久化 identity/control state、auth key、hostname、tags、TCP 和 UDP，不调用系统 Tailscale 进程、不修改主机路由。
+- DNS outbound 支持 raw DNS 的 UDP、TCP、DoT 和 DoH；Rematch 支持带命名上下文的规则重新匹配、循环检测和最大深度保护。
 - HTTP 代理支持 HTTP/HTTPS CONNECT、Basic Auth、SNI、证书校验、IPv4/IPv6 目标、非 2xx 错误分类和握手后预读数据保留；HTTP CONNECT 原生仅承载 TCP。
 - SOCKS5 支持无认证与用户名密码认证、域名/IPv4/IPv6 TCP CONNECT、UDP ASSOCIATE、响应来源校验和有界会话池复用。
 - SSH 支持固定主机公钥或 SHA-256 指纹、主机密钥算法约束、密码/内联或文件私钥认证、keepalive、并发 direct-tcpip 通道共享物理会话和断线自动重连；SSH 没有标准 UDP relay。
-- parse-only：OpenVPN。
+- `faketcp` 依赖平台级 packet backend，在 macOS 上由相关协议明确拒绝，不静默退化为 TCP。
 - 订阅能力：支持多订阅导入、切换、更新、缓存、生命周期计量。
 - 规则能力：支持主要规则目标与 RULE-SET 规则源。
 - 启动行为：启动/运行 `Supercore`，支持 TUN 与本地 DNS 策略（含 Virtual/Direct/over-tcp）。

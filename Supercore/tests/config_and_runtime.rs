@@ -138,6 +138,41 @@ fn smart_rule_overrides_static_rules() {
 }
 
 #[test]
+fn rematch_outbound_reenters_rules_with_named_context() {
+    let mut config = SuperConfig::default();
+    isolate_smart_state(&mut config, "rematch-route");
+    config.outbounds = vec![
+        OutboundConfig::Direct {
+            name: "direct".to_string(),
+        },
+        OutboundConfig::Rematch {
+            name: "rematch-eu".to_string(),
+            target_rematch_name: Some("eu".to_string()),
+            target_sub_rule: None,
+        },
+    ];
+    config.core.default_outbound = "rematch-eu".to_string();
+    config.rules = vec![
+        RouteRule {
+            target: RuleTarget::RematchName,
+            value: "eu".to_string(),
+            outbound: "direct".to_string(),
+        },
+        RouteRule {
+            target: RuleTarget::Match,
+            value: "*".to_string(),
+            outbound: "rematch-eu".to_string(),
+        },
+    ];
+
+    let runtime = Runtime::new(config).expect("runtime");
+    let decision = runtime.decide(&Destination::new("example.com", 443));
+
+    assert_eq!(decision.outbound, "direct");
+    assert_eq!(decision.matched_rule, Some("RematchName:eu".to_string()));
+}
+
+#[test]
 fn app_and_ip_rules_can_route_to_named_outbound() {
     let mut config = SuperConfig::default();
     isolate_smart_state(&mut config, "app-ip");

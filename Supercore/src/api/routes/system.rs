@@ -39,9 +39,14 @@ pub(super) async fn status(State(runtime): State<Arc<Runtime>>) -> Json<StatusRe
 
 pub(super) async fn tun_status(State(runtime): State<Arc<Runtime>>) -> Json<serde_json::Value> {
     let config = runtime.config();
+    let runtime_status = runtime.tun_runtime_status();
     Json(serde_json::json!({
         "tun": config.tun,
         "dns": config.dns,
+        "runtime": {
+            "state": runtime_status.state(),
+            "error": runtime_status.error(),
+        },
     }))
 }
 

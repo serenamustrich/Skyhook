@@ -31,6 +31,11 @@ pub struct OutboundCapability {
     pub limitations: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RematchTarget {
+    pub rematch_name: Option<String>,
+}
+
 impl OutboundCapability {
     pub fn tcp_only(limitation: impl Into<String>) -> Self {
         Self {
@@ -84,6 +89,10 @@ pub trait Outbound: Send + Sync {
     }
 
     fn runtime_stats(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    fn rematch_target(&self) -> Option<RematchTarget> {
         None
     }
 

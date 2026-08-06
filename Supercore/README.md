@@ -81,6 +81,16 @@ governed by the matrix and may be partial for specific transports, codecs, or fi
   interoperate with the official v0.5.0 server.
 - Hysteria2 and TUIC native QUIC TCP outbounds with strict authentication and complete local QUIC
   server end-to-end coverage.
+- OpenVPN native TLS control/data channels with TCP, UDP, pushed routes/DNS, reconnect handling and
+  userspace Layer-3 relay. The OpenVPN profile never starts an external OpenVPN process.
+- Sudoku native KIP handshake, AEAD records, pure Sudoku and 6-bit packed downlink, UoT UDP,
+  ASCII/entropy/custom tables, table rotation, and legacy/stream/poll/auto/WebSocket HTTP masking.
+- TrustTunnel native HTTP/2 and HTTP/3 CONNECT with Basic authentication, TCP relay and `_udp2`
+  framed UDP exchange.
+- Tailscale native userspace TCP/UDP with persistent Skyhook-owned identity/control state, optional
+  auth key, hostname and tags. It does not invoke the installed Tailscale process or alter host routes.
+- DNS outbound for raw UDP, TCP, DNS-over-TLS and DNS-over-HTTPS queries, plus Rematch rule-control
+  outbounds with named re-entry, cycle detection and bounded depth.
 - Hysteria2 HTTP/3 auth, TCP, QUIC datagram UDP, session reuse, fragmentation, bandwidth-aware
   congestion control, and Salamander/Gecko packet obfuscation.
 - TUIC UDP exchange for `native` QUIC datagram mode and `quic` unidirectional-stream mode, with a
@@ -141,10 +151,13 @@ Supercore no longer treats protocol support as a single boolean.
 
 Current matrix details are in `docs/protocol-matrix.md`:
 
-- **parse-only**: `masque`, `openvpn`
+- **full**: `MASQUE` and `OpenVPN` both have native outbound implementations. OpenVPN's
+  `faketcp`/packet-backend path remains an explicit platform boundary; MASQUE's H2/H3
+  CONNECT-IP and CONNECT-UDP paths are implemented in the native runtime.
 - **unsupported**: parse failures and unknown configs with explicit parse errors
 - **full**: Shadowsocks, ShadowsocksR, Snell, Trojan, VMess, VLESS, Hysteria v1, Hysteria2, TUIC,
-  WireGuard, AnyTLS, ShadowTLS, Naive, Mieru, Juicity, HTTP, SOCKS5, and SSH
+  WireGuard, AnyTLS, ShadowTLS, Naive, Mieru, Juicity, MASQUE, OpenVPN, Sudoku, TrustTunnel,
+  Tailscale, DNS outbound, Rematch, HTTP, SOCKS5, and SSH
 
 The current tun2proxy-backed TUN capability boundary is documented in
 `docs/tun-capabilities.md`. Unsupported advanced options fail explicitly instead of being silently

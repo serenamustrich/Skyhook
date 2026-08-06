@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{anyhow, Context};
 use rustls::{crypto::aws_lc_rs, ClientConfig, RootCertStore};
@@ -97,6 +97,47 @@ impl Runtime {
                         anyhow!("dns over tcp timed out after {}ms", config.dns.timeout_ms)
                     })?
                 }
+                DnsUpstream::System => {
+                    let mut servers = crate::inbound::dns::discover_system_dns_servers();
+                    servers.extend(
+                        config
+                            .dns
+                            .direct_nameserver
+                            .iter()
+                            .filter_map(|item| crate::inbound::dns::parse_plain_dns_server(item)),
+                    );
+                    let mut seen = HashSet::new();
+                    servers.retain(|server| seen.insert(*server));
+                    let budget = Duration::from_millis(config.dns.timeout_ms.clamp(100, 10_000));
+                    let mut errors = Vec::new();
+                    let mut successful = None;
+                    for server in servers {
+                        match crate::inbound::dns::exchange_system_dns_server(
+                            server,
+                            query,
+                            budget,
+                            &cancellation,
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                successful = Some(response);
+                                break;
+                            }
+                            Err(error) => errors.push(format!("{server}: {error}")),
+                        }
+                    }
+                    Ok(successful.ok_or_else(|| {
+                        anyhow!(
+                            "system DNS resolution failed: {}",
+                            if errors.is_empty() {
+                                "no system resolver discovered".to_string()
+                            } else {
+                                errors.join("; ")
+                            }
+                        )
+                    })?)
+                }
             }
         };
 
@@ -109,6 +150,7 @@ impl Runtime {
 
 enum DnsUpstream {
     Plain(Destination),
+    System,
     Https(String),
     Tls {
         host: String,
@@ -125,10 +167,14 @@ fn dns_upstream(config: &SuperConfig) -> DnsUpstream {
         .chain(config.dns.default_nameserver.iter())
         .find_map(|item| parse_dns_upstream(item))
         .unwrap_or_else(|| {
-            DnsUpstream::Plain(Destination::new(
-                config.dns.server.ip().to_string(),
-                config.dns.server.port(),
-            ))
+            if config.dns.server.ip().is_loopback() && config.dns.server.port() == 53 {
+                DnsUpstream::System
+            } else {
+                DnsUpstream::Plain(Destination::new(
+                    config.dns.server.ip().to_string(),
+                    config.dns.server.port(),
+                ))
+            }
         })
 }
 

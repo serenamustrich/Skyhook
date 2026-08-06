@@ -83,6 +83,44 @@ final class TunLaunchDaemonManager: @unchecked Sendable {
         try runPrivilegedShell(script)
     }
 
+    /// Re-load an already installed daemon before sending it a control request.
+    /// The daemon may have been booted out by network recovery while its plist
+    /// and root-only token remain installed.
+    func ensureLoaded() throws {
+        guard fileManager.fileExists(atPath: plistPath.path) else {
+            throw AppError.processFailed("TUN 权限服务尚未安装")
+        }
+        let script = ([
+            "set -e",
+            "/bin/launchctl bootout system/\(label) >/dev/null 2>&1 || true",
+            "/bin/launchctl bootstrap system \(shellQuote(plistPath.path))",
+            "/bin/launchctl enable system/\(label)",
+            "/bin/launchctl kickstart -k system/\(label)"
+        ]).joined(separator: "\n")
+        try runPrivilegedShell(script)
+    }
+
+    /// Stop the privileged process without deleting the installation. This is
+    /// the last-resort rollback when the core no longer answers reload requests.
+    func stopForRecovery() throws {
+        let script = ([
+            "set -e",
+            "/bin/launchctl bootout system/\(label) >/dev/null 2>&1 || true"
+        ]).joined(separator: "\n")
+        try runPrivilegedShell(script)
+    }
+
+    @discardableResult
+    func waitUntilLoaded(_ expected: Bool, timeout: TimeInterval = 5) -> TunLaunchDaemonStatus {
+        let deadline = Date().addingTimeInterval(timeout)
+        var current = status()
+        while current.loaded != expected, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+            current = status()
+        }
+        return current
+    }
+
     func uninstall() throws {
         let script = ([
             "set -e",

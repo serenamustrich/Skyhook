@@ -95,6 +95,7 @@ fn build_router(runtime: Arc<Runtime>, auth: ControlAuthState) -> axum::Router {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use std::{path::PathBuf, time::Duration};
 

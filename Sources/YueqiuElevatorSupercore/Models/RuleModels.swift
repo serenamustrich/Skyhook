@@ -7,6 +7,11 @@ enum CustomRuleTarget: String, CaseIterable, Codable, Identifiable, Sendable {
     case domainRegex = "DOMAIN-REGEX"
     case ipCIDR = "IP-CIDR"
     case ipCIDR6 = "IP-CIDR6"
+    case sourceIPCIDR = "SRC-IP-CIDR"
+    case sourcePort = "SRC-PORT"
+    case destinationPort = "DST-PORT"
+    case inboundPort = "IN-PORT"
+    case network = "NETWORK"
     case appName = "APP-NAME"
     case appPath = "APP-PATH"
     case appPathRegex = "APP-PATH-REGEX"
@@ -22,6 +27,11 @@ enum CustomRuleTarget: String, CaseIterable, Codable, Identifiable, Sendable {
         case .domainRegex: "域名正则"
         case .ipCIDR: "IPv4/CIDR"
         case .ipCIDR6: "IPv6/CIDR"
+        case .sourceIPCIDR: "来源 IPv4/CIDR"
+        case .sourcePort: "来源端口"
+        case .destinationPort: "目标端口"
+        case .inboundPort: "入口端口"
+        case .network: "网络类型"
         case .appName: "App 名称"
         case .appPath: "App 路径"
         case .appPathRegex: "App 路径正则"
@@ -37,6 +47,11 @@ enum CustomRuleTarget: String, CaseIterable, Codable, Identifiable, Sendable {
         case .domainRegex: "domain-regex"
         case .ipCIDR: "ip-cidr"
         case .ipCIDR6: "ip-cidr6"
+        case .sourceIPCIDR: "src-ip-cidr"
+        case .sourcePort: "src-port"
+        case .destinationPort: "dst-port"
+        case .inboundPort: "in-port"
+        case .network: "network"
         case .appName: "app-name"
         case .appPath: "app-path"
         case .appPathRegex: "app-path-regex"
@@ -52,6 +67,11 @@ enum CustomRuleTarget: String, CaseIterable, Codable, Identifiable, Sendable {
         case "domain-regex": self = .domainRegex
         case "ip-cidr": self = .ipCIDR
         case "ip-cidr6": self = .ipCIDR6
+        case "src-ip-cidr": self = .sourceIPCIDR
+        case "src-port": self = .sourcePort
+        case "dst-port": self = .destinationPort
+        case "in-port": self = .inboundPort
+        case "network": self = .network
         case "app-name": self = .appName
         case "app-path": self = .appPath
         case "app-path-regex": self = .appPathRegex

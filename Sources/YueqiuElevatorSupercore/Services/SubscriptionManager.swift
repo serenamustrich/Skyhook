@@ -380,6 +380,9 @@ final class SubscriptionManager: @unchecked Sendable {
         if !(200..<300).contains(http.statusCode) {
             throw AppError.apiError(http.statusCode, HTTPURLResponse.localizedString(forStatusCode: http.statusCode))
         }
+        guard !data.isEmpty else {
+            throw AppError.processFailed("订阅服务器返回空内容（HTTP \(http.statusCode)）")
+        }
         guard let text = String(data: data, encoding: .utf8) else {
             throw AppError.invalidYAML
         }

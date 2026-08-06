@@ -8,7 +8,7 @@ mod selection;
 mod subscription;
 
 pub use probe::{ProbeOptions, ProbeProgress, ProbeResult};
-pub use runtime::Runtime;
+pub use runtime::{Runtime, TunRuntimeStatus};
 pub use selection::{
     CountryGroupSnapshot, OutboundCapabilitySnapshot, ProxyGroupMemberSnapshot, ProxyGroupSnapshot,
 };

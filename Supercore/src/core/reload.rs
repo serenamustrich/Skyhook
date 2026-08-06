@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 
 use crate::{
-    config::SuperConfig, outbound::build_outbounds_with_options, routing::Router,
+    config::SuperConfig, outbound::build_outbounds_with_options_and_dns, routing::Router,
     telemetry::Telemetry,
 };
 
@@ -49,10 +49,11 @@ pub(super) fn build_runtime_state(
     config: SuperConfig,
     telemetry: Arc<Telemetry>,
 ) -> anyhow::Result<RuntimeState> {
-    let outbounds = build_outbounds_with_options(
+    let outbounds = build_outbounds_with_options_and_dns(
         &config.outbounds,
         &config.outbound_options,
         Some(telemetry),
+        Some(&config.dns),
     )?;
     if !outbounds.contains_key(&config.core.default_outbound) {
         return Err(anyhow!(
