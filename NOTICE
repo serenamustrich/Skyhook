@@ -1,0 +1,5 @@
+Skyhook
+Copyright (c) 2026 Skyhook contributors
+
+Skyhook is an independent Rust implementation. Protocol compatibility is
+implemented for interoperability.
